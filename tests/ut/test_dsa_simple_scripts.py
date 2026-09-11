@@ -87,6 +87,59 @@ class TestSimpleScripts(unittest.TestCase):
                     self.assertEqual(spec["draft_tensor_parallel_size"], tp)
                     self.assertEqual(spec["enforce_eager"], not (offload and graph and mode == "graph"))
 
+    def test_mtp_budget_defaults_and_environment(self):
+        for mtp in (False, True):
+            config = replace(self.config, enable_mtp=mtp)
+            dsa = self.smoke.build_llm_kwargs(config)["additional_config"]["dsa_sparse_config"]
+            self.assertEqual(dsa["resident_budget_tokens"], [8192, 12288, 12288] if mtp else [10240] * 3)
+            self.assertEqual(dsa["sparse_activation_tokens"], 8192 if mtp else 6144)
+            self.assertLessEqual(dsa["sparse_activation_tokens"], min(dsa["resident_budget_tokens"]))
+        values = {"VLLM_ASCEND_SMOKE_DSA_MTP_RESIDENT_BUDGET_TOKENS": "8192,10240,12288"}
+        with patch.dict(os.environ, values, clear=True):
+            config = self.smoke.config_from_environment(self.config, self.smoke.read_smoke_environment())
+        self.assertEqual(config.dsa_mtp_resident_budget_tokens, (8192, 10240, 12288))
+        dsa = self.smoke.build_llm_kwargs(config)["additional_config"]["dsa_sparse_config"]
+        self.assertEqual(dsa["resident_budget_tokens"], [8192, 10240, 12288])
+
+    def test_inactive_mtp_budget_override_is_ignored(self):
+        for switch in ("enable_mtp", "enable_offload"):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                config = self.smoke.config_from_environment(
+                    self.config, {switch: "0", "dsa_mtp_resident_budget_tokens": "ignored even if malformed"}
+                )
+            self.assertIn("ignoring DSA_MTP_RESIDENT_BUDGET_TOKENS", output.getvalue())
+            self.assertEqual(config.dsa_mtp_resident_budget_tokens, self.config.dsa_mtp_resident_budget_tokens)
+            additional = self.smoke.build_llm_kwargs(config)["additional_config"]
+            if switch == "enable_mtp":
+                self.assertEqual(additional["dsa_sparse_config"]["resident_budget_tokens"], [10240] * 3)
+            else:
+                self.assertNotIn("dsa_sparse_config", additional)
+
+    def test_invalid_mtp_budget_overrides(self):
+        for value in (
+            "8192,12288",
+            "8192,12288,12288,12288",
+            "6144,10240,12288",
+            "8192,9000,12288",
+            "12288,8192,12288",
+            "oops",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                config = self.smoke.config_from_environment(self.config, {"dsa_mtp_resident_budget_tokens": value})
+                self.smoke.build_llm_kwargs(config)
+
+    def test_default_capture_sizes_include_batch_size(self):
+        self.assertEqual(self.config.graph_capture_sizes, (1, 2, 4, 8, 16))
+        for bs, expected in ((1, [1]), (12, [1, 2, 4, 8, 12]), (16, [1, 2, 4, 8, 16]), (20, [1, 2, 4, 8, 16, 20])):
+            for mtp in (False, True):
+                with self.subTest(bs=bs, mtp=mtp):
+                    config = replace(self.config, max_num_seqs=bs, enable_mtp=mtp)
+                    compilation = self.smoke.build_llm_kwargs(config)["compilation_config"]
+                    self.assertEqual(
+                        compilation["cudagraph_capture_sizes"], [size * (4 if mtp else 1) for size in expected]
+                    )
+
     def test_environment_overrides(self):
         values = {
             "model_path": "/models/custom",

@@ -50,7 +50,8 @@ class SmokeConfig:
     dsa_max_active_reqs: int = 256
     dsa_hot_cpu_block_multiple: float = 1.0
     dsa_prompt_budget_thresholds: tuple[int, ...] = (32768, 65536)
-    graph_capture_sizes: tuple[int, ...] = (1, 2, 4, 8, 12)  # 按请求数配置，底座转换成 token 数。
+    dsa_mtp_resident_budget_tokens: tuple[int, ...] = (8192, 12288, 12288)  # 仅卸载 + MTP 生效。
+    graph_capture_sizes: tuple[int, ...] = (1, 2, 4, 8, 16)  # 请求数；自动补入 max_num_seqs，再转换成 token 数。
 
     @property
     def mtp_graph_enabled(self) -> bool:
@@ -97,6 +98,13 @@ def config_from_environment(defaults: SmokeConfig, values: dict[str, str]) -> Sm
     overrides = {}
     for field in fields(defaults):
         if field.name not in values:
+            continue
+        # Budget 字段排在两个开关之后，使用本次环境变量覆盖后的开关值。
+        if field.name == "dsa_mtp_resident_budget_tokens" and not (
+            overrides.get("enable_mtp", defaults.enable_mtp)
+            and overrides.get("enable_offload", defaults.enable_offload)
+        ):
+            print("[dsa-smoke] ignoring DSA_MTP_RESIDENT_BUDGET_TOKENS: requires offload + MTP", flush=True)
             continue
         raw = values[field.name]
         default = getattr(defaults, field.name)
@@ -187,6 +195,16 @@ def validate_config(config: SmokeConfig) -> None:
             raise ValueError("This smoke test supports MTP3 only")
         if config.enable_offload and not config.enable_a5_packed_c8:
             raise ValueError("DSA MTP3 requires enable_a5_packed_c8=True")
+        if config.enable_offload:
+            budgets = config.dsa_mtp_resident_budget_tokens
+            if len(budgets) != len(config.dsa_prompt_budget_thresholds) + 1:
+                raise ValueError(
+                    "DSA_MTP_RESIDENT_BUDGET_TOKENS must have one more value than DSA_PROMPT_BUDGET_THRESHOLDS"
+                )
+            if any(budget not in (8192, 10240, 12288) for budget in budgets):
+                raise ValueError("DSA MTP resident budgets must be 8192, 10240 or 12288")
+            if any(left > right for left, right in zip(budgets, budgets[1:])):
+                raise ValueError("DSA MTP resident budgets must be non-decreasing")
 
 
 def get_open_port() -> int:
@@ -233,9 +251,11 @@ def build_llm_kwargs(config: SmokeConfig, multi_node: bool = False) -> dict[str,
             "enabled": True,
             "split_indexer_cache": True,
             "indexer_mla_block_ratio": config.dsa_indexer_mla_block_ratio,
-            "sparse_activation_tokens": 10240 if config.enable_mtp else 6144,
+            "sparse_activation_tokens": 8192 if config.enable_mtp else 6144,
             "prompt_budget_thresholds": list(config.dsa_prompt_budget_thresholds),
-            "resident_budget_tokens": [10240, 10240, 10240],
+            "resident_budget_tokens": list(config.dsa_mtp_resident_budget_tokens)
+            if config.enable_mtp
+            else [10240, 10240, 10240],
             "max_active_reqs": config.dsa_max_active_reqs,
             "hot_cpu_block_multiple": config.dsa_hot_cpu_block_multiple,
             "enable_row_mode_decode_graph": graph,

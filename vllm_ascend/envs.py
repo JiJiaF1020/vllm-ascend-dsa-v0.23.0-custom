@@ -64,6 +64,9 @@ SMOKE_ENV_FIELDS = (
     "dsa_max_active_reqs",
     "dsa_hot_cpu_block_multiple",
     "dsa_prompt_budget_thresholds",
+    # Offload + MTP only: default 8192,12288,12288; non-decreasing supported
+    # budgets (8192/10240/12288), one per prompt tier; otherwise ignored.
+    "dsa_mtp_resident_budget_tokens",
     "graph_capture_sizes",
     "node_rank",
     "master_addr",

@@ -27,12 +27,13 @@
 | `ENABLE_PROFILE` | `0` | Profile 开关，采集 generate 阶段；cache-init 不采集 |
 | `PROFILE_DIR` | 单机 `./profiles/1p`，双机 `./profiles/2p` | 采集根目录，自动按配置/rank 分目录 |
 | `RESULT_DIR` | 单机 `./results/1p`，双机 `./results/2p` | JSON 结果目录；`none` 禁用保存；重复实验请更换输出目录 |
-| `GRAPH_CAPTURE_SIZES` | `1,2,4,8,12` | 请求数档位；过滤大于 BS 的值并补入 BS；MTP3 时自动乘 4 |
+| `GRAPH_CAPTURE_SIZES` | `1,2,4,8,16` + `MAX_NUM_SEQS` | 请求数档位；自动补入当前 BS、去重并过滤大于 BS 的值；MTP3 时自动乘 4 |
 | `PROCESS_TIMEOUT_SECONDS` | `3600` | DP 进程及前端同步等待超时，单位秒 |
 | `DSA_INDEXER_MLA_BLOCK_RATIO` | `4` | 卸载 Indexer / resident MLA block 比例 |
 | `DSA_MAX_ACTIVE_REQS` | `256` | 卸载活跃请求容量上限 |
 | `DSA_HOT_CPU_BLOCK_MULTIPLE` | `1.0` | 卸载 DRAM 热块容量倍率 |
 | `DSA_PROMPT_BUDGET_THRESHOLDS` | `32768,65536` | 卸载 prompt 分档阈值，逗号分隔 |
+| `DSA_MTP_RESIDENT_BUDGET_TOKENS` | `8192,12288,12288` | 仅卸载 + MTP 生效，依次对应 ≤32768、≤65536、>65536；可选 8192/10240/12288，须非递减；非 MTP 忽略并保持 10240,10240,10240 |
 | `NODE_RANK` | `0` | 仅双机：第一台 0，第二台 1 |
 | `MASTER_ADDR` | 空，双机必填 | 两台均填第一台 IP |
 | `MASTER_PORT` | `29500` | 双机 DP rendezvous 端口，两台一致 |

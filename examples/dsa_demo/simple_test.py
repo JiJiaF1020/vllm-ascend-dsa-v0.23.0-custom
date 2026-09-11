@@ -143,7 +143,8 @@ def config_from_environment(defaults: SmokeConfig, values: dict[str, str]) -> Sm
         import novel_dataset
 
         datasets = {
-            name: getattr(novel_dataset, name) for name in ("chinese_10k", "chinese_23k", "chinese_48k", "chinese_64k")
+            name: getattr(novel_dataset, name)
+            for name in ("chinese_5k", "chinese_10k", "chinese_23k", "chinese_40k", "chinese_64k")
         }
         datasets["short"] = ["请用一句话介绍你自己。"]
         name = values["dataset"].strip()

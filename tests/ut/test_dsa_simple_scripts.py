@@ -39,9 +39,12 @@ class TestSimpleScripts(unittest.TestCase):
             one = importlib.import_module("simple_test_1p").CONFIG
             two = importlib.import_module("simple_test_2p").CONFIG
         self.assertFalse(hasattr(dataset, "chinese_20k"))
-        self.assertEqual(dataset.chinese_48k, [dataset.chinese_23k[0] * 2])
-        self.assertEqual(dataset.chinese_64k, [(dataset.chinese_23k[0] * 3)[:92800]])
+        self.assertFalse(hasattr(dataset, "chinese_48k"))
+        self.assertEqual(len(dataset.chinese_40k), 1)
+        self.assertTrue(dataset.chinese_40k[0])
+        self.assertEqual(dataset.chinese_64k, [dataset.chinese_23k[0] + dataset.chinese_40k[0]])
         self.assertEqual(dataset.chinese_10k, [dataset.chinese_23k[0][:15000]])
+        self.assertEqual(dataset.chinese_5k, [dataset.chinese_23k[0][:7500]])
         self.assertEqual((one.tensor_parallel_size, one.data_parallel_size), (2, 4))
         self.assertEqual((two.tensor_parallel_size, two.data_parallel_size), (1, 16))
         for config in (one, two):
@@ -174,11 +177,12 @@ class TestSimpleScripts(unittest.TestCase):
 
     def test_environment_dataset_and_rejections(self):
         with patch.object(sys, "path", [str(DEMO), *sys.path]):
-            for name in ("short", "chinese_10k", "chinese_23k", "chinese_48k", "chinese_64k"):
+            for name in ("short", "chinese_5k", "chinese_10k", "chinese_23k", "chinese_40k", "chinese_64k"):
                 config = self.smoke.config_from_environment(self.config, {"dataset": name})
                 self.assertEqual(len(config.prompts), 1)
             for values in (
                 {"dataset": "typo"},
+                {"dataset": "chinese_48k"},
                 {"dataset": "short", "prompts": '["hello"]'},
                 {"enable_offload": "maybe"},
                 {"tensor_parallel_size": "1.5"},

@@ -927,36 +927,36 @@ def test_tp_dp_collectives_and_both_logits_paths_match_full_vocab_eager(tmp_path
 
 
 @pytest.mark.parametrize("mtp_eager", [False, True])
-def test_tp8_smoke_entry_config_without_initializing_vllm(monkeypatch, mtp_eager):
+def test_single_node_smoke_entry_config_without_initializing_vllm(monkeypatch, mtp_eager):
     examples = ROOT / "examples/dsa_demo"
     monkeypatch.syspath_prepend(str(examples))
     # The smoke module sets runtime env defaults; isolate them from other tests.
     monkeypatch.setattr(os, "environ", dict(os.environ))
-    for name in ("simple_prompt_test_dp16", "simple_prompt_test_tp8_mtp_graph"):
+    for name in ("simple_test", "simple_test_1p"):
         spec = importlib.util.spec_from_file_location(name, examples / f"{name}.py")
         module = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, name, module)
         spec.loader.exec_module(module)
     entry = module
     monkeypatch.setattr(sys, "argv", ["tp8-smoke"] + (["--mtp-eager"] if mtp_eager else []))
-    entry.smoke.run_node_dp = Mock()
-    entry.main()
-    launch = entry.smoke.run_node_dp.call_args.args[0]
+    smoke = sys.modules["simple_test"]
+    monkeypatch.setattr(smoke, "run_node_dp", Mock())
+    entry.main(entry.CONFIG, node_size=1)
+    settings, launch = smoke.run_node_dp.call_args.args
     assert launch.node_size == 1 and launch.node_rank == 0 and launch.sync_port == 0
-    assert entry.smoke.DATA_PARALLEL_SIZE == 1
-    assert len(entry.smoke.PROMPTS) == 1 and not entry.smoke.ENABLE_PROFILE
-    expected_result = "tp8_mtp_eager.json" if mtp_eager else "tp8_mtp_graph.json"
-    assert expected_result == entry.smoke.RESULT_JSON
-    config = entry.smoke.build_llm_kwargs(0, False)
-    assert config["model"] == "/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4"
-    assert config["tensor_parallel_size"] == 8 and config["enable_expert_parallel"]
+    assert settings.data_parallel_size == 4
+    assert len(settings.prompts) == 1 and not settings.enable_profile
+    assert settings.run_name.endswith("mtp_eager" if mtp_eager else "mtp_graph")
+    config = smoke.build_llm_kwargs(settings)
+    assert config["model"] == "/home/models/GLM-5.2-w4a4c8-mxfp4_99"
+    assert config["tensor_parallel_size"] == 2 and config["enable_expert_parallel"]
     assert not config["enforce_eager"] and not config["enable_chunked_prefill"]
     assert config["max_num_seqs"] == 1
     assert config["max_num_batched_tokens"] == config["max_model_len"] == 25600
     assert config["speculative_config"] == {
         "method": "mtp",
         "num_speculative_tokens": 3,
-        "draft_tensor_parallel_size": 8,
+        "draft_tensor_parallel_size": 2,
         "enforce_eager": mtp_eager,
     }
     assert config["compilation_config"]["cudagraph_mode"] == "FULL_DECODE_ONLY"
@@ -975,18 +975,15 @@ def test_tp8_smoke_entry_config_without_initializing_vllm(monkeypatch, mtp_eager
 @pytest.mark.parametrize("mtp_graph", [False, True])
 def test_generic_smoke_matches_draft_tp_and_keeps_control_layout(monkeypatch, tp, dp, mtp_graph):
     monkeypatch.setattr(os, "environ", dict(os.environ))
-    source = ROOT / "examples/dsa_demo/simple_prompt_test_dp16.py"
+    source = ROOT / "examples/dsa_demo/simple_test.py"
     spec = importlib.util.spec_from_file_location("generic_smoke", source)
     smoke = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "generic_smoke", smoke)
     spec.loader.exec_module(smoke)
-    smoke.TENSOR_PARALLEL_SIZE = tp
-    smoke.DATA_PARALLEL_SIZE = dp
-    smoke.RUN_MODE = "graph"
-    smoke.ENABLE_MTP = True
-    smoke.ENABLE_MTP_GRAPH = mtp_graph
-    smoke.ENABLE_PROFILE = False
-    smoke.PROMPTS = ["short prompt"] * dp
-    config = smoke.build_llm_kwargs(0, False)
+    settings = smoke.SmokeConfig(
+        model_path="test-model", tensor_parallel_size=tp, data_parallel_size=dp, enable_mtp_graph=mtp_graph
+    )
+    config = smoke.build_llm_kwargs(settings)
     assert config["speculative_config"]["draft_tensor_parallel_size"] == tp
     assert config["speculative_config"]["enforce_eager"] == (not mtp_graph)
     assert not config["enforce_eager"]
@@ -995,7 +992,7 @@ def test_generic_smoke_matches_draft_tp_and_keeps_control_layout(monkeypatch, tp
         assert not config["additional_config"][key]
     if dp > 1:
         assert config["additional_config"]["dp_allreduce_on_npu"]
-    assert all(len(smoke.shard_prompts(rank)) == 1 for rank in range(dp))
+    assert all(len(smoke.shard_prompts(settings, rank)) == 1 for rank in range(dp))
 
 
 @pytest.mark.parametrize("graph,load_failure", [(True, False), (True, True), (False, False)])

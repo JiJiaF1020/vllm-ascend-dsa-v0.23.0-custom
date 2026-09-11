@@ -22,8 +22,8 @@ LONG_CONTEXT_FILE: str | None = None
 # 设为非 None 时，客户端改用 /v1/completions 做一次纯文本续写，
 # 不套 chat template，也不进入下方的多轮对话循环。例如：
 #
-# from novel_dataset import chinese_40k
-# CONTINUATION_PROMPT = chinese_40k[0]
+# from novel_dataset import chinese_48k
+# CONTINUATION_PROMPT = chinese_48k[0]
 CONTINUATION_PROMPT: str | None = None
 
 MAX_TOKENS = 512

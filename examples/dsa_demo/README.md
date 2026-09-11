@@ -1,406 +1,80 @@
-# DSA 稀疏卸载测试入口
+## 1. 参数说明
 
-本目录是 v0.23 DSA 的 tester-facing 验收入口。脚本以 GLM-5.1/GLM-5.2
-为首要模型，DeepSeek-V3.2 使用相同配置做强制回归。
+环境变量均需加前缀 `VLLM_ASCEND_SMOKE_`，例如 `ENABLE_PROFILE` 写作 `VLLM_ASCEND_SMOKE_ENABLE_PROFILE`。未设置时使用默认值，布尔值用 `1` 开启、`0` 关闭。
 
-| 文件 | 用途 |
-|---|---|
-| `simple_prompt_test.py` | 基线隔离、cache-init、eager 和 graph 冒烟 |
-| `qa_dataset_test.py` | LongBench 风格数据集精度回归，可切 disabled/eager/graph |
-| `eval_dataset_acc_score.py` | 对 QA 脚本生成的 JSONL 计算 LongBench 指标 |
-| `serve_dsa.sh` | 以 OpenAI 兼容在线服务拉起 DSA eager/graph |
-| `stream_chat_client.py` | 交互式多轮流式客户端 |
-| `online_long_context_dataset_test.py` | 在线长上下文数据集分桶回归 |
+| 参数（省略前缀） | 默认值 | 说明 |
+|---|---|---|
+| `MODEL_PATH` | `/home/models/GLM-5.2-w4a4c8-mxfp4_99` | 模型目录 |
+| `TENSOR_PARALLEL_SIZE` | 单机 `2`，双机 `1` | TP 大小 |
+| `DATA_PARALLEL_SIZE` | 单机 `4`，双机 `16` | 全局 DP 大小；双机须为偶数 |
+| `MAX_NUM_SEQS` | `1` | 每个 DP rank 的 BS；总 BS = DP × 此值 |
+| `DATASET` | `chinese_23k` | `short/chinese_10k/chinese_23k/chinese_48k/chinese_64k` |
+| `PROMPTS` | 未设置 | 自定义 JSON 数组，如 `'["你好"]'`；与 DATASET 二选一 |
+| `MAX_MODEL_LEN` | `25600` | 单请求输入与输出的最大总 token 数 |
+| `MAX_NUM_BATCHED_TOKENS` | `25600` | 每 DP rank 每步 token 预算；关闭 chunk 时须 ≥ MAX_MODEL_LEN |
+| `MAX_TOKENS` | `64` | 最多生成的 token 数 |
+| `ENABLE_CHUNKED_PREFILL` | `0` | Chunked prefill 开关；此前存在精度问题，默认关闭 |
+| `ENABLE_OFFLOAD` | `1` | `0` 为不卸载基线，仍保留 C8；baseline 的 MTP 自动 eager |
+| `RUN_MODE` | `graph` | `cache-init` 只初始化；`eager` 不入图；`graph` target FULL_DECODE_ONLY |
+| `ENABLE_MTP` | `1` | MTP 开关 |
+| `MTP_NUM_SPECULATIVE_TOKENS` | `3` | 当前开启 MTP 时仅支持 3 |
+| `ENABLE_MTP_GRAPH` | `1` | 三轮 MTP 合并图；仅 offload + graph + MTP 时生效 |
+| `GPU_MEMORY_UTILIZATION` | `0.85` | 显存利用率，范围 `(0,1]` |
+| `QUANTIZATION` | `ascend` | 量化方式，本示例保持默认 |
+| `ENABLE_EXPERT_PARALLEL` | `1` | EP 开关；开启时 EP=TP×DP；卸载且 DP>1 时必须开启 |
+| `ENABLE_A5_PACKED_C8` | `1` | LI/SFA C8 开关；卸载 + MTP3 时必须开启 |
+| `ENABLE_CPU_BINDING` | `1` | CPU 绑核开关 |
+| `ENABLE_PROFILE` | `0` | Profile 开关，采集 generate 阶段；cache-init 不采集 |
+| `PROFILE_DIR` | 单机 `./profiles/1p`，双机 `./profiles/2p` | 采集根目录，自动按配置/rank 分目录 |
+| `RESULT_DIR` | 单机 `./results/1p`，双机 `./results/2p` | JSON 结果目录；`none` 禁用保存；重复实验请更换输出目录 |
+| `GRAPH_CAPTURE_SIZES` | `1,2,4,8,12` | 请求数档位；过滤大于 BS 的值并补入 BS；MTP3 时自动乘 4 |
+| `PROCESS_TIMEOUT_SECONDS` | `3600` | DP 进程及前端同步等待超时，单位秒 |
+| `DSA_INDEXER_MLA_BLOCK_RATIO` | `4` | 卸载 Indexer / resident MLA block 比例 |
+| `DSA_MAX_ACTIVE_REQS` | `256` | 卸载活跃请求容量上限 |
+| `DSA_HOT_CPU_BLOCK_MULTIPLE` | `1.0` | 卸载 DRAM 热块容量倍率 |
+| `DSA_PROMPT_BUDGET_THRESHOLDS` | `32768,65536` | 卸载 prompt 分档阈值，逗号分隔 |
+| `NODE_RANK` | `0` | 仅双机：第一台 0，第二台 1 |
+| `MASTER_ADDR` | 空，双机必填 | 两台均填第一台 IP |
+| `MASTER_PORT` | `29500` | 双机 DP rendezvous 端口，两台一致 |
+| `SYNC_PORT` | `29600` | 双机前端同步端口，两台一致且不同于 MASTER_PORT |
 
-当前架构和稳定 ABI 见
-[DSA 稀疏卸载详细设计](../../docs/source/developer_guide/Design_Documents/dsa_offload_design.md)。
+## 2. simple_test_1p.py 使用样例
 
-## 1. 前置条件
-
-- 配套 vLLM v0.23 和当前 vLLM-Ascend 已安装；
-- 当前 checkout 的自定义算子已经完整编译并重新安装；
-- Ascend 910C 首版使用 PP=1、DCP=1、PCP=1；
-- `block_size=128`；
-- 关闭 async scheduling、prefix cache、KV transfer 和 KV-cache
-  metrics/events；如启用 speculative decoding，只允许 A5 packed-C8
-  下固定 MTP3 与 greedy sampling；
-- 正式精度和性能测试关闭 DSA trace points。
-
-脚本只设置必要的 vLLM/vLLM-Ascend 原生环境变量。DSA 策略参数全部位于
-`additional_config["dsa_sparse_config"]`，不再通过零散 DSA 环境变量控制。
-A5 packed C8 物理布局另外复用 vLLM-Ascend 原生的
-`enable_sparse_sfa_c8` 与 `enable_sparse_li_c8`；示例用一个开关同时控制二者，
-不暴露 DSA 不支持的半开组合。该开关在 `disabled` 模式下也会保留，以便
-使用相同 packed C8 cache 编码公平对照原生路径与 DSA 路径。
-
-首次拉起应看到且只看到一份：
-
-```text
-================ DSA HBM CACHE CAPACITY REPORT ================
-```
-
-报告中的 Indexer blocks 应等于 resident MLA base blocks 乘
-`indexer_mla_block_ratio`。
-
-## 2. 快速冒烟
-
-### A5 C8 LIM-MTP 2304 升级回归
-
-LIM-MTP 源码同步自单算子仓 `ops_lidu_scattercopy_sfa_a5` 的 `d946b55`（内核与已验证的 `1d6cffa` 一致）。MTP 的两份 attention 索引为 `[T,1,2304]`，各 query 在共享 durable prefix 上选 topK，再追加最多 256 个 causal-tail token；非 MTP 仍为 2176。块分配、COPY ABI、`torch.ops._C_ascend` 注册位置不变。必须重新编译安装当前框架算子并重启推理、重新组图，不能复用旧 2176 buffer/graph。
+在仓库根目录运行：单机 8 卡 DP4TP2、23k、BS1、卸载 + target graph + MTP3 graph。可在末尾加 `--dry-run` 只检查配置。
 
 ```bash
-python -m pytest -q tests/ut/dsa_offload/test_ops.py tests/ut/dsa_offload/test_runtime.py tests/ut/dsa_offload/test_input_batch.py tests/ut/dsa_offload/test_request_cache_layout.py tests/ut/dsa_offload/test_resident_pool.py tests/ut/dsa_offload/test_dram_store.py
-python -m pytest -q tests/e2e/nightly/single_node/ops/singlecard_ops/test_dsa_a5_c8_ops.py
+VLLM_ASCEND_SMOKE_MODEL_PATH=/home/models/GLM-5.2-w4a4c8-mxfp4_99 \
+VLLM_ASCEND_SMOKE_TENSOR_PARALLEL_SIZE=2 \
+VLLM_ASCEND_SMOKE_DATA_PARALLEL_SIZE=4 \
+VLLM_ASCEND_SMOKE_DATASET=chinese_23k \
+VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=1 \
+VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=1 \
+VLLM_ASCEND_SMOKE_RUN_MODE=graph \
+VLLM_ASCEND_SMOKE_ENABLE_MTP=1 \
+VLLM_ASCEND_SMOKE_ENABLE_MTP_GRAPH=1 \
+VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0 \
+python examples/dsa_demo/simple_test_1p.py
 ```
 
-第二条需在 Ascend 950 运行，覆盖框架注册入口的非 MTP 回归、MTP 独立官方 LI TopK 对照、双尾边界、混合状态与 graph replay。LIM→COPY→官方 SFA 对照使用独立构造的索引和 KV，验证框架接线；官方 SFA 已知的 `-1` padding 精度风险仍单独保留，不能把该对照通过解释为精度问题已解决。
+## 3. simple_test_2p.py 使用样例
 
-`simple_prompt_test.py` 延续 v0.19 的直接用法，不提供一长串 CLI 参数。
-先修改文件顶部“用户配置”区：
+两台容器各运行一次下面的命令：每机 8 卡、全局 DP16TP1。
 
-```python
-MODEL_PATH = "/mnt/kv_dpc/weight/GLM-5.1-w4a8"
-RUN_MODE = "eager"  # disabled / cache-init / eager / graph
-PROMPTS = [
-    "第一个测试文本",
-    "第二个测试文本",
-]
-MAX_NUM_SEQS = 2
-MAX_MODEL_LEN = 8192
-MAX_NUM_BATCHED_TOKENS = 8192
-ENABLE_CHUNKED_PREFILL = False
-ENABLE_A5_PACKED_C8_DSA = False  # A5 W4A4C8 设 True；A3 W4A8 保持 False
-ENABLE_MTP = False  # A5 C8 上设 True 后固定启用 3 个 draft token
-RESULT_JSON = None  # 需要保存对照 token IDs 时填写路径
-```
-
-然后直接运行：
+- 第一台 `NODE_RANK=0`，`MASTER_ADDR` 填第一台 IP
+- 第二台 `NODE_RANK=1` ，`MASTER_ADDR` 填第一台 IP
 
 ```bash
-python examples/dsa_demo/simple_prompt_test.py
+VLLM_ASCEND_SMOKE_NODE_RANK=0 \
+VLLM_ASCEND_SMOKE_MASTER_ADDR=141.61.33.13 \
+VLLM_ASCEND_SMOKE_MODEL_PATH=/home/models/GLM-5.2-w4a4c8-mxfp4_99 \
+VLLM_ASCEND_SMOKE_TENSOR_PARALLEL_SIZE=1 \
+VLLM_ASCEND_SMOKE_DATA_PARALLEL_SIZE=16 \
+VLLM_ASCEND_SMOKE_DATASET=chinese_23k \
+VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=1 \
+VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=1 \
+VLLM_ASCEND_SMOKE_RUN_MODE=graph \
+VLLM_ASCEND_SMOKE_ENABLE_MTP=1 \
+VLLM_ASCEND_SMOKE_ENABLE_MTP_GRAPH=1 \
+VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0 \
+python examples/dsa_demo/simple_test_2p.py
 ```
-
-四种模式的作用：
-
-- `disabled`：不传 `dsa_sparse_config`；A5 C8 开关可独立保留，用于验证 DSA
-  修改未影响相同 cache 编码下的原生路径；
-- `cache-init`：只构造 `LLM`，验证 Indexer/resident MLA 双平面初始化；
-- `eager`：执行 DSA LIDU/KSC/SFA-Offload 和满块 dump；
-- `graph`：执行 `VLLM_COMPILE + FULL_DECODE_ONLY`。
-
-`cache-init` 不执行 `generate()`，因此不能证明数据面算子已经运行。结果 JSON
-也不捕获 engine-core 子进程日志；容量报告是否出现且只出现一次，必须在
-完整控制台日志中单独核对。
-
-默认短 prompt 主要覆盖 DENSE。构造 sparse/ENTER 或混合预算 batch 时，直接
-替换 `PROMPTS` 并相应增大 `MAX_NUM_SEQS`、`MAX_MODEL_LEN` 和
-`MAX_NUM_BATCHED_TOKENS`。实际阈值覆盖应使用 tokenizer token 长度，不要把
-字符数当 token 数。
-
-graph 模式下，普通 Q=1 或 MTP3 的 uniform Q=4
-DENSE/ENTER/SPARSE 任意混排可进入统一 FULL graph；prefill、非 uniform
-query、capture-size miss 或其他原生动态 blocker 会被 DSA 显式送入 true
-eager，不会执行一张仅覆盖部分 DSA metadata 的 piecewise graph。MTP3 的
-双尾块覆盖跨 128-token 边界，不通过临时降级 Q=1 规避。非法 async 配置由
-`tests/ut/dsa_offload/test_config.py` 覆盖。
-
-chunked prefill 复用 vLLM v0.23 原生调度。把
-`ENABLE_CHUNKED_PREFILL=True`，并把 `MAX_NUM_BATCHED_TOKENS` 调到小于
-单条长 prompt 的 token 数，即可覆盖多个 chunk。DSA 仍保持
-prefill/decode phase barrier：每个 prefill chunk 走 eager，最后一个 chunk
-完成并同步 dump 后才释放 resident 满块，后续单 token decode 可正常进入
-FULL graph。`scheduler_reserve_full_isl` 必须保持默认的 `True`，保证首个
-chunk 入场前完整 prompt 能同时容纳于 Indexer 与 resident MLA 两个 dense
-plane。
-
-## 3. QA 数据集回归
-
-`qa_dataset_test.py` 延续旧项目对测试同事更直接的用法：修改文件顶部“用户
-配置”区，不强制记忆大量 CLI 参数。至少设置：
-
-```python
-MODEL_PATH = "/mnt/kv_dpc/weight/GLM-5.1-w4a8"
-DATASET_FILE = "/home/data/longbench/multifieldqa_zh.jsonl"
-DATASET_START = 0
-DATASET_LIMIT = 100
-RESULT_DIR = "LongBenchResult/glm51_dsa"
-RUN_MODE = "eager"
-BATCH_SIZE = 4
-MAX_MODEL_LEN = 131072
-MAX_NUM_BATCHED_TOKENS = 131072
-ENABLE_CHUNKED_PREFILL = False
-```
-
-然后运行：
-
-```bash
-python examples/dsa_demo/qa_dataset_test.py
-```
-
-建议对同一数据切片跑三次：
-
-1. `RUN_MODE="disabled"`：原生基线；
-2. `RUN_MODE="eager"`：DSA eager；
-3. `RUN_MODE="graph"`：DSA FULL decode graph。
-
-脚本自动在 `RESULT_DIR` 下增加 `disabled/eager/graph` 子目录，不会让三次
-结果相互覆盖。
-
-输出 JSONL 保留：
-
-- `pred`；
-- `answers`；
-- `all_classes`；
-- LongBench `length`；
-- `sample_id`、`sample_index`；
-- 实际 `prompt_tokens`。
-
-这既可用于自动评分，也可直接定位异常请求。若一批 prompt token 总数超过
-`max_num_batched_tokens`，脚本会提示 scheduler 可能分多轮完成 prefill；
-打开 `ENABLE_CHUNKED_PREFILL` 后，单个长 prompt 也可以按 token budget
-切成多个 prefill chunk。
-
-脚本默认 `MIN_TOKENS=0`，不会强制模型绕过正常 EOS。评分器也仅按
-LongBench 官方规则对 `trec/triviaqa/samsum/lsht` 截取首行；QA 和
-retrieval 任务保留完整输出参与评分，以免掩盖后续乱码、重复 prompt 或异常
-提前结束。
-
-## 4. LongBench 评分
-
-评分脚本需要环境中存在 `jieba`、`fuzzywuzzy` 和 `rouge`。对一个目录：
-
-```bash
-python examples/dsa_demo/eval_dataset_acc_score.py \
-  --result-path \
-  examples/dsa_demo/LongBenchResult/glm51_dsa/eager
-```
-
-对单个文件：
-
-```bash
-python examples/dsa_demo/eval_dataset_acc_score.py \
-  --result-path /path/to/multifieldqa_zh.jsonl
-```
-
-增加 `--longbench-e` 可输出 `0-4k`、`4-8k` 和 `8k+` 三档分数。
-
-## 5. 最小回归矩阵
-
-| 维度 | 至少覆盖 |
-|---|---|
-| 模式 | disabled、eager、graph |
-| batch | bsz=1、bsz>1 |
-| 长度 | 超短、DENSE、三档 resident budget |
-| row mode | 全 DENSE、全 SPARSE、DENSE/ENTER/SPARSE mixed |
-| graph | active=captured、active<captured 的 PAD |
-| dump | prefill 多满块、decode 跨满块 |
-| chunked prefill | 中间 chunk、最终 chunk、完成后首个 decode |
-| 生命周期 | 请求结束、InputBatch condense/reorder、stable row 复用 |
-| 模型 | GLM-5.1/GLM-5.2 主验收、DeepSeek-V3.2 回归 |
-
-不要只看“进程跑完”。至少核对：
-
-- 无乱码和异常提前 EOS；
-- 同一请求在 bsz=1 与 bsz>1 下没有明显语义断裂；
-- eager 与 graph 没有单行串扰；
-- finish reason 与输出 token 数合理；
-- 容量报告的 blocks、tokens、bytes 自洽；
-- 没有 silent fallback 到未启用 DSA 的路径。
-
-## 6. 问题反馈工件
-
-出现问题时保留：
-
-- vLLM 和 vLLM-Ascend commit；
-- 完整脚本配置或结果 JSON；
-- 模型 architecture、量化方式、TP/EP/DP；
-- prompt token 长度和出错 sample index；
-- 从 `non-default args` 到异常结束的完整日志；
-- DSA HBM 容量报告；
-- eager/graph 对照 token IDs 与 finish reason；
-- CANN、torch、torch-npu、设备型号；
-- 性能问题对应的 profiler 目录和测试场景。
-
-`trace_points` 当前是拉起期可解析的预留合同，尚无稳定日志 consumer。不要
-把“没有 trace 输出”解释成 DSA 未运行；确认路径应结合容量报告、自定义
-算子 profiling 和输出结果。
-
-## 7. 在线流式服务
-
-先修改 `serve_dsa.sh` 顶部用户配置。首次在线验证建议从
-`RUN_MODE="eager"` 开始，确认请求生命周期、连续请求和流式返回正常后，再
-切换为 `RUN_MODE="graph"`：
-
-对 A5/950 W4A4C8，至少修改：
-
-```bash
-MODEL_PATH="/path/to/GLM-5.1-or-5.2-w4a4c8"
-SERVED_MODEL_NAME="glm-5.2-dsa"
-ENABLE_A5_PACKED_C8_DSA="true"
-SAFETENSORS_LOAD_STRATEGY="prefetch"
-```
-
-该开关会在 `additional_config` 同时写入
-`enable_sparse_sfa_c8=true` 与 `enable_sparse_li_c8=true`。不要只开其中
-一个；当前 A5 DSA 会在初始化期拒绝半开布局。W4A4C8 仍使用
-`--quantization ascend`。需要验证 MTP3 时再设置：
-
-```bash
-ENABLE_MTP="true"
-```
-
-启动脚本会同时改用 `sparse_activation_tokens=8192`、resident 档位
-`8192/10240/12288`，并传入
-`{"method":"mtp","num_speculative_tokens":3}`。MTP3 只接受
-`temperature=0.0`；target 可复用 uniform FULL graph，GLM proposer 按社区
-基线保持 eager。MTP proposer 使用独立 BF16 full-cache group，不进入 target
-DSA resident/DRAM 数据面；默认 ratio=3 时启动容量报告应显示 target Indexer
-`3N`、target resident `N`、MTP full `3N` 三个物理 pool。
-若修改了 `SERVED_MODEL_NAME`，同步把 `stream_chat_client.py` 顶部的
-`MODEL_NAME` 改成相同值。
-
-```bash
-bash examples/dsa_demo/serve_dsa.sh 2>&1 | tee dsa-online.log
-```
-
-服务就绪后，另开终端检查：
-
-```bash
-curl -H "Authorization: Bearer EMPTY" \
-  http://127.0.0.1:8000/v1/models
-```
-
-运行交互式流式客户端：
-
-```bash
-python examples/dsa_demo/stream_chat_client.py
-```
-
-客户端会保留并在下一轮重新发送完整消息历史。设置
-`LONG_CONTEXT_FILE="/path/to/long_context.txt"` 可以把长文本加入 system
-消息；只有实际 token 长度超过 `sparse_activation_tokens`，才能验证
-ENTER/SPARSE 路径，而不是只验证在线 API 和 DENSE 路径。由于 DSA 当前关闭
-prefix cache，多轮长上下文测试每次都会重新 prefill 完整历史，这是当前
-合同内的预期行为。
-
-若要复现离线 `llm.generate()` 的原始小说续写，而不是让 chat template
-把小说包装成一轮对话，可在 `stream_chat_client.py` 的用户配置区设置：
-
-```python
-from novel_dataset import chinese_40k
-
-CONTINUATION_PROMPT = chinese_40k[0]
-MAX_TOKENS = 512
-```
-
-此时脚本会调用流式 `/v1/completions`，将 `chinese_40k[0]` 原样作为
-prompt，输出一次续写后退出。`chinese_40k` 在测试数据中是只包含一条
-文本的 list，因此这里需要取 `[0]`。
-
-不安装 Python OpenAI SDK 时，也可以直接观察 SSE 流：
-
-```bash
-curl -N http://127.0.0.1:8000/v1/chat/completions \
-  -H "Authorization: Bearer EMPTY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "glm-5.1-dsa",
-    "messages": [{"role": "user", "content": "你好，请介绍一下你自己。"}],
-    "temperature": 0,
-    "max_tokens": 128,
-    "stream": true
-  }'
-```
-
-在线冒烟至少核对：
-
-- 启动日志中 DSA HBM 容量报告只出现一次；
-- `/v1/models` 返回 `glm-5.1-dsa`；
-- SSE/客户端内容逐步输出，而非等待完整回答后一次性打印；
-- 同一短请求在在线 eager 与离线 eager 下无明显语义差异；
-- 长上下文请求能够进入 DSA 算子路径；
-- 连续多轮、`/clear` 后新请求以及请求结束后的 row 复用均无串扰；
-- eager 通过后再复测 graph，比较 token IDs、结束原因和服务日志。
-
-### 在线长上下文数据集
-
-`online_long_context_dataset_test.py` 可直接复用已经拉起的在线服务。测试数据包
-包含 LV-Eval 中文 multifield QA 的 16K/32K/64K/128K 档，以及 CLongEval
-小说问答和键值检索的 small/medium/large 档。
-
-先把数据包解压到服务器，例如：
-
-```bash
-unzip -q dsa_long_context_dataset_pack.zip -d /home/data
-```
-
-确认脚本顶部配置：
-
-```python
-API_BASE = "http://127.0.0.1:8000/v1"
-MODEL_NAME = "glm-5.1-dsa"
-LOCAL_TOKENIZER_PATH = None
-DATASET_ROOT = "/home/data/dsa_long_context_dataset_pack"
-RUN_LABEL = "dsa-eager-online"
-ENABLE_THINKING = False
-MAX_SAMPLES_PER_FILE = None
-```
-
-服务无需重启，直接运行：
-
-```bash
-python examples/dsa_demo/online_long_context_dataset_test.py
-```
-
-脚本按照 `dataset_specs()` 中的数据集顺序和 JSONL 原始行序完整处理样本，
-不按长度选样或重排。`MAX_SAMPLES_PER_FILE = None` 表示完整处理每个文件；
-仅在快速调试脚本时才设置正整数上限。脚本从 `/v1/models` 返回的模型
-`root` 本地加载同一 tokenizer（不加载模型权重），提前计算 prompt token 数
-并拦截超过 `max_model_len` 的样本。服务使用单独的 `--tokenizer` 路径时，
-需要通过 `LOCAL_TOKENIZER_PATH` 显式指定。
-
-第一条有效样本会额外调用一次服务端 `/tokenize`，确认本地 tokenizer、chat
-template 和 `enable_thinking` 得到的计数完全一致；其余样本均在本地预检。
-正式响应的 `usage.prompt_tokens` 会再次与预检值核对。样本按实际长度标记为
-`0-6K`、`6-16K`、`16-32K`、`32-48K`、`48-64K`、`64-96K` 或
-`96K+`。
-
-每 `REQUEST_CONCURRENCY` 条样本组成一个客户端并发组。脚本会在发送前逐行
-打印数据集、子集、样本 ID、任务要求、问题（或检索键）和 golden answer；
-同时打印预检 token 数和长度区间。组完成后再打印正式响应中的实际 token
-数。脚本不会人为安排 mixed-length 组合；实际进入同一个引擎 batch 的请求仍
-由在线调度器决定。结果保存为 JSONL，并生成按数据集、任务类型和实际 token
-档汇总的 `summary.json`。
-
-当前接入的任务包括：
-
-- CLongEval `long_story_qa`：长篇小说问答；
-- CLongEval `key_passage_retrieval`：从 JSON 长上下文中检索指定键的值；
-- LV-Eval `multifieldqa_zh_mixup`：多文章混合场景问答；
-- 可选 LongBench `multifieldqa_zh`：长上下文问答。
-
-数据包中的 NeedleBench 文件目前只是后续扩展所需的原始语料和 needle 定义，
-尚未被该脚本组装成测试样本。
-
-GLM-5.1 的 chat template 默认开启 thinking。短答案精度回归保持
-`ENABLE_THINKING = False`；否则较小的 `MAX_TOKENS` 可能全部成为
-reasoning token，最终答案为空。
-
-`character_f1` 和 `contains_answer` 是不依赖额外包的冒烟指标，不等价于
-LV-Eval 或 CLongEval 官方排行榜分数。正式精度对比应保持相同数据包、服务
-参数和 `RUN_LABEL`，分别拉起 baseline、DSA eager 与 DSA graph 后运行。
-
-## 8. 当前不支持
-
-- prefill/decode mixed batch（chunked prefill 本身已支持）；
-- async scheduling；
-- prefix cache；
-- preemption/resume；
-- 非 MTP speculative method、MTP draft 数不等于 3、非 greedy MTP；
-- KV transfer connector；
-- context parallel 和 pipeline parallel；
-- KV-cache metrics/events；
-- A5 设备算子验收。
-
-这些能力会在后续按独立合同逐项扩展。在相应实现和回归完成前，不要通过
-删除启动期校验强行打开。

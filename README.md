@@ -193,14 +193,14 @@ DP=1 为主；DP 扩展、完整数据集与性能验收属于下一阶段。
 - [DSA demo 与测试说明](examples/dsa_demo/README.md)
 - [上游 vLLM-Ascend README](README.upstream.md)
 
-`simple_prompt_test.py` 延续旧版测试方式：先在文件顶部修改 `MODEL_PATH`、
-`RUN_MODE` 和 prompt 等常量，再直接运行。`RUN_MODE` 可取
-`disabled/cache-init/eager/graph`。
+单机使用 `simple_test_1p.py`，双机使用 `simple_test_2p.py`，共用
+`simple_test.py`。通过 `VLLM_ASCEND_SMOKE_*` 环境变量传入模型、TP/DP、数据集等参数，
+无需修改 Python；`RUN_MODE` 可取 `cache-init/eager/graph`，`ENABLE_OFFLOAD=0` 独立关闭卸载。
 
 ```bash
 python -m pytest tests/ut/dsa_offload -vv --tb=short
 
-python examples/dsa_demo/simple_prompt_test.py
+python examples/dsa_demo/simple_test_1p.py
 ```
 
 数据集精度回归与评分分别使用

@@ -27,7 +27,55 @@ from typing import Any
 
 # begin-env-vars-definition
 
+# Offline demo overrides only; never read by inference kernels. All default to
+# None (inherit SmokeConfig / entry defaults). Booleans: 0/1, true/false,
+# yes/no, on/off; numeric fields retain SmokeConfig validation; integer tuples
+# are comma-separated. DATASET: short/chinese_10k/23k/48k/64k; PROMPTS: JSON
+# string list (exclusive with DATASET). RESULT_DIR=none disables result files.
+# Node rank: 0/1; ports: 1..65535. See examples/dsa_demo/README.md for defaults.
+# Paths, prompt text and IPs may be private; do not put credentials in them.
+SMOKE_ENV_PREFIX = "VLLM_ASCEND_SMOKE_"
+SMOKE_ENV_FIELDS = (
+    "model_path",
+    "tensor_parallel_size",
+    "data_parallel_size",
+    "enable_offload",
+    "run_mode",
+    "prompts",
+    "dataset",
+    "max_num_seqs",
+    "max_model_len",
+    "max_num_batched_tokens",
+    "max_tokens",
+    "enable_chunked_prefill",
+    "gpu_memory_utilization",
+    "quantization",
+    "enable_expert_parallel",
+    "enable_a5_packed_c8",
+    "enable_cpu_binding",
+    "enable_mtp",
+    "mtp_num_speculative_tokens",
+    "enable_mtp_graph",
+    "enable_profile",
+    "profile_dir",
+    "result_dir",
+    "process_timeout_seconds",
+    "dsa_indexer_mla_block_ratio",
+    "dsa_max_active_reqs",
+    "dsa_hot_cpu_block_multiple",
+    "dsa_prompt_budget_thresholds",
+    "graph_capture_sizes",
+    "node_rank",
+    "master_addr",
+    "master_port",
+    "sync_port",
+)
+
 env_variables: dict[str, Callable[[], Any]] = {
+    **{
+        name: lambda name=name: os.getenv(name)
+        for name in (SMOKE_ENV_PREFIX + field.upper() for field in SMOKE_ENV_FIELDS)
+    },
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

@@ -38,7 +38,7 @@ class TestDSATwoNodePreflight(unittest.TestCase):
             )
         )
 
-        inference = ast.parse((demo_dir / "simple_prompt_test_dp16.py").read_text(encoding="utf-8"))
+        inference = ast.parse((demo_dir / "simple_test.py").read_text(encoding="utf-8"))
         hierarchy_values = [
             node.value.value
             for node in ast.walk(inference)

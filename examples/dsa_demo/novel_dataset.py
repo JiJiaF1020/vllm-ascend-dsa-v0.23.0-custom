@@ -1,4 +1,6 @@
-chinese_20k = ["""
+# GLM-5.1 实测本样本为 23518 token；其他 tokenizer 下可能不同。
+# 长度标签按约数命名，字符数 / 1.5 仅用于粗略估算，不能替代 tokenizer 计数。
+chinese_23k = ["""
 第一章 陨落的天才
 
 “斗之力，三段！”
@@ -1163,4 +1165,8 @@ chinese_20k = ["""
 
 这种选择题，对薰儿来说，并不困难。
 
-    """] # 23518 for glm5.1
+    """]
+
+chinese_48k = [chinese_23k[0] * 2,]
+chinese_64k = [(chinese_23k[0] * 3)[:92800],]
+chinese_10k = [chinese_23k[0][:15000],]

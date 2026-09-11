@@ -504,7 +504,7 @@ def test_mc2(
         device=device,
     )
 
-    # Match simple_prompt_test_dp16.py: do not force hierarchy, which the
+    # Match simple_test.py: do not force hierarchy, which the
     # Ascend 950 communication-context path rejects during tiling.
     dispatch_outputs = torch_npu.npu_moe_distribute_dispatch_v2(
         x=x,

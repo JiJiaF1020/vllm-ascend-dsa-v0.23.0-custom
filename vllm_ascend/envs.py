@@ -30,7 +30,7 @@ from typing import Any
 # Offline demo overrides only; never read by inference kernels. All default to
 # None (inherit SmokeConfig / entry defaults). Booleans: 0/1, true/false,
 # yes/no, on/off; numeric fields retain SmokeConfig validation; integer tuples
-# are comma-separated. DATASET: short/chinese_5k/10k/23k/40k/64k; PROMPTS: JSON
+# are comma-separated. DATASET: short/chinese_5k/10k/23k/40k/64k/104k; PROMPTS: JSON
 # string list (exclusive with DATASET). RESULT_DIR=none disables result files.
 # Node rank: 0/1; ports: 1..65535. See examples/dsa_demo/README.md for defaults.
 # Paths, prompt text and IPs may be private; do not put credentials in them.

@@ -8,7 +8,7 @@
 | `TENSOR_PARALLEL_SIZE` | 单机 `2`，双机 `1` | TP 大小 |
 | `DATA_PARALLEL_SIZE` | 单机 `4`，双机 `16` | 全局 DP 大小；双机须为偶数 |
 | `MAX_NUM_SEQS` | `1` | 每个 DP rank 的 BS；总 BS = DP × 此值 |
-| `DATASET` | `chinese_23k` | `short/chinese_5k/chinese_10k/chinese_23k/chinese_40k/chinese_64k`；64k 为23k与40k拼接，token 数为估算 |
+| `DATASET` | `chinese_23k` | `short/chinese_5k/chinese_10k/chinese_23k/chinese_40k/chinese_64k/chinese_104k`；GLM-5.2 实测依次为（不含 short）5000/10000/23000/40000/64000/104000 token；104k 为40k与64k拼接 |
 | `PROMPTS` | 未设置 | 自定义 JSON 数组，如 `'["你好"]'`；与 DATASET 二选一 |
 | `MAX_MODEL_LEN` | `25600` | 单请求输入与输出的最大总 token 数 |
 | `MAX_NUM_BATCHED_TOKENS` | `25600` | 每 DP rank 每步 token 预算；关闭 chunk 时须 ≥ MAX_MODEL_LEN |

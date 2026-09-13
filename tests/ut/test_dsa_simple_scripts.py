@@ -2,14 +2,17 @@
 """Smoke configuration/launcher tests without vLLM or NPU dependencies."""
 
 import argparse
+import ast
 import importlib
 import io
 import itertools
 import json
 import multiprocessing
 import os
+import re
 import sys
 import tempfile
+import unicodedata
 import unittest
 from contextlib import redirect_stdout
 from dataclasses import replace
@@ -42,9 +45,7 @@ class TestSimpleScripts(unittest.TestCase):
         self.assertFalse(hasattr(dataset, "chinese_48k"))
         self.assertEqual(len(dataset.chinese_40k), 1)
         self.assertTrue(dataset.chinese_40k[0])
-        self.assertEqual(dataset.chinese_64k, [dataset.chinese_23k[0] + dataset.chinese_40k[0]])
-        self.assertEqual(dataset.chinese_10k, [dataset.chinese_23k[0][:15000]])
-        self.assertEqual(dataset.chinese_5k, [dataset.chinese_23k[0][:7500]])
+        self.assertEqual(dataset.chinese_104k, [dataset.chinese_40k[0] + dataset.chinese_64k[0]])
         self.assertEqual((one.tensor_parallel_size, one.data_parallel_size), (2, 4))
         self.assertEqual((two.tensor_parallel_size, two.data_parallel_size), (1, 16))
         for config in (one, two):
@@ -52,6 +53,29 @@ class TestSimpleScripts(unittest.TestCase):
             self.assertFalse(config.enable_profile)
             self.assertFalse(config.enable_chunked_prefill)
             self.assertTrue(config.mtp_graph_enabled)
+
+    def test_independent_chinese_datasets(self):
+        names = {"chinese_5k", "chinese_10k", "chinese_23k", "chinese_40k", "chinese_64k"}
+        tree = ast.parse((DEMO / "novel_dataset.py").read_text())
+        fingerprints = {}
+        for node in tree.body:
+            if not isinstance(node, ast.Assign) or not isinstance(node.targets[0], ast.Name):
+                continue
+            name = node.targets[0].id
+            if name not in names:
+                continue
+            # Each independent dataset must be a literal, not a slice/concatenation.
+            texts = ast.literal_eval(node.value)
+            self.assertEqual(len(texts), 1)
+            text = texts[0]
+            self.assertIsInstance(text, str)
+            normalized = re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", text))
+            self.assertGreater(len(re.findall(r"[\u4e00-\u9fff]", normalized)) / len(normalized), 0.75)
+            fingerprints[name] = {normalized[i : i + 32] for i in range(len(normalized) - 31)}
+        self.assertEqual(set(fingerprints), names)
+        for left, right in itertools.combinations(sorted(names), 2):
+            with self.subTest(left=left, right=right):
+                self.assertFalse(fingerprints[left] & fingerprints[right])
 
     def test_configuration_matrix(self):
         for (tp, dp), offload, mode, mtp, graph in itertools.product(
@@ -177,7 +201,15 @@ class TestSimpleScripts(unittest.TestCase):
 
     def test_environment_dataset_and_rejections(self):
         with patch.object(sys, "path", [str(DEMO), *sys.path]):
-            for name in ("short", "chinese_5k", "chinese_10k", "chinese_23k", "chinese_40k", "chinese_64k"):
+            for name in (
+                "short",
+                "chinese_5k",
+                "chinese_10k",
+                "chinese_23k",
+                "chinese_40k",
+                "chinese_64k",
+                "chinese_104k",
+            ):
                 config = self.smoke.config_from_environment(self.config, {"dataset": name})
                 self.assertEqual(len(config.prompts), 1)
             for values in (

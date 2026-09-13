@@ -1,4 +1,4 @@
-## 1. 参数说明
+## 参数说明
 
 环境变量均需加前缀 `VLLM_ASCEND_SMOKE_`，例如 `ENABLE_PROFILE` 写作 `VLLM_ASCEND_SMOKE_ENABLE_PROFILE`。未设置时使用默认值，布尔值用 `1` 开启、`0` 关闭。
 
@@ -39,7 +39,7 @@
 | `MASTER_PORT` | `29500` | 双机 DP rendezvous 端口，两台一致 |
 | `SYNC_PORT` | `29600` | 双机前端同步端口，两台一致且不同于 MASTER_PORT |
 
-## 2. simple_test_1p.py 使用样例
+## 单机多卡运行：simple_test_1p.py 使用样例
 
 在仓库根目录运行：单机 8 卡 DP4TP2 + 卸载 + target graph + MTP3 graph。可在末尾加 `--dry-run` 只检查配置。
 
@@ -62,7 +62,7 @@ VLLM_ASCEND_SMOKE_PROFILE_DIR=./vllm_profile/dp4tp2_64k_bs8_offload  \
 python examples/dsa_demo/simple_test_1p.py
 ```
 
-## 3. simple_test_2p.py 使用样例
+## 双机多卡运行：simple_test_2p.py 使用样例
 
 两台容器各运行一次下面的命令：每机 8 卡、全局 DP16TP1。
 
@@ -88,4 +88,26 @@ VLLM_ASCEND_SMOKE_DSA_INDEXER_MLA_BLOCK_RATIO=4 \
 VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0 \
 VLLM_ASCEND_SMOKE_PROFILE_DIR=./vllm_profile/2p_dp16_64k_bs8_offload  \
 python examples/dsa_demo/simple_test_2p.py
+```
+
+## 双击HCCL连通性测试
+
+在**两台机器的容器内、仓库根目录下，各运行同一条命令**。
+
+```
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash examples/dsa_demo/check_two_node_dp16_ep16.sh --master-port 29688 --log-dir ./two_node_preflight_logs --node0-ip 141.61.33.13 --node1-ip 141.61.33.21
+```
+
+注意：
+
+- 每台8张卡应空闲，容器使用 `--network=host`，具备 `ip`、`hostname` 命令和 `torch_npu` 环境。
+- 两台 IP 参数的顺序、端口必须一致；脚本自动识别节点号及网卡。
+- 两端尽快先后启动即可，不需要精确同时。不要额外套 `torchrun`。
+- **不要加 `--skip-mc2`**，这样才会同时验证 HCCL 和 MC2。
+
+检查内容包括16 rank 初始化、`all_reduce` 正确性、`all_to_all_single` 路由，以及 MC2 dispatch/combine。两台最后都出现：
+
+```
+[PASS] node=... completed DP16/EP16 communication preflight
+[PASS] HCCL all_reduce + all_to_all + requested MC2 checks passed
 ```

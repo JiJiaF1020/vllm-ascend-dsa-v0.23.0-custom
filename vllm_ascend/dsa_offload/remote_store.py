@@ -8,12 +8,16 @@
 
 from __future__ import annotations
 
+import logging
+import uuid
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 PAGE_TOKENS = 128
 TOKEN_BYTES = 656
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -42,9 +46,12 @@ class RemoteKvStore:
         # 延迟导入，保持 local_all 不依赖远端算子包、socket 或 HCCP。
         from kvcache_scatter_copy_custom_ops import custom_ops_lib
 
+        if not hasattr(custom_ops_lib, "RemoteKvStoreClient"):
+            raise RuntimeError("operator package has no RemoteKvStoreClient; rebuild the matching Torch extension")
+        logger.info("DSA_STORE_OPEN_BEGIN endpoint=%s native_library=%s", endpoint, custom_ops_lib.__file__)
         self._client = custom_ops_lib.RemoteKvStoreClient(endpoint)
         layers, rows, source_capacity, page_tokens, token_bytes = self._client.layout
-        if (layers, source_capacity, page_tokens, token_bytes) != (payload_layers, capacity, PAGE_TOKENS, TOKEN_BYTES):
+        if (layers, page_tokens, token_bytes) != (payload_layers, PAGE_TOKENS, TOKEN_BYTES) or source_capacity < capacity:
             raise ValueError("remote Store packed layout does not match worker")
         self.store_id = self._client.store_id
         self.capacity = capacity
@@ -136,3 +143,108 @@ class RemoteWatermarks:
             raise ValueError("bound version must remain inside PUT_DONE")
         self.bound[rows] = pages
         self.bound_versions[rows] = versions
+
+
+class RemoteStoreShadow:
+    """真实框架生命周期的写侧穿刺；保留本地计算，不建 DU binding。
+
+    所有操作限定图外/eager。row 是框架稳定行，handle 是 Store 身份；每个
+    worker 使用独立 namespace。同一个 row 在 CLOSE 后可绑定新请求，但当前
+    Store 不回收旧 handle/物理页。PUT_DONE 只在全部 target 层到齐后查询。
+    """
+
+    def __init__(self, store: RemoteKvStore, rows: int) -> None:
+        self.store = store
+        self.namespace = uuid.uuid4().int & ((1 << 63) - 1)
+        self.next_request = 1
+        self.handles = torch.zeros(rows, dtype=torch.int64)
+        self.request_ids: dict[int, str] = {}
+        self.watermarks = RemoteWatermarks(rows)
+        self.layer_pages = np.zeros((store.payload_layers, rows), dtype=np.int32)
+        self.put_pages = 0
+        self.closed_requests = 0
+        logger.info("DSA_STORE_SHADOW_OPEN mode=store_shadow inference=local_all store_id=%s layers=%s capacity=%s",
+                    store.store_id, store.payload_layers, store.capacity)
+
+    def ensure_requests(self, request_ids: list[str], pool_rows: np.ndarray) -> None:
+        for request_id, row_value in zip(request_ids, pool_rows, strict=True):
+            row = int(row_value)
+            if row in self.request_ids:
+                if self.request_ids[row] != request_id:
+                    raise RuntimeError("Store row reused before CLOSE")
+                continue
+            # 单个 CREATE 成功后立即记录，后续 CREATE 失败也不会丢失已分配的 handle。
+            keys = torch.tensor([[self.namespace, self.next_request]], dtype=torch.int64)
+            capacities = torch.tensor([self.store.capacity], dtype=torch.int32)
+            handles, _ = self.store.create_requests(keys, capacities)
+            self.handles[row] = handles[0]
+            self.request_ids[row] = request_id
+            self.next_request += 1
+            logger.info("DSA_STORE_CREATE row=%s request=%s handle=%s", row, request_id, int(handles[0]))
+
+    def plan_dump(self, pool_rows: np.ndarray, logical_pages: np.ndarray) -> None:
+        if not pool_rows.size:
+            return
+        planned = self.watermarks.planned.numpy()
+        np.maximum.at(planned, pool_rows, logical_pages + 1)
+
+    def put_layer(self, layer: int, packed_hbm: torch.Tensor, source_blocks: np.ndarray,
+                  pool_rows: np.ndarray, logical_pages: np.ndarray, *, before_cache_write: bool) -> None:
+        if not pool_rows.size:
+            return
+        if torch.compiler.is_compiling():
+            raise RuntimeError("store_shadow PUT must not enter a compiled graph")
+        rows = torch.from_numpy(pool_rows.astype(np.int64, copy=False))
+        if bool((self.handles[rows] == 0).any()):
+            raise RuntimeError("Store PUT requires CREATE for each real request row")
+        # 原 dump plan 已按 request/logical page 排序。只接受连续满块，不把洞当作前缀。
+        unique_rows = np.unique(pool_rows)
+        for row in unique_rows:
+            pages = logical_pages[pool_rows == row]
+            start = int(self.layer_pages[layer, row])
+            if not np.array_equal(pages, np.arange(start, start + pages.size)):
+                raise RuntimeError(f"Store PUT prefix mismatch: layer={layer} row={row} next_page={start}")
+        logger.info("DSA_STORE_PUT_BEGIN layer=%s pages=%s phase=%s", layer, pool_rows.size,
+                    "prewrite" if before_cache_write else "post_attention")
+        self.store.dump_packed_pages(
+            layer, packed_hbm, torch.from_numpy(source_blocks), self.handles[rows],
+            torch.from_numpy(logical_pages.astype(np.int32, copy=False)),
+        )
+        np.maximum.at(self.layer_pages[layer], pool_rows, logical_pages + 1)
+        self.put_pages += int(pool_rows.size)
+        logger.info("DSA_STORE_PUT_END layer=%s pages=%s bytes=%s", layer, pool_rows.size,
+                    pool_rows.size * PAGE_TOKENS * TOKEN_BYTES)
+        # Store 的 READY 前缀跨所有 payload 层取 min；第一层 PUT 后直接 WAIT 会死等后续层。
+        prefix = self.layer_pages[:, unique_rows].min(axis=0)
+        ready = prefix > self.watermarks.done.numpy()[unique_rows]
+        if np.any(ready):
+            done_rows = torch.from_numpy(unique_rows[ready].astype(np.int64, copy=False))
+            targets = torch.from_numpy(prefix[ready].copy())
+            result = self.store.wait_put_done(self.handles[done_rows], targets)
+            if not torch.equal(result.handles, self.handles[done_rows]) or not torch.equal(result.full_blocks, targets):
+                raise RuntimeError("Store PUT_DONE does not match this worker's handles/pages")
+            self.watermarks.complete(done_rows, result)
+            logger.info("DSA_STORE_PUT_DONE rows=%s pages=%s versions=%s bound=0",
+                        done_rows.tolist(), result.full_blocks.tolist(), result.versions.tolist())
+
+    def release(self, row: int) -> None:
+        if row not in self.request_ids:
+            return
+        handle = self.handles[row:row + 1]
+        # shadow 没有 DU lease，不伪造 DRAIN/APPLIED；同步 PUT 返回后已无在途读者。
+        self.store.close_requests(handle)
+        logger.info("DSA_STORE_CLOSE row=%s handle=%s done_pages=%s binding=none", row, int(handle[0]),
+                    int(self.watermarks.done[row]))
+        self.closed_requests += 1
+        del self.request_ids[row]
+        self.handles[row] = 0
+        self.layer_pages[:, row] = 0
+        for values in (self.watermarks.planned, self.watermarks.done, self.watermarks.bound,
+                       self.watermarks.done_versions, self.watermarks.bound_versions):
+            values[row] = 0
+
+    def close(self) -> None:
+        for row in tuple(self.request_ids):
+            self.release(row)
+        logger.info("DSA_STORE_SHADOW_CLOSED requests=%s put_pages=%s inference=local_all remote_get=0",
+                    self.closed_requests, self.put_pages)

@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     from vllm_ascend.dsa_offload.input_batch import (
         DSAInputBatchCacheLayout,
     )
+    from vllm_ascend.dsa_offload.remote_store import RemoteStoreShadow
     from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 
@@ -243,6 +244,7 @@ class DSAOffloadRuntime:
         )
 
         self.dram_store: DSAHotDRAMStore | None = None
+        self.remote_store_shadow: RemoteStoreShadow | None = None
         self.active_num_reqs = 0
         self.execution_num_reqs = 0
         self.dump_job_count = 0
@@ -279,9 +281,15 @@ class DSAOffloadRuntime:
         self.dram_store = store
 
     def release_pool_index(self, pool_index: int) -> None:
+        if self.remote_store_shadow is not None:
+            self.remote_store_shadow.release(pool_index)
         store = self.dram_store
         if store is not None:
             store.release_pool_index(pool_index)
+
+    def close_remote_store(self) -> None:
+        if self.remote_store_shadow is not None:
+            self.remote_store_shadow.close()
 
     def _reset_selection_source(self) -> None:
         """进入新的执行 view 前清空上一步的 full 层来源标记。"""
@@ -321,6 +329,10 @@ class DSAOffloadRuntime:
         )
         self._forward_epoch += 1
 
+        if self.remote_store_shadow is not None:
+            self.remote_store_shadow.ensure_requests(
+                input_batch.req_ids[:num_reqs], state.resident_pool_indices_cpu[:num_reqs],
+            )
         self._prepare_dump_plan(
             input_batch=input_batch,
             state=state,
@@ -760,6 +772,10 @@ class DSAOffloadRuntime:
         self.dump_dst_block_ids.np[:job_count] = (
             reservation.physical_block_ids
         )
+        if self.remote_store_shadow is not None:
+            self.remote_store_shadow.plan_dump(
+                self._dump_pool_indices[:job_count], self._dump_logical_indices[:job_count],
+            )
         store.commit_durable_full_block_counts(
             pool_indices=pool_indices[boundary_rows],
             full_block_counts=durable_target[boundary_rows],
@@ -1224,6 +1240,14 @@ class DSALayerOffloadContext:
                 src_block_ids=self.runtime.dump_src_block_ids.gpu[:job_count],
                 dst_block_ids=self.runtime.dump_dst_block_ids.gpu[:job_count],
             )
+            shadow = self.runtime.remote_store_shadow
+            if shadow is not None:
+                real_jobs = self.runtime.dump_job_count
+                shadow.put_layer(
+                    self.layer_id, resident_cache[0], self.runtime._dump_source_blocks[:real_jobs],
+                    self.runtime._dump_pool_indices[:real_jobs], self.runtime._dump_logical_indices[:real_jobs],
+                    before_cache_write=before_cache_write,
+                )
             return
         if len(resident_cache) < 2 or arenas.nope is None or arenas.rope is None:
             raise RuntimeError("DSA bf16 dump requires NOPE and ROPE HBM/DRAM planes")

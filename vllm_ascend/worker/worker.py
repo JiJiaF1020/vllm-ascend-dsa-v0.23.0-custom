@@ -384,6 +384,9 @@ class NPUWorker(WorkerBase):
             weight_transfer_engine.shutdown()
 
         if model_runner := getattr(self, "model_runner", None):
+            if dsa_runtime := getattr(model_runner, "dsa_offload_runtime", None):
+                # 正常 shutdown 也回收最后一轮尚未出现在 finished_req_ids 中的请求。
+                dsa_runtime.close_remote_store()
             shutdown_fn = getattr(model_runner, "shutdown", None)
             if callable(shutdown_fn):
                 shutdown_fn()

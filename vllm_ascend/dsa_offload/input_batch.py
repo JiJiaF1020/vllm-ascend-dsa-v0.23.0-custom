@@ -199,9 +199,11 @@ class DSAInputBatchCacheLayout:
     def release_request(self, request_id: str) -> None:
         """在请求真正结束时释放 resident 行及其 DRAM ledger。"""
 
-        released_index = self.resident_token_pool.release(request_id)
-        if released_index is not None and self._pool_release_callback is not None:
-            self._pool_release_callback(released_index)
+        pool_index = self.resident_token_pool.get_index(request_id)
+        if pool_index is not None and self._pool_release_callback is not None:
+            # 外部 CLOSE 失败不能先把 row 放回空闲队列，否则下一请求会复用仍存活的身份。
+            self._pool_release_callback(pool_index)
+        self.resident_token_pool.release(request_id)
         # finished_req_ids 可能与同一轮新提交的同名 request 重叠。清空这份
         # 仅用于跳过稳态重映射的行序缓存，确保新请求仍会重新 acquire。
         if request_id in self._request_ids:

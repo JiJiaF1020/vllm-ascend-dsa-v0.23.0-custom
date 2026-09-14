@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_ascend.dsa_offload.input_batch import (
@@ -509,6 +510,23 @@ def test_stable_row_order_uses_bulk_column_refresh() -> None:
     assert state.sparse_budget_tokens_cpu[:2].tolist() == [0, 4096]
     assert state.resident_valid_tokens_cpu[:2].tolist() == [-1, 4097]
     assert state.resident_pool_indices_cpu[:2].tolist() == [0, 1]
+
+
+def test_failed_external_close_keeps_resident_row() -> None:
+    state = _make_state()
+    row = state.resident_token_pool.acquire("req-a")
+
+    def fail_close(pool_row):
+        assert pool_row == row
+        raise RuntimeError("remote CLOSE failed")
+
+    state.set_pool_release_callback(fail_close)
+    with pytest.raises(RuntimeError, match="remote CLOSE failed"):
+        state.release_request("req-a")
+    assert state.resident_token_pool.get_index("req-a") == row
+    state.set_pool_release_callback(lambda _: None)
+    state.release_request("req-a")
+    assert state.resident_token_pool.get_index("req-a") is None
 
 
 def test_unscheduled_request_keeps_pool_row_until_finished() -> None:

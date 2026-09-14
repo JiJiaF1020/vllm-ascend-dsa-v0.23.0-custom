@@ -52,6 +52,7 @@ class SmokeConfig:
     dsa_prompt_budget_thresholds: tuple[int, ...] = (32768, 65536)
     dsa_mtp_resident_budget_tokens: tuple[int, ...] = (8192, 12288, 12288)  # 仅卸载 + MTP 生效。
     graph_capture_sizes: tuple[int, ...] = (1, 2, 4, 8, 16)  # 请求数；自动补入 max_num_seqs，再转换成 token 数。
+    store_endpoint: str | None = None  # 仅 CLI --store-endpoint；真实写侧穿刺，推理仍是 local_all。
 
     @property
     def mtp_graph_enabled(self) -> bool:
@@ -63,6 +64,7 @@ class SmokeConfig:
         return (
             f"dp{self.data_parallel_size}_tp{self.tensor_parallel_size}"
             f"_{'offload' if self.enable_offload else 'baseline'}_{self.run_mode}_{mtp}"
+            f"{'_store_shadow' if self.store_endpoint else ''}"
         )
 
 
@@ -168,6 +170,10 @@ def main_from_env(defaults: SmokeConfig, *, node_size: int) -> None:
 
 
 def validate_config(config: SmokeConfig) -> None:
+    if config.store_endpoint and (
+        not config.enable_offload or not config.enable_a5_packed_c8 or config.run_mode != "eager"
+    ):
+        raise ValueError("--store-endpoint requires offload + A5 C8 + run_mode=eager; inference remains local_all")
     if config.run_mode not in {"cache-init", "eager", "graph"}:
         raise ValueError("run_mode must be cache-init/eager/graph; use enable_offload=False for baseline")
     for name in (
@@ -262,6 +268,10 @@ def build_llm_kwargs(config: SmokeConfig, multi_node: bool = False) -> dict[str,
             "enable_row_mode_decode_graph": graph,
             "trace_points": {"enabled": False, "points": ["first_sample"], "ranks": [0]},
         }
+        if config.store_endpoint:
+            additional_config["dsa_sparse_config"]["remote_store"] = {
+                "mode": "store_shadow", "endpoint": config.store_endpoint,
+            }
     kwargs: dict[str, Any] = {
         "model": config.model_path,
         "tensor_parallel_size": config.tensor_parallel_size,
@@ -526,10 +536,14 @@ def main(
         parser.set_defaults(node_rank=0, master_addr="", master_port=0, sync_port=0)
     parser.set_defaults(node_size=node_size)
     parser.add_argument("--mtp-eager", action="store_true", help="MTP eager 对照；不改变 target 模式")
+    parser.add_argument("--store-endpoint", help="host:port；真实 CREATE/PUT/PUT_DONE/CLOSE，推理仍走本地，不启用远端 Get")
     parser.add_argument("--dry-run", action="store_true", help="只检查配置和 rank 分配，不加载模型或初始化 NPU")
     args = parser.parse_args()
     if args.mtp_eager:
         config = replace(config, enable_mtp_graph=False)
+    if args.store_endpoint:
+        config = replace(config, store_endpoint=args.store_endpoint)
+        print("[dsa-smoke] mode=store_shadow inference=local_all remote_get=0; synchronous PUT, not a performance run", flush=True)
     # 在创建任何子进程之前发现无效配置。
     _, _, _, ranks = resolve_node_launch(config, args)
     if config.enable_mtp and config.enable_mtp_graph and not config.enable_offload:

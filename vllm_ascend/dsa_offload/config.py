@@ -48,6 +48,7 @@ _PUBLIC_CONFIG_KEYS = frozenset(
         "hot_cpu_block_multiple",
         "enable_row_mode_decode_graph",
         "trace_points",
+        "remote_store",
     }
 )
 _TRACE_CONFIG_KEYS = frozenset({"enabled", "points", "ranks"})
@@ -154,6 +155,30 @@ class DSAOffloadTraceConfig:
 
 
 @dataclass(frozen=True)
+class DSARemoteStoreConfig:
+    """首阶段只验证真实 PUT 生命周期；不把本地推理冒充远端 Get。"""
+
+    endpoint: str
+    mode: str = "store_shadow"
+
+    @classmethod
+    def from_value(cls, value: Any) -> DSARemoteStoreConfig | None:
+        if value is None:
+            return None
+        if not isinstance(value, Mapping) or set(value) - {"endpoint", "mode"}:
+            raise ValueError("remote_store accepts only endpoint and mode=store_shadow")
+        if value.get("mode") != "store_shadow":
+            raise ValueError("remote_store requires explicit mode=store_shadow; remote decode/FETCH is not connected")
+        endpoint = value.get("endpoint")
+        if not isinstance(endpoint, str):
+            raise ValueError("remote_store.endpoint must be host:port")
+        host, separator, port = endpoint.rpartition(":")
+        if not host or not separator or not port.isdecimal() or not 0 < int(port) < 65536:
+            raise ValueError("remote_store.endpoint must be host:port with port in 1..65535")
+        return cls(endpoint=endpoint)
+
+
+@dataclass(frozen=True)
 class DSAOffloadConfig:
     """DSA offload 的唯一类型化配置真源。"""
 
@@ -166,6 +191,7 @@ class DSAOffloadConfig:
     hot_cpu_block_multiple: float = 3.0
     enable_row_mode_decode_graph: bool = False
     trace_points: DSAOffloadTraceConfig = field(default_factory=DSAOffloadTraceConfig)
+    remote_store: DSARemoteStoreConfig | None = None
     model_capabilities: DSAOffloadModelCapabilities | None = field(
         default=None,
         compare=False,
@@ -289,6 +315,7 @@ class DSAOffloadConfig:
                 field_name="enable_row_mode_decode_graph",
             ),
             trace_points=DSAOffloadTraceConfig.from_value(raw_config.get("trace_points")),
+            remote_store=DSARemoteStoreConfig.from_value(raw_config.get("remote_store")),
         )
         config._validate_static_contract()
         if config.enabled and vllm_config is not None:
@@ -306,6 +333,8 @@ class DSAOffloadConfig:
         return config
 
     def _validate_static_contract(self) -> None:
+        if self.remote_store is not None and (not self.enabled or self.enable_row_mode_decode_graph):
+            raise ValueError("store_shadow requires enabled=True and enable_row_mode_decode_graph=False")
         thresholds = self.prompt_budget_thresholds
         budgets = self.resident_budget_tokens
         if len(budgets) != len(thresholds) + 1:
@@ -332,6 +361,11 @@ class DSAOffloadConfig:
         self,
         vllm_config: Any,
     ) -> tuple[DSAOffloadModelCapabilities, int, int]:
+        if self.remote_store is not None:
+            from vllm.config import CompilationMode
+
+            if not vllm_config.model_config.enforce_eager or vllm_config.compilation_config.mode != CompilationMode.NONE:
+                raise ValueError("store_shadow uses synchronous D2H/TCP PUT; set enforce_eager=True and compilation mode=NONE")
         capabilities = require_dsa_offload_model_support(vllm_config.model_config)
         operator_contract = {
             "index_head_dim": (
@@ -567,6 +601,10 @@ class DSAOffloadConfig:
 
         compilation_config = vllm_config.compilation_config
         cudagraph_mode = compilation_config.cudagraph_mode
+        if self.remote_store is not None and (
+            compilation_config.mode != CompilationMode.NONE or cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            raise ValueError(f"store_shadow cannot run compiled/captured PUT: phase={phase}; use eager mode")
         if self.enable_row_mode_decode_graph:
             if compilation_config.mode != CompilationMode.VLLM_COMPILE:
                 raise ValueError(

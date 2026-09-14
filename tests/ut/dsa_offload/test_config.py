@@ -8,7 +8,34 @@ from vllm.config import CompilationMode, CUDAGraphMode
 from vllm_ascend.dsa_offload.config import (
     DSAOffloadConfig,
     DSAOffloadTraceConfig,
+    DSARemoteStoreConfig,
 )
+
+
+def test_store_shadow_is_explicit_and_eager_only():
+    assert DSAOffloadConfig.from_dict({}).remote_store is None
+    config = DSAOffloadConfig.from_dict({
+        "enabled": True, "remote_store": {"mode": "store_shadow", "endpoint": "127.0.0.1:19080"},
+    }, vllm_config=_vllm_config())
+    assert config.remote_store.endpoint == "127.0.0.1:19080"
+    for value in ({"endpoint": "localhost:19080"}, {"mode": "remote_all", "endpoint": "localhost:19080"},
+                  {"mode": "store_shadow", "endpoint": "localhost:0"}):
+        with pytest.raises(ValueError):
+            DSARemoteStoreConfig.from_value(value)
+    with pytest.raises(ValueError, match="enforce_eager"):
+        DSAOffloadConfig.from_dict({
+            "enabled": True, "remote_store": {"mode": "store_shadow", "endpoint": "127.0.0.1:19080"},
+        }, vllm_config=_vllm_config(enforce_eager=False))
+
+
+def test_store_shadow_cannot_enable_capture_after_config_normalization():
+    config = DSAOffloadConfig.from_dict({
+        "enabled": True, "remote_store": {"mode": "store_shadow", "endpoint": "127.0.0.1:19080"},
+    })
+    with pytest.raises(ValueError, match="compiled/captured PUT"):
+        config.validate_finalized_graph_contract(
+            _vllm_config(compilation_mode=CompilationMode.VLLM_COMPILE), phase="test",
+        )
 
 
 def _vllm_config(

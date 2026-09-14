@@ -447,6 +447,8 @@ class NPUModelRunner(GPUModelRunner):
             else None
         )
         self.dsa_hot_dram_store: DSAHotDRAMStore | None = None
+        if dsa_config.remote_store is not None and not self.dsa_offload_packed_c8:
+            raise ValueError("store_shadow requires A5 packed C8; BF16 and Indexer cache are not uploaded")
         self._dsa_decode_forward = False
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
 
@@ -5071,6 +5073,18 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         runtime.bind_dram_store(store)
+        remote_config = self.ascend_config.dsa_offload_config.remote_store
+        if remote_config is not None:
+            from vllm_ascend.dsa_offload.remote_store import RemoteKvStore, RemoteStoreShadow
+
+            remote_store = RemoteKvStore(
+                remote_config.endpoint, payload_layers=runtime.num_layers,
+                capacity=runtime.max_logical_blocks * runtime.block_size,
+            )
+            runtime.remote_store_shadow = RemoteStoreShadow(remote_store, resident_pool.max_num_reqs)
+            logger.info("DSA_STORE_SHADOW_TOPOLOGY payload_layer_indices=%s full_layer_indices=%s "
+                        "selection_groups=%s remote_selection_plan=0", ordered_layer_indices,
+                        sorted(indexer_names), next_selection_state_id)
         cache_layout.set_pool_release_callback(
             runtime.release_pool_index
         )

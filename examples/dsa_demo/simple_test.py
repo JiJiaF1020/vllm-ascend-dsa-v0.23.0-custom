@@ -53,6 +53,9 @@ class SmokeConfig:
     dsa_mtp_resident_budget_tokens: tuple[int, ...] = (8192, 12288, 12288)  # 仅卸载 + MTP 生效。
     graph_capture_sizes: tuple[int, ...] = (1, 2, 4, 8, 16)  # 请求数；自动补入 max_num_seqs，再转换成 token 数。
     store_endpoint: str | None = None  # 仅 CLI --store-endpoint；真实写侧穿刺，推理仍是 local_all。
+    ready_shadow_dir: str | None = None  # 仅CLI；使用真实LIDU轨迹，候选不改变模型输出。
+    ready_shadow_steps: int = 3
+    ready_shadow_group: int = 0
 
     @property
     def mtp_graph_enabled(self) -> bool:
@@ -170,6 +173,14 @@ def main_from_env(defaults: SmokeConfig, *, node_size: int) -> None:
 
 
 def validate_config(config: SmokeConfig) -> None:
+    if config.ready_shadow_dir is not None and (
+        not config.enable_offload or not config.enable_a5_packed_c8 or not config.enable_mtp
+        or config.mtp_num_speculative_tokens != 3 or config.run_mode != "eager"
+        or config.data_parallel_size != 1 or config.tensor_parallel_size not in (1, 2)
+        or config.max_num_seqs != 1 or config.enable_mtp_graph or config.enable_profile
+        or config.ready_shadow_steps < 1 or config.ready_shadow_group < 0
+    ):
+        raise ValueError("ready shadow requires DP1 TP1/2 BS1, local A5 offload, MTP3 eager; no graph/profile")
     if config.store_endpoint and (
         not config.enable_offload or not config.enable_a5_packed_c8 or config.run_mode != "eager"
     ):
@@ -271,6 +282,11 @@ def build_llm_kwargs(config: SmokeConfig, multi_node: bool = False) -> dict[str,
         if config.store_endpoint:
             additional_config["dsa_sparse_config"]["remote_store"] = {
                 "mode": "store_shadow", "endpoint": config.store_endpoint,
+            }
+        if config.ready_shadow_dir is not None:
+            additional_config["dsa_sparse_config"]["ready_shadow"] = {
+                "directory": config.ready_shadow_dir, "steps": config.ready_shadow_steps,
+                "group": config.ready_shadow_group,
             }
     kwargs: dict[str, Any] = {
         "model": config.model_path,
@@ -441,6 +457,16 @@ def run_dp_rank(
                     flush=True,
                 )
             payload["outputs"] = records
+            if config.ready_shadow_dir is not None:
+                from vllm_ascend.dsa_offload.ready_shadow import ready_shadow_report
+
+                reports = llm.collective_rpc(ready_shadow_report)
+                payload["ready_shadow"] = reports
+                print("DSA_READY_SHADOW_SUMMARY " + json.dumps(reports), flush=True)
+                if not reports or not all(report["passed"] for report in reports):
+                    payload["status"] = "failed_ready_shadow"
+                    write_result(config, payload, dp_rank)
+                    raise RuntimeError("ready shadow mismatch or insufficient coverage; see per-rank reports")
         write_result(config, payload, dp_rank)
         # 等所有 DP 完成后才退出，防止提前销毁仍在参与 EP collective 的 worker。
         if store is not None:
@@ -538,12 +564,19 @@ def main(
     parser.add_argument("--mtp-eager", action="store_true", help="MTP eager 对照；不改变 target 模式")
     parser.add_argument("--store-endpoint", help="host:port；真实 CREATE/PUT/PUT_DONE/CLOSE，推理仍走本地，不启用远端 Get")
     parser.add_argument("--dry-run", action="store_true", help="只检查配置和 rank 分配，不加载模型或初始化 NPU")
+    parser.add_argument("--ready-shadow-dir", help="有限ready旁路对拍；失败落盘，推理输出仍使用本地LIDU/KSC/SFA")
+    parser.add_argument("--ready-shadow-steps", type=int, default=3)
+    parser.add_argument("--ready-shadow-group", type=int, default=0, help="full层对应的selection-state id")
     args = parser.parse_args()
     if args.mtp_eager:
         config = replace(config, enable_mtp_graph=False)
     if args.store_endpoint:
         config = replace(config, store_endpoint=args.store_endpoint)
         print("[dsa-smoke] mode=store_shadow inference=local_all remote_get=0; synchronous PUT, not a performance run", flush=True)
+    if args.ready_shadow_dir is not None:
+        config = replace(config, ready_shadow_dir=args.ready_shadow_dir,
+                         ready_shadow_steps=args.ready_shadow_steps, ready_shadow_group=args.ready_shadow_group)
+        print("[dsa-smoke] ready shadow: reference=LIDU/KSC/SFA candidate=CopySFA; real_pool=0; NOT a performance run", flush=True)
     # 在创建任何子进程之前发现无效配置。
     _, _, _, ranks = resolve_node_launch(config, args)
     if config.enable_mtp and config.enable_mtp_graph and not config.enable_offload:

@@ -245,6 +245,7 @@ class DSAOffloadRuntime:
 
         self.dram_store: DSAHotDRAMStore | None = None
         self.remote_store_shadow: RemoteStoreShadow | None = None
+        self.ready_shadow = None  # 仅显式验证模式绑定；正常路径不采集、不导入候选扩展。
         self.active_num_reqs = 0
         self.execution_num_reqs = 0
         self.dump_job_count = 0
@@ -988,6 +989,10 @@ class DSALayerOffloadContext:
                     raise RuntimeError(
                         "DSA A5 MTP context has no per-query selection scratch"
                     )
+                shadow = self.runtime.ready_shadow
+                if shadow is not None:
+                    shadow.before_selection(self, cache_slots, resident_pool_indices,
+                                            row_modes, actual_seq_lengths_query)
                 a5_lightning_indexer_decode_update_mtp_c8(
                     index_weights=weights,
                     query=query.view(query_shape),
@@ -1039,6 +1044,9 @@ class DSALayerOffloadContext:
             packed_arena = store.get_layer_arenas(self.layer_id).packed
             if packed_arena is None:
                 raise RuntimeError("DSA A5 layer has no packed DRAM arena")
+            if self.runtime.ready_shadow is not None:
+                self.runtime.ready_shadow.before_copy(
+                    self, resident_cache[0], resident_block_table, packed_arena, dram_block_table, outputs)
             a5_kvcache_scatter_copy_c8(
                 resident_packed_cache=resident_cache[0],
                 dram_packed_arena=packed_arena,
@@ -1139,6 +1147,9 @@ class DSALayerOffloadContext:
                 )
             attention_slots = attention_slots_buffer[:num_query_rows]
             resident_seq_lengths = resident_seq_lengths_buffer[:num_reqs]
+            if self.runtime.ready_shadow is not None:
+                self.runtime.ready_shadow.before_copy(
+                    self, resident_cache[0], resident_block_table, arenas.packed, dram_block_table, outputs)
             a5_kvcache_scatter_copy_c8(
                 resident_packed_cache=resident_cache[0],
                 dram_packed_arena=arenas.packed,
@@ -1189,8 +1200,9 @@ class DSALayerOffloadContext:
             resident_seq_lengths = selection.resident_seq_lengths
             if resident_seq_lengths is None:
                 raise RuntimeError("DSA A5 C8 selection has no resident sequence lengths")
-            return sparse_flash_attention_for_offload_c8(
-                query=torch.cat([query, query_rope], dim=-1),
+            packed_query = torch.cat([query, query_rope], dim=-1)
+            result = sparse_flash_attention_for_offload_c8(
+                query=packed_query,
                 packed_kv=resident_cache[0],
                 sparse_indices=selection.sparse_indices,
                 scale_value=scale_value,
@@ -1198,6 +1210,10 @@ class DSALayerOffloadContext:
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 resident_seq_lengths=resident_seq_lengths,
             )
+            if self.runtime.ready_shadow is not None:
+                self.runtime.ready_shadow.after_attention(
+                    self, packed_query, resident_cache[0], result, scale_value)
+            return result
         if len(resident_cache) < 2:
             raise RuntimeError("DSA bf16 attention requires NOPE and ROPE resident caches")
         return sparse_flash_attention_for_offload(

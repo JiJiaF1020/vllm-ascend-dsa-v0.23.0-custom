@@ -49,6 +49,7 @@ _PUBLIC_CONFIG_KEYS = frozenset(
         "enable_row_mode_decode_graph",
         "trace_points",
         "remote_store",
+        "ready_shadow",
     }
 )
 _TRACE_CONFIG_KEYS = frozenset({"enabled", "points", "ranks"})
@@ -179,6 +180,29 @@ class DSARemoteStoreConfig:
 
 
 @dataclass(frozen=True)
+class DSAReadyShadowConfig:
+    """限定真实模型ready旁路；失败快照用于离线重放，不是远端Get开关。"""
+
+    directory: str = "ready_shadow"
+    steps: int = 3
+    group: int = 0
+
+    @classmethod
+    def from_value(cls, value: Any) -> DSAReadyShadowConfig | None:
+        if value is None:
+            return None
+        if not isinstance(value, Mapping) or set(value) - {"directory", "steps", "group"}:
+            raise ValueError("ready_shadow accepts directory, steps, group")
+        directory = value.get("directory", "ready_shadow")
+        group = value.get("group", 0)
+        if not isinstance(directory, str) or not directory:
+            raise ValueError("ready_shadow.directory must be a nonempty string")
+        if isinstance(group, bool) or not isinstance(group, int) or group < 0:
+            raise ValueError("ready_shadow.group must be a nonnegative selection-state id")
+        return cls(directory, _positive_int(value.get("steps", 3), field_name="ready_shadow.steps"), group)
+
+
+@dataclass(frozen=True)
 class DSAOffloadConfig:
     """DSA offload 的唯一类型化配置真源。"""
 
@@ -192,6 +216,7 @@ class DSAOffloadConfig:
     enable_row_mode_decode_graph: bool = False
     trace_points: DSAOffloadTraceConfig = field(default_factory=DSAOffloadTraceConfig)
     remote_store: DSARemoteStoreConfig | None = None
+    ready_shadow: DSAReadyShadowConfig | None = None
     model_capabilities: DSAOffloadModelCapabilities | None = field(
         default=None,
         compare=False,
@@ -316,6 +341,7 @@ class DSAOffloadConfig:
             ),
             trace_points=DSAOffloadTraceConfig.from_value(raw_config.get("trace_points")),
             remote_store=DSARemoteStoreConfig.from_value(raw_config.get("remote_store")),
+            ready_shadow=DSAReadyShadowConfig.from_value(raw_config.get("ready_shadow")),
         )
         config._validate_static_contract()
         if config.enabled and vllm_config is not None:
@@ -333,6 +359,8 @@ class DSAOffloadConfig:
         return config
 
     def _validate_static_contract(self) -> None:
+        if self.ready_shadow is not None and (not self.enabled or self.enable_row_mode_decode_graph):
+            raise ValueError("ready_shadow requires local offload enabled and decode graph disabled")
         if self.remote_store is not None and (not self.enabled or self.enable_row_mode_decode_graph):
             raise ValueError("store_shadow requires enabled=True and enable_row_mode_decode_graph=False")
         thresholds = self.prompt_budget_thresholds
@@ -361,11 +389,11 @@ class DSAOffloadConfig:
         self,
         vllm_config: Any,
     ) -> tuple[DSAOffloadModelCapabilities, int, int]:
-        if self.remote_store is not None:
+        if self.remote_store is not None or self.ready_shadow is not None:
             from vllm.config import CompilationMode
 
             if not vllm_config.model_config.enforce_eager or vllm_config.compilation_config.mode != CompilationMode.NONE:
-                raise ValueError("store_shadow uses synchronous D2H/TCP PUT; set enforce_eager=True and compilation mode=NONE")
+                raise ValueError("store/ready shadow uses synchronous data copies; set enforce_eager=True and compilation mode=NONE")
         capabilities = require_dsa_offload_model_support(vllm_config.model_config)
         operator_contract = {
             "index_head_dim": (
@@ -421,6 +449,16 @@ class DSAOffloadConfig:
         cache_config = vllm_config.cache_config
         parallel_config = vllm_config.parallel_config
         observability_config = vllm_config.observability_config
+        if self.ready_shadow is not None and (
+            parallel_config.data_parallel_size != 1 or parallel_config.tensor_parallel_size not in (1, 2)
+            or int(scheduler_config.max_num_seqs) != 1
+        ):
+            raise ValueError("ready_shadow first stage requires DP1, TP1/2, BS1; actual CopySFA heads must be 32/64")
+        if self.ready_shadow is not None:
+            heads = int(getattr(vllm_config.model_config.hf_text_config, "num_attention_heads", 0))
+            tp = parallel_config.tensor_parallel_size
+            if heads and (heads % tp or heads // tp not in (32, 64)):
+                raise ValueError("ready_shadow CopySFA supports 32/64 local attention heads; use TP2 for 128-head GLM-5.2")
 
         max_num_seqs = int(scheduler_config.max_num_seqs or 0)
         if max_num_seqs > self.max_active_reqs:
@@ -601,10 +639,10 @@ class DSAOffloadConfig:
 
         compilation_config = vllm_config.compilation_config
         cudagraph_mode = compilation_config.cudagraph_mode
-        if self.remote_store is not None and (
+        if (self.remote_store is not None or self.ready_shadow is not None) and (
             compilation_config.mode != CompilationMode.NONE or cudagraph_mode != CUDAGraphMode.NONE
         ):
-            raise ValueError(f"store_shadow cannot run compiled/captured PUT: phase={phase}; use eager mode")
+            raise ValueError(f"store/ready shadow cannot run compiled/captured: phase={phase}; use eager mode")
         if self.enable_row_mode_decode_graph:
             if compilation_config.mode != CompilationMode.VLLM_COMPILE:
                 raise ValueError(

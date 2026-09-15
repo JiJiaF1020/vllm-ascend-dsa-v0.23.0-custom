@@ -447,6 +447,13 @@ class NPUModelRunner(GPUModelRunner):
             else None
         )
         self.dsa_hot_dram_store: DSAHotDRAMStore | None = None
+        if dsa_config.ready_shadow is not None:
+            if not self.dsa_offload_packed_c8 or self.uniform_decode_query_len != 4:
+                raise ValueError("ready_shadow requires A5 packed C8 and MTP3")
+            from vllm_ascend.dsa_offload.ready_shadow import ReadyShadow
+
+            self.dsa_offload_runtime.ready_shadow = ReadyShadow(
+                dsa_config.ready_shadow, self.dsa_offload_runtime, torch.distributed.get_rank())
         if dsa_config.remote_store is not None and not self.dsa_offload_packed_c8:
             raise ValueError("store_shadow requires A5 packed C8; BF16 and Indexer cache are not uploaded")
         self._dsa_decode_forward = False
@@ -5042,6 +5049,9 @@ class NPUModelRunner(GPUModelRunner):
                         f"layer={resident_name}"
                     )
                 selection_source_layer_id = last_full_runtime_layer_id
+
+            if runtime.ready_shadow is not None:
+                runtime.ready_shadow.register_layer(runtime_layer_id, selection_state_id, selection_source_layer_id)
 
             if self.dsa_offload_packed_c8:
                 store.add_packed_layer(

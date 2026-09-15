@@ -9,6 +9,7 @@ from vllm_ascend.dsa_offload.config import (
     DSAOffloadConfig,
     DSAOffloadTraceConfig,
     DSARemoteStoreConfig,
+    DSAReadyShadowConfig,
 )
 
 
@@ -32,10 +33,26 @@ def test_store_shadow_cannot_enable_capture_after_config_normalization():
     config = DSAOffloadConfig.from_dict({
         "enabled": True, "remote_store": {"mode": "store_shadow", "endpoint": "127.0.0.1:19080"},
     })
-    with pytest.raises(ValueError, match="compiled/captured PUT"):
+    with pytest.raises(ValueError, match="compiled/captured"):
         config.validate_finalized_graph_contract(
             _vllm_config(compilation_mode=CompilationMode.VLLM_COMPILE), phase="test",
         )
+
+
+def test_ready_shadow_requires_explicit_local_eager_validation():
+    assert DSAOffloadConfig.from_dict({}).ready_shadow is None
+    config = DSAOffloadConfig.from_dict({"enabled": True, "ready_shadow": {"steps": 3, "group": 0}})
+    assert config.ready_shadow.steps == 3
+    for value in ({"steps": 0}, {"group": -1}, {"directory": ""}, {"unknown": True}):
+        with pytest.raises(ValueError):
+            DSAReadyShadowConfig.from_value(value)
+    with pytest.raises(ValueError, match="local offload"):
+        DSAOffloadConfig.from_dict({"ready_shadow": {}})
+    with pytest.raises(ValueError, match="decode graph disabled"):
+        DSAOffloadConfig.from_dict({"enabled": True, "enable_row_mode_decode_graph": True, "ready_shadow": {}})
+    with pytest.raises(ValueError, match="compiled/captured"):
+        config.validate_finalized_graph_contract(
+            _vllm_config(compilation_mode=CompilationMode.VLLM_COMPILE), phase="ready_test")
 
 
 def _vllm_config(

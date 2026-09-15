@@ -54,6 +54,17 @@ class TestSimpleScripts(unittest.TestCase):
             self.assertFalse(config.enable_chunked_prefill)
             self.assertTrue(config.mtp_graph_enabled)
 
+    def test_ready_shadow_configuration(self):
+        config = replace(self.config, data_parallel_size=1, tensor_parallel_size=2,
+                         run_mode="eager", enable_mtp_graph=False, ready_shadow_dir="snapshots")
+        kwargs = self.smoke.build_llm_kwargs(config)
+        self.assertEqual(kwargs["additional_config"]["dsa_sparse_config"]["ready_shadow"],
+                         {"directory": "snapshots", "steps": 3, "group": 0})
+        for changes in ({"data_parallel_size": 4}, {"run_mode": "graph"},
+                        {"enable_offload": False}, {"enable_mtp": False}, {"enable_profile": True}):
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, "ready shadow"):
+                self.smoke.validate_config(replace(config, **changes))
+
     def test_independent_chinese_datasets(self):
         names = {"chinese_5k", "chinese_10k", "chinese_23k", "chinese_40k", "chinese_64k"}
         tree = ast.parse((DEMO / "novel_dataset.py").read_text())
@@ -251,9 +262,11 @@ class TestSimpleScripts(unittest.TestCase):
     def test_all_config_fields_have_registered_overrides(self):
         from dataclasses import fields
 
-        values = {"VLLM_ASCEND_SMOKE_" + field.name.upper(): "test" for field in fields(self.config)}
+        cli_only = {"store_endpoint", "ready_shadow_dir", "ready_shadow_steps", "ready_shadow_group"}
+        names = {field.name for field in fields(self.config)} - cli_only
+        values = {"VLLM_ASCEND_SMOKE_" + name.upper(): "test" for name in names}
         with patch.dict(os.environ, values, clear=True):
-            self.assertEqual(set(self.smoke.read_smoke_environment()), {field.name for field in fields(self.config)})
+            self.assertEqual(set(self.smoke.read_smoke_environment()), names)
 
     def test_topology_and_prompt_assignment(self):
         for nodes, dp, tp in [(1, 1, 8), (1, 4, 2), (1, 16, 1), (2, 16, 1), (2, 4, 2)]:

@@ -1,5 +1,16 @@
 ## 参数说明
 
+### 有限ready旁路验证（新增，待A5实机验收）
+
+`--ready-shadow-dir ./ready_shadow --ready-shadow-steps 3 --ready-shadow-group 0`
+在本地LIDU/KSC/SFA轨迹上比较独立CopySFA副本，失败保存CPU快照；不使用真实Pool。
+先用DP1/TP2、BS1、MTP3、`RUN_MODE=eager`、`ENABLE_MTP_GRAPH=0`和`--mtp-eager`。
+需要配套算子仓新增的32/64头CopySFA与`kvcache_scatter_copy_custom_ops.ready_shadow`模块。
+默认模型与DP4/TP2不变。只采稳定SPARSE、每请求四query调用，覆盖full及其shared层。
+`generate`后汇总全部TP rank，数值失败或覆盖不足都会失败，模型始终返回本地结果。
+验证有同步/复制，不可测性能；TP1实际128头、DP4、真实LISSend/PoolDU仍待后续。
+详细命令及重放见算子仓`docs/glm52_ready_validation.md`。
+
 环境变量均需加前缀 `VLLM_ASCEND_SMOKE_`，例如 `ENABLE_PROFILE` 写作 `VLLM_ASCEND_SMOKE_ENABLE_PROFILE`。未设置时使用默认值，布尔值用 `1` 开启、`0` 关闭。
 
 | 参数（省略前缀） | 默认值 | 说明 |

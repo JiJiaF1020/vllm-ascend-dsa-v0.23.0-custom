@@ -39,6 +39,7 @@ from vllm_ascend.dsa_offload.contracts import (
     DSA_ROW_MODE_SPARSE,
 )
 from vllm_ascend.dsa_offload.dram_store import DSAHotDRAMStore
+from vllm_ascend.dsa_offload.execution_plan import LayerExecutionPlan
 from vllm_ascend.dsa_offload.ops import (
     DSALightningIndexerOutputs,
     DSAOffloadSelectionOutput,
@@ -928,6 +929,8 @@ class DSALayerOffloadContext:
     selection_state_id: int | None = None
     selection_source_layer_id: int | None = None
     packed_c8: bool = False
+
+    execution_plan: LayerExecutionPlan | None = None
 
     def execute_decode_selection(
         self,

@@ -407,6 +407,15 @@ class NPUModelRunner(GPUModelRunner):
             self.parallel_config
         )
         resident_layer_count = target_resident_layer_count
+        self.dsa_execution_plan = (
+            dsa_config.build_execution_plan(target_resident_layer_count)
+            if self.dsa_offload_enabled else None
+        )
+        if self.dsa_execution_plan is not None:
+            logger.info("DSA_EXECUTION_PLAN\n%s", self.dsa_execution_plan.table())
+            # 当前绑定器仅能执行 local_all。远端 capability 需在真实算子/连接
+            # 接通后逐项提供；生成计划本身不能授权用 resident cache 冒充完整 HBM。
+            self.dsa_execution_plan.require_capabilities(set())
         full_indexer_layers = (
             dsa_config.model_capabilities.full_indexer_layer_indices
             if dsa_config.model_capabilities is not None
@@ -4927,6 +4936,7 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         ordered_layer_indices = sorted(resident_names)
+        self.dsa_execution_plan.validate_binding(tuple(indexer_names), tuple(ordered_layer_indices))
         if len(ordered_layer_indices) != runtime.num_layers:
             raise RuntimeError(
                 "DSA runtime layer capacity does not match cache planes: "
@@ -5036,10 +5046,11 @@ class NPUModelRunner(GPUModelRunner):
             # shared indexer 层无本层 indexer_cache，记录最近 full 层的
             # runtime_layer_id 作为其 top-K 选择来源。LIDU cache_slots 仅按
             # full 层分配紧凑 selection_state_id。
+            layer_plan = self.dsa_execution_plan.layers[layer_index]
             selection_state_id: int | None = None
             selection_source_layer_id: int | None = None
             if indexer_cache is not None:
-                selection_state_id = next_selection_state_id
+                selection_state_id = layer_plan.group
                 next_selection_state_id += 1
                 last_full_runtime_layer_id = runtime_layer_id
             else:
@@ -5048,7 +5059,7 @@ class NPUModelRunner(GPUModelRunner):
                         "DSA shared-indexer layer precedes any full layer: "
                         f"layer={resident_name}"
                     )
-                selection_source_layer_id = last_full_runtime_layer_id
+                selection_source_layer_id = layer_plan.source_layer
 
             if runtime.ready_shadow is not None:
                 runtime.ready_shadow.register_layer(runtime_layer_id, selection_state_id, selection_source_layer_id)
@@ -5072,6 +5083,7 @@ class NPUModelRunner(GPUModelRunner):
                     selection_state_id=selection_state_id,
                     selection_source_layer_id=selection_source_layer_id,
                     packed_c8=self.dsa_offload_packed_c8,
+                    execution_plan=layer_plan,
                 )
             )
 

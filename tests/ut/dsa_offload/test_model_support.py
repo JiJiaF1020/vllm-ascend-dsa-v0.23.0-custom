@@ -3,12 +3,84 @@
 from types import SimpleNamespace
 
 import pytest
-
+from vllm_ascend.dsa_offload.execution_plan import (
+    DsaKvPlacement, LayerExecutionPath, SelectionDomain, build_execution_plan,
+)
 from vllm_ascend.dsa_offload.model_support import (
     get_dsa_offload_model_capabilities,
     require_dsa_offload_model_support,
 )
 
+
+def test_hbm_full_remote_shared_execution_plan():
+    plan = build_execution_plan(["full", "full", "full", "shared", "shared"], 5,
+                                DsaKvPlacement.HBM_FULL_REMOTE_SHARED)
+    assert [layer.ops for layer in plan.layers] == [
+        ("li", "sfa_native"), ("li", "sfa_native"), ("lis_send", "sfa_native"),
+        ("scatter_sfa",), ("gather_only", "scatter_sfa", "applied"),
+    ]
+    assert [(c.submit_layer, c.payload_layer, c.action, c.plan_command) for c in plan.commands] == [
+        (2, 3, "DU_AND_GATHER", 0), (4, 4, "GATHER_ONLY", 0),
+    ]
+    assert [layer.mirror_writer for layer in plan.layers] == ["none"] * 4 + ["scatter_sfa"]
+    assert plan.groups[2].mirror_commit_layer == 4
+    assert plan.layers[3].send_command is None  # 首层 payload 已由 full 提前请求。
+    assert [layer.path for layer in plan.layers] == [
+        LayerExecutionPath.NATIVE_FULL, LayerExecutionPath.NATIVE_FULL,
+        LayerExecutionPath.LIS_SEND_FULL, LayerExecutionPath.REMOTE_SHARED,
+        LayerExecutionPath.REMOTE_SHARED,
+    ]
+    assert [layer.selection_domain for layer in plan.layers] == [
+        SelectionDomain.VISIBLE_CAUSAL, SelectionDomain.VISIBLE_CAUSAL,
+        SelectionDomain.DURABLE_WITH_CAUSAL_TAIL, SelectionDomain.SOURCE_PLAN,
+        SelectionDomain.SOURCE_PLAN,
+    ]
+    plan.validate_binding((0, 1, 2), (0, 1, 2, 3, 4))
+    with pytest.raises(RuntimeError, match="refusing silent local fallback"):
+        plan.require_capabilities(set())
+    plan.require_capabilities(set(plan.required_capabilities))
+
+
+def test_local_full_remote_shared_keeps_du_on_npu():
+    plan = build_execution_plan(["full", "full", "full", "shared", "shared"], 5,
+                                DsaKvPlacement.LOCAL_FULL_REMOTE_SHARED)
+    assert [layer.ops for layer in plan.layers] == [
+        ("lidu", "ksc", "sfa"), ("lidu", "ksc", "sfa"),
+        ("lidu", "miss_plan_send", "ksc", "sfa"),
+        ("scatter_sfa",), ("gather_only", "scatter_sfa", "applied"),
+    ]
+    assert plan.commands[0].action == "MISS_PLAN_AND_GATHER"
+    assert all(layer.du_owner == "npu" for layer in plan.layers)
+    assert [layer.mirror_writer for layer in plan.layers] == ["lidu"] * 3 + ["none"] * 2
+    assert "pool_du" not in plan.required_capabilities
+    assert plan.groups[2].mirror_commit_layer == 2
+    assert plan.groups[2].release_layer == 4
+
+
+@pytest.mark.parametrize("placement", list(DsaKvPlacement))
+def test_execution_plan_topology_and_generation(placement):
+    roles = ["full", "shared", "full", "shared", "shared", "full"]
+    plan = build_execution_plan(roles, len(roles), placement)
+    assert [layer.source_layer for layer in plan.layers] == [0, 0, 2, 2, 2, 5]
+    assert [group.layers for group in plan.groups] == [(0, 1), (2, 3, 4), (5,)]
+    generations = [plan.generation(step, command.index, group, 2)
+                   for step in range(4) for command in plan.commands for group in range(2)]
+    assert generations == list(range(1, len(generations) + 1))
+    truncated = build_execution_plan(roles[:4], 4, placement)
+    assert truncated.groups[1].release_layer == 3
+    assert plan.groups[-1].remote_layers == ()
+    with pytest.raises(ValueError, match="binding mismatch"):
+        plan.validate_binding((0, 1, 2), tuple(range(6)))
+
+
+def test_local_execution_plan_preserves_baseline_and_rejects_invalid_topology():
+    plan = build_execution_plan(None, 3)
+    plan.require_capabilities(set())
+    assert not plan.commands
+    assert all(layer.ops == ("lidu", "ksc", "sfa") for layer in plan.layers)
+    for roles, count in [(["shared"], 1), (["full"], 2), (["full", "typo"], 2), (None, 0)]:
+        with pytest.raises(ValueError):
+            build_execution_plan(roles, count)
 
 def _model_config(
     architecture: str,

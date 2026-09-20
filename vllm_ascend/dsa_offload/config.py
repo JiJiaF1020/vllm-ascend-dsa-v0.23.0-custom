@@ -27,6 +27,7 @@ from vllm_ascend.dsa_offload.contracts import (
     DSA_SFA_COMPUTE_TOPK,
     DSA_SUPPORTED_INDEX_HEAD_COUNTS,
 )
+from vllm_ascend.dsa_offload.execution_plan import DsaExecutionPlan, DsaKvPlacement, build_execution_plan
 from vllm_ascend.dsa_offload.model_support import (
     DSAOffloadModelCapabilities,
     require_dsa_offload_model_support,
@@ -50,6 +51,7 @@ _PUBLIC_CONFIG_KEYS = frozenset(
         "trace_points",
         "remote_store",
         "ready_shadow",
+        "placement",
     }
 )
 _TRACE_CONFIG_KEYS = frozenset({"enabled", "points", "ranks"})
@@ -217,6 +219,7 @@ class DSAOffloadConfig:
     trace_points: DSAOffloadTraceConfig = field(default_factory=DSAOffloadTraceConfig)
     remote_store: DSARemoteStoreConfig | None = None
     ready_shadow: DSAReadyShadowConfig | None = None
+    placement: DsaKvPlacement = DsaKvPlacement.LOCAL_ALL
     model_capabilities: DSAOffloadModelCapabilities | None = field(
         default=None,
         compare=False,
@@ -266,6 +269,10 @@ class DSAOffloadConfig:
         layer_index = int(layer_index)
         target_layer_count = int(target_layer_count)
         return self.mtp_enabled and target_layer_count <= layer_index < target_layer_count + self.mtp_cache_layer_count
+
+    def build_execution_plan(self, target_layer_count: int) -> DsaExecutionPlan:
+        roles = self.model_capabilities.indexer_types if self.model_capabilities is not None else None
+        return build_execution_plan(roles, target_layer_count, self.placement)
 
     @classmethod
     def from_dict(
@@ -342,6 +349,7 @@ class DSAOffloadConfig:
             trace_points=DSAOffloadTraceConfig.from_value(raw_config.get("trace_points")),
             remote_store=DSARemoteStoreConfig.from_value(raw_config.get("remote_store")),
             ready_shadow=DSAReadyShadowConfig.from_value(raw_config.get("ready_shadow")),
+            placement=DsaKvPlacement(raw_config.get("placement", "local_all")),
         )
         config._validate_static_contract()
         if config.enabled and vllm_config is not None:
@@ -359,6 +367,11 @@ class DSAOffloadConfig:
         return config
 
     def _validate_static_contract(self) -> None:
+        if self.placement != DsaKvPlacement.LOCAL_ALL:
+            if not self.enabled:
+                raise ValueError("remote placement requires enabled=True")
+            if self.remote_store is not None or self.ready_shadow is not None:
+                raise ValueError("remote placement cannot be combined with store_shadow/ready_shadow")
         if self.ready_shadow is not None and (not self.enabled or self.enable_row_mode_decode_graph):
             raise ValueError("ready_shadow requires local offload enabled and decode graph disabled")
         if self.remote_store is not None and (not self.enabled or self.enable_row_mode_decode_graph):

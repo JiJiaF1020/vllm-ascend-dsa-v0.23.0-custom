@@ -24,8 +24,9 @@ python examples/dsa_demo/simple_test_1p.py
 `ENABLE_OFFLOAD=0`为原生target对照，`1`为本地卸载，二者都支持target图模式。
 图模式沿用`VLLM_COMPILE + FULL_DECODE_ONLY`，capture大小为`4 × 请求数`。
 CPU proposer和rejection/scheduler仍在图外；`ENABLE_MTP_GRAPH`对合成模式不创建draft图。
-当前`--remote-shared-config`、`--store-endpoint`和ready-shadow仍受原有eager门禁保护，
-此开关不能让含同步PUT/REFRESH的真实远端整网链自动入图。
+当前`--store-endpoint`和ready-shadow仍受原有eager门禁保护；真实`--remote-shared-config`
+可以使用下文的延迟捕获decode FULL图（不是将Store调用放入图中）。
+合成draft只提供target的Q=4输入，不能代替真实PUT/GET或精度验收。
 
 验收不要只看配置或进程退出：
 
@@ -98,7 +99,8 @@ NPU capture/replay、精度及DP/TP并发须在服务器验收。无算子/wire�
 
 ## 单机多卡运行：simple_test_1p.py 使用样例
 
-真实`--remote-shared-config`链目前支持每DP BS1..32、TP1/TP2、MTP3 eager。
+真实`--remote-shared-config`链支持每DP BS1..32、TP1/TP2、MTP3 eager；
+decode FULL图适配已加入，DP4/BS32的NPU实机验收尚未完成。
 首次decode绑定一批请求，之后允许缩批/重排；请求结束保留row和连接，到worker退出统一释放。
 暂不支持后补新请求或row复用。请给整批prefill足够token/HBM预算，并检查
 `DSA_SHARED_CONNECT_BEGIN rows=...`是否确实包含期望的32请求；只设`MAX_NUM_SEQS=32`
@@ -153,6 +155,47 @@ VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0 \
 VLLM_ASCEND_SMOKE_PROFILE_DIR=./vllm_profile/2p_dp16_64k_bs8_offload  \
 python examples/dsa_demo/simple_test_2p.py
 ```
+
+## 真实远端 shared 的 decode FULL 图（待实机验收）
+
+先保持已经跑通的Store/DU/EID JSON及模型路径，只把target切到`graph`；drafter仍eager。
+当前沿用vLLM 0.23的外层`ACLGraphWrapper`，直接捕获实际模型的算子调用，跳过Dynamo
+编译forward；不是新建一套GraphEx多流调度，也不是仅打印FULL而执行eager。
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export VLLM_ASCEND_SMOKE_DATA_PARALLEL_SIZE=4
+export VLLM_ASCEND_SMOKE_TENSOR_PARALLEL_SIZE=2
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=32
+export VLLM_ASCEND_SMOKE_RUN_MODE=graph
+export VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=1
+export VLLM_ASCEND_SMOKE_ENABLE_MTP=1
+export VLLM_ASCEND_SMOKE_ENABLE_MTP_GRAPH=0
+# 没有MTP权重时仅用于target/IO穿刺；有真实MTP权重则设0。
+export VLLM_ASCEND_SMOKE_SYNTHETIC_DRAFT=1
+python examples/dsa_demo/simple_test_1p.py --remote-shared-config /绝对路径/remote-shared.json --dry-run
+python examples/dsa_demo/simple_test_1p.py --remote-shared-config /绝对路径/remote-shared.json
+```
+
+这是每DP BS32，共128个请求、8个DU连接；不是DP32。先DP1/BS1验证，再扩大。
+首批prefill必须能容纳完整cohort（23k×32输入需相应prefill token预算和HBM）；仍不支持
+新请求补入或row复用。JSON为每物理卡配置独立DU服务，Store容量至少256个rank-local请求。
+
+执行次序：真实prefill/PUT → 首次真实decode eager预热 → 同shape下一步capture并执行一次
+→ 后续replay。启动日志`DSA_SHARED_GRAPH_DEFERRED`表示跳过无连接的dummy capture，
+不是禁用图；随后应出现`DSA_SHARED_GRAPH_CAPTURE_BEGIN/END first_replay=1`、
+`Replaying aclgraph`和逐步`DSA_SHARED_STEP_OK ... checked=ScatterSFA,APPLIED`。
+需看msprof确认LISSend、GATHER_ONLY、ScatterSFA及APPLIED确实在图内。
+
+每层generation/status独立，generation每step在图外H2D；已捕获shape的buffer保留到关闭。
+PUT/PUT_DONE、REFRESH和步末status检查均在图外，仍有Host同步开销；这轮以功能为准。
+所有DP均预热、均为Q=4且token数一致时才FULL；缩批只能命中精确capture size，
+不一致时全体eager，不创建远端PAD请求。Q不足4、非SPARSE等原远端限制没有因此解除。
+图内地址变化会明确报错，不会静默使用旧metadata。
+
+延迟捕获的graph/workspace占用未计入启动期KV容量估算，需保留HBM余量，不能直接使用
+启动日志建议的最大KV内存。此次只改框架Python，不要求重编Pool、hcomm或OPP；仍需已有
+LISSend/ScatterSFA/APPLIED正确部署。仅完成静态检查，不能视为DP4/TP2设备验收已通过。
 
 ## 双击HCCL连通性测试
 

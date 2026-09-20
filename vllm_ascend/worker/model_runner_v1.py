@@ -204,6 +204,7 @@ from vllm_ascend.dsa_offload.dram_store import (
 from vllm_ascend.dsa_offload.graph_gate import (
     DSARowModeGraphDecision,
     evaluate_dsa_row_mode_decode_graph,
+    evaluate_remote_decode_graph,
 )
 from vllm_ascend.dsa_offload.input_batch import (
     apply_dsa_cache_layout_projection,
@@ -813,6 +814,10 @@ class NPUModelRunner(GPUModelRunner):
             and self.ascend_config.dsa_offload_config.enable_row_mode_decode_graph
         )
 
+    def _remote_decode_graph_enabled(self) -> bool:
+        return (self._dsa_row_mode_decode_graph_enabled()
+                and self.ascend_config.dsa_offload_config.remote_shared is not None)
+
     def _evaluate_dsa_row_mode_graph_gate(
         self,
         *,
@@ -830,7 +835,7 @@ class NPUModelRunner(GPUModelRunner):
                 False,
                 "missing_input_batch_state",
             )
-        return evaluate_dsa_row_mode_decode_graph(
+        decision = evaluate_dsa_row_mode_decode_graph(
             state=state,
             num_reqs=num_reqs,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
@@ -838,6 +843,14 @@ class NPUModelRunner(GPUModelRunner):
             uniform_decode_query_len=self.uniform_decode_query_len,
             max_capture_size=self._dsa_row_mode_max_capture_size,
         )
+        if decision.use_full_graph and self._remote_decode_graph_enabled():
+            remote = self.dsa_offload_runtime.remote_shared
+            return evaluate_remote_decode_graph(
+                decision, num_tokens=total_num_scheduled_tokens,
+                capture_sizes=self.compilation_config.cudagraph_capture_sizes,
+                warmed=remote is not None and num_reqs in remote.warmed_batches,
+            )
+        return decision
 
     @staticmethod
     def _raise_dsa_row_mode_graph_violation(
@@ -1015,6 +1028,11 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_across_dp = packed_tensor[0, :]
         max_tokens_across_dp = int(num_tokens_across_dp.max().item())
         synced_cudagraph_mode = CUDAGraphMode(_post_process_cudagraph_mode(packed_tensor))
+        if (not is_draft_model and self._remote_decode_graph_enabled()
+                and not bool((num_tokens_across_dp == num_tokens_across_dp[0]).all())):
+            # Remote协议尚无dummy row；DP缩批不一致时全体eager，不能伪造远端请求。
+            synced_cudagraph_mode = CUDAGraphMode.NONE
+            allow_dp_padding = False
 
         # DSA 的本地 gate 已体现在各 rank 上报的 graph mode 中。同步后的
         # mode 才是整个 DP group 的图结论：若任一 replica 需要 eager，
@@ -2818,6 +2836,12 @@ class NPUModelRunner(GPUModelRunner):
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 )
 
+                if self._remote_decode_graph_enabled():
+                    # 真实prefill已经完成Store PUT；decode满块先在图外提交再REFRESH。
+                    remote_metadata = next(value for value in attn_metadata.values()
+                                           if getattr(value, "dsa_indexer_block_table", None) is not None)
+                    self.dsa_offload_runtime.remote_shared.prepare_decode(remote_metadata)
+
                 self._sanitize_placeholder_input_ids_for_forward(
                     scheduler_output,
                     num_tokens_padded
@@ -2863,7 +2887,7 @@ class NPUModelRunner(GPUModelRunner):
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         skip_compiled_model_forward = (
-            has_encoder_input or force_dsa_row_mode_eager
+            has_encoder_input or force_dsa_row_mode_eager or self._remote_decode_graph_enabled()
         )
 
         # Run forward pass
@@ -2896,9 +2920,13 @@ class NPUModelRunner(GPUModelRunner):
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
+            if self._remote_decode_graph_enabled():
+                get_forward_context().dsa_remote_runtime = self.dsa_offload_runtime.remote_shared
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+        if self._remote_decode_graph_enabled():
+            self.dsa_offload_runtime.remote_shared.finish_decode()
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -4183,7 +4211,8 @@ class NPUModelRunner(GPUModelRunner):
             max_num_scheduled_tokens=max_query_len,
             use_cascade_attn=False,
             allow_microbatching=allow_microbatching,
-            force_eager=is_profile or (cudagraph_runtime_mode == CUDAGraphMode.NONE) or profile_cpp,
+            force_eager=(is_profile or (cudagraph_runtime_mode == CUDAGraphMode.NONE) or profile_cpp
+                         or self._remote_decode_graph_enabled()),
             # `force_uniform_decode` is used for cudagraph capture; because for
             # capturing mixed prefill-decode batches, we sometimes use
             # num_tokens == num_reqs which looks like a uniform decode batch to the
@@ -4421,6 +4450,7 @@ class NPUModelRunner(GPUModelRunner):
                 model_instance=self.model,
                 has_sinks = self._has_sinks,
                 input_ids=input_ids,
+                skip_compiled=self._remote_decode_graph_enabled(),
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
             ):
                 outputs = self._model_forward(
@@ -5146,7 +5176,8 @@ class NPUModelRunner(GPUModelRunner):
                 remote_layers.append((context, packed))
             runtime.remote_shared = RemoteShared(shared_device, runtime, self.dsa_execution_plan, remote_layers,
                                                 dp_rank=self.dp_rank, tp_rank=get_tp_group().rank_in_group,
-                                                physical_device=physical_device)
+                                                physical_device=physical_device,
+                                                graph_enabled=self._remote_decode_graph_enabled())
         cache_layout.set_pool_release_callback(
             runtime.release_pool_index
         )
@@ -6601,6 +6632,10 @@ class NPUModelRunner(GPUModelRunner):
 
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
+        if self._remote_decode_graph_enabled():
+            logger.info("DSA_SHARED_GRAPH_DEFERRED capture=first_real_decode_after_warmup "
+                        "dummy_remote_commands=0; graph memory is allocated later, reserve HBM headroom")
+            return 0
         parent_module_name = _get_gpu_model_runner_module_name(self)
         with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
             cuda_graph_size = GPUModelRunner.capture_model(self)

@@ -154,6 +154,9 @@ class ACLGraphWrapper:
             self.concrete_aclgraph_entries[batch_descriptor] = ACLGraphEntry(batch_descriptor=batch_descriptor)
 
         entry = self.concrete_aclgraph_entries[batch_descriptor]
+        remote = getattr(forward_context, "dsa_remote_runtime", None)
+        if remote is not None:
+            remote.validate_graph_inputs(batch_descriptor, forward_context.attn_metadata, args, kwargs)
 
         if entry.aclgraph is None:
             if self.aclgraph_options.debug_log_enable:
@@ -163,7 +166,10 @@ class ACLGraphWrapper:
                 # piecewise mode.
                 logger.debug("Capturing a aclgraph on (%s,%s)", self.runtime_mode.name, entry.batch_descriptor)
             # validate that aclgraph capturing is legal at this point.
-            validate_cudagraph_capturing_enabled()
+            if remote is None:
+                validate_cudagraph_capturing_enabled()
+            else:
+                logger.info("DSA_SHARED_GRAPH_CAPTURE_BEGIN %s batch=%s", remote.identity, batch_descriptor)
 
             input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
             entry.input_addresses = input_addresses
@@ -226,6 +232,14 @@ class ACLGraphWrapper:
 
             compilation_counter.num_cudagraph_captured += 1
 
+            if remote is not None:
+                # 启动期capture不需要输出；真实decode必须执行一次刚捕获的图。
+                # CaptureBegin/End只记录任务，不能读取上轮status冒充本轮完成。
+                forward_context.capturing = False
+                aclgraph.replay()
+                logger.info("DSA_SHARED_GRAPH_CAPTURE_END %s first_replay=1 batch=%s",
+                            remote.identity, batch_descriptor)
+
             # important: we need to return the output, rather than
             # the weak ref of the output, so that pytorch can correctly
             # manage the memory during acl graph capture
@@ -255,6 +269,9 @@ class ACLGraphWrapper:
         if not self.enable_enpu and need_sync:
             torch.npu.current_stream().synchronize()
         entry.aclgraph.replay()
+        if remote is not None:
+            logger.debug("DSA_SHARED_GRAPH_REPLAY %s epoch=%s batch=%s",
+                         remote.identity, remote.prepared_epoch, batch_descriptor)
         return entry.output
 
 

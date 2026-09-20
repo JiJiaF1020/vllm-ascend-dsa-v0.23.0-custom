@@ -7,7 +7,9 @@ import numpy as np
 import pytest
 
 from vllm_ascend.dsa_offload.graph_gate import (
+    DSARowModeGraphDecision,
     evaluate_dsa_row_mode_decode_graph,
+    evaluate_remote_decode_graph,
 )
 from vllm_ascend.dsa_offload.request_cache_layout import (
     DSARequestCacheStage,
@@ -150,6 +152,27 @@ def test_uniform_mtp3_decode_uses_the_same_full_graph_gate() -> None:
     )
 
     assert decision.use_full_graph
+
+
+@pytest.mark.parametrize("batch", [1, 8, 16, 32])
+def test_remote_mtp3_exact_batch_requires_real_warmup(batch) -> None:
+    decision = evaluate_dsa_row_mode_decode_graph(
+        state=_state(*([DSARequestCacheStage.SPARSE_DECODE] * batch)),
+        num_reqs=batch, total_num_scheduled_tokens=batch * 4,
+        max_num_scheduled_tokens=4, uniform_decode_query_len=4, max_capture_size=32,
+    )
+    sizes = [4, 32, 64, 128]
+    warmup = evaluate_remote_decode_graph(decision, num_tokens=batch * 4, capture_sizes=sizes, warmed=False)
+    assert warmup.reason == "remote_decode_warmup" and warmup.is_expected_eager
+    assert evaluate_remote_decode_graph(decision, num_tokens=batch * 4, capture_sizes=sizes, warmed=True).use_full_graph
+
+
+def test_remote_does_not_pad_or_override_prefill_gate() -> None:
+    eligible = DSARowModeGraphDecision(True, "allow_row_mode_decode")
+    result = evaluate_remote_decode_graph(eligible, num_tokens=28, capture_sizes=[32, 64, 128], warmed=True)
+    assert result.reason == "remote_exact_shape_required" and result.is_expected_eager
+    prefill = DSARowModeGraphDecision(False, "non_decode_stage")
+    assert evaluate_remote_decode_graph(prefill, num_tokens=128, capture_sizes=[128], warmed=True) is prefill
 
 
 def test_mixed_mtp_query_lengths_fall_back_to_true_eager() -> None:

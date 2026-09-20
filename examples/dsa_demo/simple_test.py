@@ -185,11 +185,11 @@ def validate_config(config: SmokeConfig) -> None:
         raise ValueError("synthetic draft requires ENABLE_MTP=1, three drafts and RUN_MODE=eager/graph")
     if config.remote_shared is not None:
         if (not config.enable_offload or not config.enable_a5_packed_c8 or not config.enable_mtp
-                or config.mtp_num_speculative_tokens != 3 or config.run_mode != "eager"
+                or config.mtp_num_speculative_tokens != 3 or config.run_mode not in ("eager", "graph")
                 or config.tensor_parallel_size not in (1, 2)
                 or not 1 <= config.max_num_seqs <= 32 or config.enable_mtp_graph
                 or config.store_endpoint or config.ready_shadow_dir):
-            raise ValueError("remote shared smoke requires TP1/TP2, BS1..32 per DP, A5 C8 MTP3 eager; one offline cohort, no row reuse or shadow modes")
+            raise ValueError("remote shared smoke requires TP1/TP2, BS1..32 per DP, A5 C8 MTP3 eager/graph and draft eager; one offline cohort, no row reuse or shadow modes")
         # 只加载stdlib配置模块；dry-run与spawn之前不能初始化torch/vLLM/NPU。
         path = Path(__file__).resolve().parents[2] / "vllm_ascend/dsa_offload/remote_shared_config.py"
         remote = runpy.run_path(str(path))["DSARemoteSharedConfig"].from_value(config.remote_shared)
@@ -604,7 +604,8 @@ def main(
     if args.remote_shared_config:
         with open(args.remote_shared_config, encoding="utf-8") as source:
             config = replace(config, remote_shared=json.load(source))
-        print("[dsa-smoke] hbm_full_remote_shared real_store=1 real_get=1; eager functional validation, NOT performance", flush=True)
+        print("[dsa-smoke] hbm_full_remote_shared real_store=1 real_get=1; target=" + config.run_mode +
+              "; PUT/REFRESH/status checks outside decode graph", flush=True)
     if args.store_endpoint:
         config = replace(config, store_endpoint=args.store_endpoint)
         print("[dsa-smoke] mode=store_shadow inference=local_all remote_get=0; synchronous PUT, not a performance run", flush=True)

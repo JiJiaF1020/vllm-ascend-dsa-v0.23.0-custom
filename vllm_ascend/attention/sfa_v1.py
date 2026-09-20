@@ -1941,7 +1941,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         }
 
         dsa_context = self.dsa_offload_context
-        if dsa_context is not None:
+        remote_decode_prepared = (
+            dsa_context is not None and dsa_context.runtime.remote_shared is not None
+            and dsa_context.runtime.remote_shared.graph_enabled and attn_metadata.dsa_decode_forward
+        )
+        if dsa_context is not None and not remote_decode_prepared:
             if kv_cache is None:
                 raise RuntimeError("DSA full-block dump requires a resident cache")
             if dsa_context.runtime.remote_shared is not None:
@@ -2354,7 +2358,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query,
             actual_seq_lengths_key,
         )
-        if self.dsa_offload_context is not None:
+        if self.dsa_offload_context is not None and not remote_decode_prepared:
             if kv_cache is None:
                 raise RuntimeError("DSA full-block dump requires a resident cache")
             # 当前 DSA 只使用单 stream：本层 SFA 完成后再 dump，下一

@@ -36,6 +36,8 @@ _EXPECTED_EAGER_REASONS = frozenset(
         "non_uniform_decode",
         "non_decode_stage",
         "capture_size_miss",
+        "remote_decode_warmup",
+        "remote_exact_shape_required",
     }
 )
 
@@ -50,6 +52,20 @@ class DSARowModeGraphDecision:
     @property
     def is_expected_eager(self) -> bool:
         return self.reason in _EXPECTED_EAGER_REASONS
+
+
+def evaluate_remote_decode_graph(
+    decision: DSARowModeGraphDecision, *, num_tokens: int,
+    capture_sizes: list[int], warmed: bool,
+) -> DSARowModeGraphDecision:
+    """远端无PAD请求协议；每种真实shape先eager预热，再延迟捕获。"""
+    if not decision.use_full_graph:
+        return decision
+    if num_tokens not in capture_sizes:
+        return DSARowModeGraphDecision(False, "remote_exact_shape_required")
+    if not warmed:
+        return DSARowModeGraphDecision(False, "remote_decode_warmup")
+    return decision
 
 
 def evaluate_dsa_row_mode_decode_graph(

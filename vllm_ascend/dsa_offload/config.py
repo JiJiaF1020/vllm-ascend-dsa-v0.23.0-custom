@@ -373,8 +373,8 @@ class DSAOffloadConfig:
 
     def _validate_static_contract(self) -> None:
         if self.remote_shared is not None:
-            if self.placement != DsaKvPlacement.HBM_FULL_REMOTE_SHARED or self.enable_row_mode_decode_graph:
-                raise ValueError("remote_shared currently requires hbm_full_remote_shared and eager execution")
+            if self.placement != DsaKvPlacement.HBM_FULL_REMOTE_SHARED:
+                raise ValueError("remote_shared requires hbm_full_remote_shared")
         if self.placement != DsaKvPlacement.LOCAL_ALL:
             if not self.enabled:
                 raise ValueError("remote placement requires enabled=True")
@@ -410,7 +410,7 @@ class DSAOffloadConfig:
         self,
         vllm_config: Any,
     ) -> tuple[DSAOffloadModelCapabilities, int, int]:
-        if self.remote_store is not None or self.ready_shadow is not None or self.remote_shared is not None:
+        if self.remote_store is not None or self.ready_shadow is not None:
             from vllm.config import CompilationMode
 
             if not vllm_config.model_config.enforce_eager or vllm_config.compilation_config.mode != CompilationMode.NONE:
@@ -478,6 +478,12 @@ class DSAOffloadConfig:
                 raise ValueError("remote_shared CopySFA requires 32/64 local attention heads")
             if not 1 <= int(scheduler_config.max_num_seqs) <= 32:
                 raise ValueError("remote_shared requires BS1..32 per DP; one offline cohort, no request-row reuse")
+            if self.enable_row_mode_decode_graph:
+                spec = vllm_config.speculative_config
+                if spec is None or not bool(getattr(spec, "enforce_eager", False)):
+                    raise ValueError("remote_shared decode graph currently requires an eager drafter (enforce_eager=True)")
+                if getattr(vllm_config, "lora_config", None) is not None:
+                    raise ValueError("remote_shared late graph capture does not support LoRA graph keys")
         if self.ready_shadow is not None and (
             parallel_config.data_parallel_size != 1 or parallel_config.tensor_parallel_size not in (1, 2)
             or int(scheduler_config.max_num_seqs) != 1
@@ -671,7 +677,7 @@ class DSAOffloadConfig:
 
         compilation_config = vllm_config.compilation_config
         cudagraph_mode = compilation_config.cudagraph_mode
-        if (self.remote_store is not None or self.ready_shadow is not None or self.remote_shared is not None) and (
+        if (self.remote_store is not None or self.ready_shadow is not None) and (
             compilation_config.mode != CompilationMode.NONE or cudagraph_mode != CUDAGraphMode.NONE
         ):
             raise ValueError(f"store/ready shadow cannot run compiled/captured: phase={phase}; use eager mode")

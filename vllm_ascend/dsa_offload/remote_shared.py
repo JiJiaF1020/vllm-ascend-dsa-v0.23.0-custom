@@ -62,10 +62,11 @@ class RemoteShared:
         logger.info("DSA_SHARED_PREWRITE_BEGIN epoch=%s pages_per_layer=%s",
                     runtime._forward_epoch, runtime.dump_job_count)
         for context, packed in self.layers:
-            if context.full_cache is not None:
-                context.full_dump_table = metadata.dsa_indexer_block_table
-                context.full_dump_rows = metadata.dsa_resident_pool_indices
-            context.dump_full_blocks(resident_cache=(packed,), before_cache_write=True)
+            context.dump_full_blocks(
+                resident_cache=(packed,), before_cache_write=True,
+                full_dump_table=metadata.dsa_indexer_block_table,
+                full_dump_rows=metadata.dsa_resident_pool_indices,
+            )
         self.dump_epoch = runtime._forward_epoch
         logger.info("DSA_SHARED_PREWRITE_END epoch=%s", self.dump_epoch)
 

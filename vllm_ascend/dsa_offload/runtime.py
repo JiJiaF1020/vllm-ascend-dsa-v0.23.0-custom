@@ -944,8 +944,6 @@ class DSALayerOffloadContext:
 
     execution_plan: LayerExecutionPlan | None = None
     full_cache: torch.Tensor | None = None
-    full_dump_table: torch.Tensor | None = None
-    full_dump_rows: torch.Tensor | None = None
 
     def execute_decode_selection(
         self,
@@ -1273,7 +1271,10 @@ class DSALayerOffloadContext:
         *,
         resident_cache: tuple[torch.Tensor, ...],
         before_cache_write: bool,
+        full_dump_table: torch.Tensor | None = None,
+        full_dump_rows: torch.Tensor | None = None,
     ) -> None:
+        # 页表和batch→pool row映射属于本轮输入，不写入冻结的逐层资源context。
         job_count = self.runtime.dump_launch_count
         if job_count == 0:
             return
@@ -1293,8 +1294,8 @@ class DSALayerOffloadContext:
             source_tensor = self.runtime.dump_src_block_ids.gpu[:job_count]
             if self.full_cache is not None:
                 # full plane遵循Indexer完整页生命周期，不能用resident收缩后的block id。
-                table = self.full_dump_table.cpu().numpy()
-                row_ids = self.full_dump_rows.cpu().tolist()
+                table = full_dump_table.cpu().numpy()
+                row_ids = full_dump_rows.cpu().tolist()
                 row_map = {row: batch for batch, row in enumerate(row_ids)}
                 source_blocks = np.asarray([
                     table[row_map[int(row)], int(page)] for row, page in zip(

@@ -1902,8 +1902,6 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         context = self.dsa_offload_context
         if context is not None and context.full_cache is not None:
-            context.full_dump_table = attn_metadata.dsa_indexer_block_table
-            context.full_dump_rows = attn_metadata.dsa_resident_pool_indices
             kv_cache = (context.full_cache,)
             attn_metadata = replace(
                 attn_metadata, block_table=attn_metadata.dsa_indexer_block_table,
@@ -1955,6 +1953,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             dsa_context.dump_full_blocks(
                 resident_cache=kv_cache,
                 before_cache_write=True,
+                full_dump_table=attn_metadata.dsa_indexer_block_table,
+                full_dump_rows=attn_metadata.dsa_resident_pool_indices,
             )
 
         if self.enable_sfa_prolog_v3 and attn_metadata.attn_state in (
@@ -2363,6 +2363,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.dsa_offload_context.dump_full_blocks(
                 resident_cache=kv_cache,
                 before_cache_write=False,
+                full_dump_table=attn_metadata.dsa_indexer_block_table,
+                full_dump_rows=attn_metadata.dsa_resident_pool_indices,
             )
 
         attn_output = self._v_up_proj(attn_output)

@@ -122,6 +122,7 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
+from vllm_ascend.dsa_offload.synthetic_draft import synthetic_draft_enabled, validate_synthetic_draft
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
@@ -750,6 +751,7 @@ class NPUModelRunner(GPUModelRunner):
 
     def _set_up_drafter(self):
         # Set up speculative decoding.
+        self.synthetic_draft = synthetic_draft_enabled(self.vllm_config)
         self.drafter: (
             AscendNgramProposer
             | AscendNgramProposerNPU
@@ -1940,7 +1942,7 @@ class NPUModelRunner(GPUModelRunner):
         # We assume it is the decode stage, where prefill occurs but only one token is not hit in cache.
         elif np.all(num_scheduled_tokens == 1):
             attn_state = AscendAttentionState.DecodeOnly
-            if self.speculative_config and self.speculative_config.method == "mtp":
+            if self.speculative_config and (self.speculative_config.method == "mtp" or self.synthetic_draft):
                 # SpecDecoding now supports seq_len=1 and seq_len=2
                 # In Prefilling Decoding Disaggregation scenario, SpecDecoding need to supports seq_len=1
                 attn_state = AscendAttentionState.SpecDecoding
@@ -1958,11 +1960,15 @@ class NPUModelRunner(GPUModelRunner):
 
         # For the overlay of the PCP feature and the eagle3, attn_state needs to be recovered
         # TODO: Resolved the conflict between the sunset of attn_state and the PCP that requires this interface.
-        if attn_state == AscendAttentionState.SpecDecoding and self.speculative_config.method != "mtp":
+        if (attn_state == AscendAttentionState.SpecDecoding
+                and self.speculative_config.method != "mtp" and not self.synthetic_draft):
             self.attn_state = AscendAttentionState.ChunkedPrefill  # type: ignore
         else:
             self.attn_state = attn_state  # type: ignore
 
+        if self.synthetic_draft:
+            logger.info("DSA_SYNTHETIC_DRAFT_TARGET requests=%s query_lengths=%s state=%s effective_state=%s",
+                        num_reqs, num_scheduled_tokens.tolist(), attn_state, self.attn_state)
         return attn_state
 
     def _sanitize_placeholder_input_ids_for_forward(
@@ -3622,6 +3628,9 @@ class NPUModelRunner(GPUModelRunner):
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
+        if self.synthetic_draft:
+            logger.info("DSA_SYNTHETIC_DRAFT_DISPATCH mode=%s uniform=%s descriptor=%s force_eager=%s",
+                        cudagraph_mode, uniform_decode, batch_descriptor, force_eager)
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
             cudagraph_stats = CUDAGraphStat(
@@ -4238,7 +4247,7 @@ class NPUModelRunner(GPUModelRunner):
                     "create_mixed_batch is used for warmup deepgemm, vllm-ascend does not need it"
                 )
             self.attn_state = AscendAttentionState.DecodeOnly
-            if self.speculative_config and self.speculative_config.method == "mtp":
+            if self.speculative_config and (self.speculative_config.method == "mtp" or self.synthetic_draft):
                 # `AscendAttentionState.SpecDecoding` is only designed for mla
                 if self.vllm_config.model_config.use_mla:
                     self.attn_state = AscendAttentionState.SpecDecoding
@@ -4524,7 +4533,7 @@ class NPUModelRunner(GPUModelRunner):
                 if "sink" in name:
                     self._has_sinks = True
                     break
-            if self.drafter:
+            if self.drafter and not self.synthetic_draft:
                 logger.info("Loading drafter model...")
                 if self.vllm_config.quant_config is not None:
                     patch_load_weights(self.vllm_config)
@@ -6539,6 +6548,10 @@ class NPUModelRunner(GPUModelRunner):
             phase="attention_backend",
             require_resolved_mode=True,
         )
+        validate_synthetic_draft(self.vllm_config, resolved_graph=True)
+        if self.synthetic_draft:
+            logger.info("DSA_SYNTHETIC_DRAFT_GRAPH_READY mode=%s uniform_query_len=%s drafter_graph=0",
+                        cudagraph_mode, self.uniform_decode_query_len)
         self._dsa_row_mode_max_capture_size = max(
             (
                 int(key.num_reqs)

@@ -620,9 +620,9 @@ def report_dsa_kv_cache_config(
     actual_mtp_layer_count = (
         len(mtp_group.layer_names) if mtp_group is not None else 0
     )
-    if dsa_config.mtp_enabled != (mtp_group is not None) or (
-        dsa_config.mtp_enabled
-        and actual_mtp_layer_count != dsa_config.mtp_cache_layer_count
+    # [TO BE REMOVE] 合成draft有Q=4，但没有额外MTP模型/cache group。
+    if (dsa_config.mtp_cache_layer_count > 0) != (mtp_group is not None) or (
+        actual_mtp_layer_count != dsa_config.mtp_cache_layer_count
     ):
         raise RuntimeError(
             "DSA capacity report found an MTP config/cache-group mismatch: "

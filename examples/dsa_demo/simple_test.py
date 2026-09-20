@@ -41,6 +41,7 @@ class SmokeConfig:
     enable_a5_packed_c8: bool = True
     enable_cpu_binding: bool = True  # 共用宿主机、不希望改变绑核时设 False。
     enable_mtp: bool = True
+    synthetic_draft: bool = False  # [TO BE REMOVE] 无MTP权重，合成三token，仅target/IO功能穿刺。
     mtp_num_speculative_tokens: int = 3
     enable_mtp_graph: bool = True  # baseline 暂不支持 MTP 图，底座会自动使用 eager。
     enable_profile: bool = False
@@ -61,11 +62,14 @@ class SmokeConfig:
 
     @property
     def mtp_graph_enabled(self) -> bool:
-        return self.enable_offload and self.run_mode == "graph" and self.enable_mtp and self.enable_mtp_graph
+        return (not self.synthetic_draft and self.enable_offload and self.run_mode == "graph"
+                and self.enable_mtp and self.enable_mtp_graph)
 
     @property
     def run_name(self) -> str:
         mtp = "mtp_graph" if self.mtp_graph_enabled else ("mtp_eager" if self.enable_mtp else "no_mtp")
+        if self.synthetic_draft:
+            mtp = "synthetic_draft3_NOT_MTP"
         return (
             f"dp{self.data_parallel_size}_tp{self.tensor_parallel_size}"
             f"_{'offload' if self.enable_offload else 'baseline'}_{self.run_mode}_{mtp}"
@@ -176,6 +180,9 @@ def main_from_env(defaults: SmokeConfig, *, node_size: int) -> None:
 
 
 def validate_config(config: SmokeConfig) -> None:
+    if config.synthetic_draft and (not config.enable_mtp or config.mtp_num_speculative_tokens != 3
+                                  or config.run_mode not in ("eager", "graph")):
+        raise ValueError("synthetic draft requires ENABLE_MTP=1, three drafts and RUN_MODE=eager/graph")
     if config.remote_shared is not None:
         if (not config.enable_offload or not config.enable_a5_packed_c8 or not config.enable_mtp
                 or config.mtp_num_speculative_tokens != 3 or config.run_mode != "eager"
@@ -273,6 +280,8 @@ def build_llm_kwargs(config: SmokeConfig, multi_node: bool = False) -> dict[str,
     validate_config(config)
     graph = config.run_mode == "graph"
     additional_config: dict[str, Any] = {"enable_cpu_binding": config.enable_cpu_binding}
+    if config.synthetic_draft:
+        additional_config["dsa_synthetic_draft"] = True
     if config.data_parallel_size > 1:
         additional_config["dp_allreduce_on_npu"] = True
     if multi_node:
@@ -329,7 +338,7 @@ def build_llm_kwargs(config: SmokeConfig, multi_node: bool = False) -> dict[str,
     }
     if config.enable_mtp:
         kwargs["speculative_config"] = {
-            "method": "mtp",
+            "method": "ngram" if config.synthetic_draft else "mtp",
             "num_speculative_tokens": config.mtp_num_speculative_tokens,
             "draft_tensor_parallel_size": config.tensor_parallel_size,
             "enforce_eager": not config.mtp_graph_enabled,
@@ -441,6 +450,8 @@ def run_dp_rank(
             "model": config.model_path,
             "dp_rank": dp_rank,
             "mtp_graph_enabled": config.mtp_graph_enabled,
+            "synthetic_draft": config.synthetic_draft,
+            "physical_drafter": not config.synthetic_draft and config.enable_mtp,
             "status": "passed",
         }
         if config.run_mode == "cache-init":
@@ -603,7 +614,10 @@ def main(
         print("[dsa-smoke] ready shadow: reference=LIDU/KSC/SFA candidate=CopySFA; real_pool=0; NOT a performance run", flush=True)
     # 在创建任何子进程之前发现无效配置。
     _, _, _, ranks = resolve_node_launch(config, args)
-    if config.enable_mtp and config.enable_mtp_graph and not config.enable_offload:
+    if config.synthetic_draft:
+        print("[TO BE REMOVE] synthetic draft3: no MTP model/weights; target mode=" + config.run_mode +
+              "; proposer=host; rejection=standard; NOT MTP performance/accuracy validation", flush=True)
+    elif config.enable_mtp and config.enable_mtp_graph and not config.enable_offload:
         print("[dsa-smoke] baseline MTP graph is not supported; using MTP eager, target mode unchanged", flush=True)
     if args.dry_run:
         print(

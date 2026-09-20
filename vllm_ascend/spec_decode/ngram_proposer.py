@@ -1,13 +1,26 @@
 import torch
+from vllm.logger import init_logger
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
+from vllm_ascend.dsa_offload.synthetic_draft import synthetic_draft_enabled
 from vllm_ascend.utils import vllm_version_is
+
+logger = init_logger(__name__)
 
 
 class AscendNgramProposer(NgramProposer):
     def __init__(self, vllm_config, runner):
         self.runner = runner
-        super().__init__(vllm_config)
+        self.synthetic_draft = synthetic_draft_enabled(vllm_config)
+        if self.synthetic_draft and not vllm_version_is("0.23.0"):
+            raise ValueError("[TO BE REMOVE] synthetic draft is only wired for vLLM 0.23.0")
+        if self.synthetic_draft:
+            # 不分配ngram搜索scratch，不触发其Numba预热（长上下文会分配大矩阵）。
+            self.k = vllm_config.speculative_config.num_speculative_tokens
+            self.max_model_len = vllm_config.model_config.max_model_len
+            logger.warning("DSA_SYNTHETIC_DRAFT_ENABLED drafts=3 physical_mtp_layers=0 rejection=standard NOT_MTP_PERFORMANCE")
+        else:
+            super().__init__(vllm_config)
 
     def load_model(self, *args, **kwargs):
         # No model to load.
@@ -58,6 +71,19 @@ class AscendNgramProposer(NgramProposer):
                 input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
 
                 valid_ngram_requests.append(i)
+
+            if self.synthetic_draft:
+                # [TO BE REMOVE] 保留上面的有效请求/历史输入维护，不做ngram搜索。
+                # sampled_token_ids来自正常target采样；不假造accepted长度或request身份。
+                drafts = [[] for _ in sampled_token_ids]
+                for i in valid_ngram_requests:
+                    remaining = input_batch.max_model_len - (
+                        int(input_batch.num_tokens_no_spec[i]) + len(sampled_token_ids[i]))
+                    count = min(self.k, max(0, remaining))
+                    drafts[i] = [int(sampled_token_ids[i][-1])] * count
+                logger.info("DSA_SYNTHETIC_DRAFT_PROPOSE requests=%s draft_lengths=%s rejection=standard",
+                            len(drafts), [len(row) for row in drafts])
+                return drafts
 
             return self.batch_propose(
                 len(sampled_token_ids),

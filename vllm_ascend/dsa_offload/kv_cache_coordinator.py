@@ -218,12 +218,14 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
             self.mtp_full_manager = mtp_full_manager
 
         dsa_config = get_ascend_config().dsa_offload_config
-        if bool(use_eagle) != dsa_config.mtp_enabled:
+        # [TO BE REMOVE] 合成draft沿ngram通道，不创建Eagle/MTP物理cache层。
+        has_mtp_model = dsa_config.mtp_cache_layer_count > 0
+        if bool(use_eagle) != has_mtp_model:
             raise RuntimeError(
                 "DSA coordinator Eagle mode disagrees with MTP config: "
                 f"use_eagle={use_eagle}, mtp_enabled={dsa_config.mtp_enabled}"
             )
-        if dsa_config.mtp_enabled != (self.mtp_full_manager is not None):
+        if has_mtp_model != (self.mtp_full_manager is not None):
             raise RuntimeError(
                 "DSA MTP config and finalized full-cache group disagree: "
                 f"mtp_enabled={dsa_config.mtp_enabled}, "

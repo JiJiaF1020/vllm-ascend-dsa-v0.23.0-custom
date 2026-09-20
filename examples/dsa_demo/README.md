@@ -1,5 +1,51 @@
 ## 参数说明
 
+### [TO BE REMOVE] 无MTP权重的合成draft调试
+
+裁层模型没有MTP权重时，保持模型`num_nextn_predict_layers=0`；不要伪造三个物理层。
+开启`VLLM_ASCEND_SMOKE_SYNTHETIC_DRAFT=1`后，配置使用无模型的ngram通道，但不做
+ngram搜索：在target采样后重复最后一个有效token，提出至多三个draft。无有效输出、
+不支持spec的请求不提议；接近上下文上限时缩短。保持正常rejection sampling，不强制接受。
+开启时跳过ngram的Numba大矩阵预热，不加载任何draft权重，也不创建物理MTP cache层。
+
+```bash
+VLLM_ASCEND_SMOKE_MODEL_PATH=/你的五层模型目录 \
+VLLM_ASCEND_SMOKE_TENSOR_PARALLEL_SIZE=1 \
+VLLM_ASCEND_SMOKE_DATA_PARALLEL_SIZE=1 \
+VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=1 \
+VLLM_ASCEND_SMOKE_ENABLE_MTP=1 \
+VLLM_ASCEND_SMOKE_SYNTHETIC_DRAFT=1 \
+VLLM_ASCEND_SMOKE_ENABLE_MTP_GRAPH=0 \
+VLLM_ASCEND_SMOKE_RUN_MODE=graph \
+python examples/dsa_demo/simple_test_1p.py
+```
+
+同一组参数加`--dry-run`先检查配置。`RUN_MODE=eager`用于对应的eager测试；
+`ENABLE_OFFLOAD=0`为原生target对照，`1`为本地卸载，二者都支持target图模式。
+图模式沿用`VLLM_COMPILE + FULL_DECODE_ONLY`，capture大小为`4 × 请求数`。
+CPU proposer和rejection/scheduler仍在图外；`ENABLE_MTP_GRAPH`对合成模式不创建draft图。
+当前`--remote-shared-config`、`--store-endpoint`和ready-shadow仍受原有eager门禁保护，
+此开关不能让含同步PUT/REFRESH的真实远端整网链自动入图。
+
+验收不要只看配置或进程退出：
+
+- `DSA_SYNTHETIC_DRAFT_ENABLED ... physical_mtp_layers=0`，没有MTP权重加载。
+- `DSA_SYNTHETIC_DRAFT_PROPOSE ... draft_lengths=[3,...]`。
+- `DSA_SYNTHETIC_DRAFT_TARGET ... query_lengths=[4,...]`，状态为`SpecDecoding`。
+- 图模式在稳态看到`DSA_SYNTHETIC_DRAFT_DISPATCH mode=FULL ... uniform=True`，并以
+  msprof确认实际replay；`GRAPH_READY`只证明capture配置，不代表每步都命中图。
+- 首轮prefill、上下文/输出长度边界及DP空批不保证Q=4或命中图，不能强行填充这些请求。
+- 本地卸载还要确认真实非零KSC搬运；远端eager还要确认真实回包/ScatterSFA，不以合成token代替IO。
+
+结果JSON和文件名包含synthetic标识。这只验证target四路验证及IO/调度，不代表真实MTP
+模型、接受率或整步性能；调试日志和CPU提议也引入Host开销。当前开发机只做Python级检查，
+NPU capture/replay、精度及DP/TP并发须在服务器验收。无算子/wire变更，无需重新编译OPP/hcomm。
+
+组图边界：合成draft是Host token列表，由原scheduler写入普通target输入buffer，
+不新增注册HBM、GVA、跨流Event或Torch schema；不修改既有本地DRAM buffer生命周期。
+实机仍需核对编译图参数、原算子源地址和流依赖，CPU检查不能替代FX/地址/可见性验收。
+实现与本文集中在一个`[TO BE REMOVE]`提交，调试结束整体revert该提交，保留之前BS32基线。
+
 ### 有限ready旁路验证（新增，待A5实机验收）
 
 `--ready-shadow-dir ./ready_shadow --ready-shadow-steps 3 --ready-shadow-group 0`

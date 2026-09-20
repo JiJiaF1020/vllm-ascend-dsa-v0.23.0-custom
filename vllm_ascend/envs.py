@@ -54,6 +54,8 @@ SMOKE_ENV_FIELDS = (
     "enable_a5_packed_c8",
     "enable_cpu_binding",
     "enable_mtp",
+    # [TO BE REMOVE] 0/1，默认0；无权重的三token proposer，target eager/graph IO调试，无敏感信息。
+    "synthetic_draft",
     "mtp_num_speculative_tokens",
     "enable_mtp_graph",
     "enable_profile",

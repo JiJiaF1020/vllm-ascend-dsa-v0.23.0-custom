@@ -33,6 +33,7 @@ from vllm_ascend.dsa_offload.model_support import (
     require_dsa_offload_model_support,
 )
 from vllm_ascend.dsa_offload.remote_shared_config import DSARemoteSharedConfig
+from vllm_ascend.dsa_offload.synthetic_draft import synthetic_draft_enabled
 
 DSA_SPARSE_CONFIG_KEY = "dsa_sparse_config"
 DSA_TRACE_POINT_FIRST_SAMPLE = "first_sample"
@@ -537,7 +538,8 @@ class DSAOffloadConfig:
         if speculative_config is not None:
             method = getattr(speculative_config, "method", None)
             mtp_num_speculative_tokens = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
-            if method != "mtp":
+            synthetic_draft = synthetic_draft_enabled(vllm_config)
+            if method != "mtp" and not (synthetic_draft and method == "ngram"):
                 raise ValueError(f"DSA sparse offload initially supports only speculative method='mtp', got {method!r}")
             if mtp_num_speculative_tokens != DSA_MTP_MAX_SPECULATIVE_TOKENS:
                 raise ValueError(
@@ -557,8 +559,10 @@ class DSAOffloadConfig:
                 raise ValueError("DSA compromise MTP requires padded drafter batches")
             draft_model_config = speculative_config.draft_model_config
             draft_hf_config = draft_model_config.hf_config
-            mtp_cache_layer_count = int(getattr(draft_hf_config, "num_nextn_predict_layers", 0) or 0)
-            if mtp_cache_layer_count <= 0:
+            # [TO BE REMOVE] 四query的target布局不等于存在物理MTP层。
+            mtp_cache_layer_count = (0 if synthetic_draft else
+                                    int(getattr(draft_hf_config, "num_nextn_predict_layers", 0) or 0))
+            if mtp_cache_layer_count <= 0 and not synthetic_draft:
                 raise ValueError(
                     "DSA compromise MTP requires at least one physical "
                     "MTP cache layer, got "

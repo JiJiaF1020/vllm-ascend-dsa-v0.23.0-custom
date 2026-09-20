@@ -21,6 +21,7 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.dsa_offload import DSA_SPARSE_CONFIG_KEY, DSAOffloadConfig
+from vllm_ascend.dsa_offload.synthetic_draft import validate_synthetic_draft
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -34,6 +35,7 @@ class AscendConfig:
     def __init__(self, vllm_config: "VllmConfig"):
         self.vllm_config = vllm_config
         additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
+        validate_synthetic_draft(vllm_config)  # [TO BE REMOVE] 包括未开启offload的对照路径。
         self._check_mooncake_c8_kv_cache_quant(vllm_config)
 
         self.dsa_offload_config = DSAOffloadConfig.from_dict(

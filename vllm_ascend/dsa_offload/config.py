@@ -32,6 +32,7 @@ from vllm_ascend.dsa_offload.model_support import (
     DSAOffloadModelCapabilities,
     require_dsa_offload_model_support,
 )
+from vllm_ascend.dsa_offload.remote_shared_config import DSARemoteSharedConfig
 
 DSA_SPARSE_CONFIG_KEY = "dsa_sparse_config"
 DSA_TRACE_POINT_FIRST_SAMPLE = "first_sample"
@@ -156,36 +157,6 @@ class DSAOffloadTraceConfig:
             if any(rank < 0 for rank in ranks):
                 raise ValueError("DSA trace ranks must contain non-negative integers")
         return cls(enabled=True, points=points, ranks=ranks)
-
-
-@dataclass(frozen=True)
-class DSARemoteSharedConfig:
-    """首轮整网eager验证：每worker一个真实Store与DU连接，EID显式来自连通性probe。"""
-    store_endpoint: str
-    du_endpoint: str
-    device_eid: str
-    eid_index: int = -1
-    pool_eid: str = ""
-
-    @classmethod
-    def from_value(cls, value):
-        if value is None:
-            return None
-        if not isinstance(value, Mapping) or set(value) - {
-            "store_endpoint", "du_endpoint", "device_eid", "eid_index", "pool_eid"
-        }:
-            raise ValueError("invalid remote_shared configuration")
-        result = cls(**value)
-        for endpoint in (result.store_endpoint, result.du_endpoint):
-            host, sep, port = endpoint.rpartition(":")
-            if not host or not sep or not port.isdecimal() or not 0 < int(port) < 65536:
-                raise ValueError("remote_shared endpoints must be host:port")
-        for eid in (result.device_eid, result.pool_eid):
-            if eid and (len(eid) != 32 or any(c not in "0123456789abcdefABCDEF" for c in eid)):
-                raise ValueError("remote_shared EID must contain 32 hexadecimal digits")
-        if not result.device_eid or result.eid_index < -1:
-            raise ValueError("remote_shared requires a device EID and valid EID index")
-        return result
 
 
 @dataclass(frozen=True)
@@ -498,6 +469,14 @@ class DSAOffloadConfig:
         cache_config = vllm_config.cache_config
         parallel_config = vllm_config.parallel_config
         observability_config = vllm_config.observability_config
+        if self.remote_shared is not None:
+            self.remote_shared.validate_topology(parallel_config.data_parallel_size, parallel_config.tensor_parallel_size)
+            heads = int(getattr(vllm_config.model_config.hf_text_config, "num_attention_heads", 0))
+            tp = parallel_config.tensor_parallel_size
+            if heads % tp or heads // tp not in (32, 64):
+                raise ValueError("remote_shared CopySFA requires 32/64 local attention heads")
+            if int(scheduler_config.max_num_seqs) != 1:
+                raise ValueError("remote_shared multi-rank smoke currently requires BS1 per DP; dynamic rows are not supported")
         if self.ready_shadow is not None and (
             parallel_config.data_parallel_size != 1 or parallel_config.tensor_parallel_size not in (1, 2)
             or int(scheduler_config.max_num_seqs) != 1

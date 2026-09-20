@@ -416,8 +416,8 @@ class NPUModelRunner(GPUModelRunner):
             # 只有显式配置真实shared backend才开放远端能力；普通planner预检不授权执行。
             capabilities = set()
             if dsa_config.remote_shared is not None:
-                if self.parallel_config.data_parallel_size != 1 or self.parallel_config.tensor_parallel_size != 1:
-                    raise ValueError("first hbm_full_remote_shared integration requires DP1/TP1")
+                dsa_config.remote_shared.validate_topology(
+                    self.parallel_config.data_parallel_size, self.parallel_config.tensor_parallel_size)
                 if not dsa_config.mtp_enabled:
                     raise ValueError("hbm_full_remote_shared currently requires MTP3 target decode")
                 capabilities = {"full_hbm_cache", "lis_send_durable_dual_output", "shared_fetch", "scatter_sfa",
@@ -5105,6 +5105,16 @@ class NPUModelRunner(GPUModelRunner):
         runtime.bind_dram_store(store)
         remote_config = self.ascend_config.dsa_offload_config.remote_store
         shared_config = self.ascend_config.dsa_offload_config.remote_shared
+        if shared_config is not None:
+            from kvcache_scatter_copy_custom_ops import custom_ops_lib
+
+            # 物理卡号由运行时查询，不能用TP/DP rank或可见逻辑卡号猜测。
+            physical_device, shared_device = shared_config.for_device(
+                custom_ops_lib.aiv_urma_query_eids(str(self.device)))
+            logger.info("DSA_SHARED_DEVICE dp=%s tp=%s logical=%s physical=%s store=%s du=%s "
+                        "device_eid=%s eid_index=%s pool_eid=%s", self.dp_rank, get_tp_group().rank_in_group,
+                        self.device, physical_device, shared_config.store_endpoint, shared_device.du_endpoint,
+                        shared_device.device_eid, shared_device.eid_index, shared_device.pool_eid)
         if remote_config is not None or shared_config is not None:
             from vllm_ascend.dsa_offload.remote_store import RemoteKvStore, RemoteStoreShadow
 
@@ -5125,7 +5135,9 @@ class NPUModelRunner(GPUModelRunner):
                 context = forward_context[resident_names[layer]].impl.dsa_offload_context
                 packed = context.full_cache if context.full_cache is not None else kv_caches[resident_names[layer]][0]
                 remote_layers.append((context, packed))
-            runtime.remote_shared = RemoteShared(shared_config, runtime, self.dsa_execution_plan, remote_layers)
+            runtime.remote_shared = RemoteShared(shared_device, runtime, self.dsa_execution_plan, remote_layers,
+                                                dp_rank=self.dp_rank, tp_rank=get_tp_group().rank_in_group,
+                                                physical_device=physical_device)
         cache_layout.set_pool_release_callback(
             runtime.release_pool_index
         )

@@ -17,11 +17,12 @@ logger = logging.getLogger(__name__)
 
 
 class RemoteShared:
-    def __init__(self, config, runtime, plan, layers):
+    def __init__(self, config, runtime, plan, layers, *, dp_rank=0, tp_rank=0, physical_device=None):
         import kvcache_scatter_copy_custom_ops  # noqa: F401
         from kvcache_scatter_copy_custom_ops import custom_ops_lib
 
         self.native, self.config, self.runtime, self.plan = custom_ops_lib, config, runtime, plan
+        self.identity = f"dp={dp_rank} tp={tp_rank} physical={physical_device}"
         self.layers = layers  # (context, packed KV)；只有真实target层，不含MTP proposer。
         self.dump_epoch = -1
         for name in ("lis_send_pool_connect_selection", "lis_send_pool_refresh", "lis_send_pool_close"):
@@ -69,7 +70,9 @@ class RemoteShared:
                 mirror = self.runtime.resident_token_pool.get_cache_slots(group.group)
                 mirror[:b, :self.runtime.max_model_len].fill_(-1)
         host, port = self.config.du_endpoint.rsplit(":", 1)
-        logger.info("DSA_SHARED_CONNECT_BEGIN endpoint=%s rows=%s slots=%s", self.config.du_endpoint, host_rows, budgets[0])
+        logger.info("DSA_SHARED_CONNECT_BEGIN %s endpoint=%s rows=%s slots=%s handles=%s namespace=%s",
+                    self.identity, self.config.du_endpoint, host_rows, budgets[0],
+                    bound[:, 0].tolist(), shadow.namespace)
         self.handle = self.native.lis_send_pool_connect_selection(
             host, int(port), self.config.device_eid, str(self.runtime.device), owners,
             self.runtime.max_logical_blocks * 128, b, self.runtime.num_layers,
@@ -81,7 +84,7 @@ class RemoteShared:
         self.period = ((self.runtime.num_layers * self.groups + 7) // 8) * 8
         self.arange_tail = torch.arange(256, dtype=torch.int32, device=self.runtime.device)
         self.causal_query = torch.arange(4, dtype=torch.int32, device=self.runtime.device)
-        logger.info("DSA_SHARED_CONNECT_OK wire=5 backend=real_store groups=%s", len(self.plan.groups))
+        logger.info("DSA_SHARED_CONNECT_OK %s wire=5 backend=real_store groups=%s", self.identity, len(self.plan.groups))
 
     def _buffer(self, context, batch):
         key = context.execution_plan.group
@@ -196,7 +199,7 @@ class RemoteShared:
         if not torch.equal(status[:, 0], expected) or bool(status[:, 1].any()):
             raise RuntimeError(f"ScatterSFA failed at layer {context.layer_id}: {status.tolist()}")
         self.sfas += 1
-        logger.info("DSA_SHARED_CONSUMED layer=%s generation=%s mirror=%s applied=%s", context.layer_id,
+        logger.info("DSA_SHARED_CONSUMED %s layer=%s generation=%s mirror=%s applied=%s", self.identity, context.layer_id,
                     expected.tolist(), context.execution_plan.mirror_writer, context.execution_plan.applied)
         return out
 
@@ -207,5 +210,5 @@ class RemoteShared:
         self.handle = None
         self.rows = self.bound = self.current = self.previous_out = None
         self.buffers.clear()
-        logger.info("DSA_SHARED_DRAIN_OK select=%s gather_only=%s scatter_sfa=%s real_store=1",
-                    self.calls, self.fetches, self.sfas)
+        logger.info("DSA_SHARED_DRAIN_OK %s select=%s gather_only=%s scatter_sfa=%s real_store=1",
+                    self.identity, self.calls, self.fetches, self.sfas)

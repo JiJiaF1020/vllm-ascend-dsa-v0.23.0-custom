@@ -13,6 +13,7 @@ import importlib.util
 import json
 import multiprocessing
 import os
+import runpy
 import socket
 import time
 from dataclasses import dataclass, fields, replace
@@ -178,12 +179,14 @@ def validate_config(config: SmokeConfig) -> None:
     if config.remote_shared is not None:
         if (not config.enable_offload or not config.enable_a5_packed_c8 or not config.enable_mtp
                 or config.mtp_num_speculative_tokens != 3 or config.run_mode != "eager"
-                or config.data_parallel_size != 1 or config.tensor_parallel_size != 1
+                or config.tensor_parallel_size not in (1, 2)
                 or config.max_num_seqs != 1 or config.enable_mtp_graph
                 or config.store_endpoint or config.ready_shadow_dir):
-            raise ValueError("remote shared first smoke requires DP1 TP1 BS1 A5 C8 MTP3 eager; no shadow modes")
-        if not isinstance(config.remote_shared, dict) or not {"store_endpoint", "du_endpoint", "device_eid"} <= config.remote_shared.keys():
-            raise ValueError("remote shared JSON requires store_endpoint, du_endpoint and device_eid")
+            raise ValueError("remote shared smoke requires TP1/TP2, BS1 per DP, A5 C8 MTP3 eager; no shadow modes")
+        # 只加载stdlib配置模块；dry-run与spawn之前不能初始化torch/vLLM/NPU。
+        path = Path(__file__).resolve().parents[2] / "vllm_ascend/dsa_offload/remote_shared_config.py"
+        remote = runpy.run_path(str(path))["DSARemoteSharedConfig"].from_value(config.remote_shared)
+        remote.validate_topology(config.data_parallel_size, config.tensor_parallel_size)
     if config.ready_shadow_dir is not None and (
         not config.enable_offload or not config.enable_a5_packed_c8 or not config.enable_mtp
         or config.mtp_num_speculative_tokens != 3 or config.run_mode != "eager"
@@ -246,6 +249,8 @@ def resolve_node_launch(
     config: SmokeConfig, args: argparse.Namespace
 ) -> tuple[str, int, int | None, list[tuple[int, int]]]:
     validate_config(config)
+    if config.remote_shared is not None and args.node_size != 1:
+        raise ValueError("remote_shared physical-device table currently supports one NPU host; multi-node needs node identity")
     if args.node_size < 1 or not 0 <= args.node_rank < args.node_size:
         raise ValueError("node-size must be positive and node-rank must be in [0, node-size)")
     if config.data_parallel_size % args.node_size:

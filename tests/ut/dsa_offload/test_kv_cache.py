@@ -89,7 +89,8 @@ def test_indexer_spec_accounts_for_one_vector_per_token() -> None:
     assert spec.page_size_bytes == 128 * 1 * 128 * 2
 
 
-def test_c8_indexer_spec_merge_preserves_split_cache_layout() -> None:
+@pytest.mark.parametrize("full_kv_token_bytes", [0, 656])
+def test_c8_indexer_spec_merge_preserves_split_cache_layout(full_kv_token_bytes: int) -> None:
     specs = [
         DSAIndexerKVSpec(
             block_size=128,
@@ -97,6 +98,7 @@ def test_c8_indexer_spec_merge_preserves_split_cache_layout() -> None:
             head_size=128,
             dtype=torch.bfloat16,
             cache_sparse_li_c8=True,
+            full_kv_token_bytes=full_kv_token_bytes,
         )
         for _ in range(2)
     ]
@@ -106,7 +108,8 @@ def test_c8_indexer_spec_merge_preserves_split_cache_layout() -> None:
     assert merged.cache_sparse_li_c8
     assert merged.c8_k_cache_dtype == torch.float8_e4m3fn
     assert merged.c8_k_scale_cache_dtype == torch.float32
-    assert merged.page_size_bytes == 128 * (128 + 4)
+    assert merged.full_kv_token_bytes == full_kv_token_bytes
+    assert merged.page_size_bytes == 128 * (128 + 4 + full_kv_token_bytes)
 
 
 def test_c8_resident_spec_merge_preserves_packed_cache_layout() -> None:

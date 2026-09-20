@@ -413,9 +413,16 @@ class NPUModelRunner(GPUModelRunner):
         )
         if self.dsa_execution_plan is not None:
             logger.info("DSA_EXECUTION_PLAN\n%s", self.dsa_execution_plan.table())
-            # 当前绑定器仅能执行 local_all。远端 capability 需在真实算子/连接
-            # 接通后逐项提供；生成计划本身不能授权用 resident cache 冒充完整 HBM。
-            self.dsa_execution_plan.require_capabilities(set())
+            # 只有显式配置真实shared backend才开放远端能力；普通planner预检不授权执行。
+            capabilities = set()
+            if dsa_config.remote_shared is not None:
+                if self.parallel_config.data_parallel_size != 1 or self.parallel_config.tensor_parallel_size != 1:
+                    raise ValueError("first hbm_full_remote_shared integration requires DP1/TP1")
+                if not dsa_config.mtp_enabled:
+                    raise ValueError("hbm_full_remote_shared currently requires MTP3 target decode")
+                capabilities = {"full_hbm_cache", "lis_send_durable_dual_output", "shared_fetch", "scatter_sfa",
+                                "group_applied", "grouped_transport", "pool_du"}
+            self.dsa_execution_plan.require_capabilities(capabilities)
         full_indexer_layers = (
             dsa_config.model_capabilities.full_indexer_layer_indices
             if dsa_config.model_capabilities is not None
@@ -463,7 +470,7 @@ class NPUModelRunner(GPUModelRunner):
 
             self.dsa_offload_runtime.ready_shadow = ReadyShadow(
                 dsa_config.ready_shadow, self.dsa_offload_runtime, torch.distributed.get_rank())
-        if dsa_config.remote_store is not None and not self.dsa_offload_packed_c8:
+        if (dsa_config.remote_store is not None or dsa_config.remote_shared is not None) and not self.dsa_offload_packed_c8:
             raise ValueError("store_shadow requires A5 packed C8; BF16 and Indexer cache are not uploaded")
         self._dsa_decode_forward = False
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
@@ -5084,6 +5091,7 @@ class NPUModelRunner(GPUModelRunner):
                     selection_source_layer_id=selection_source_layer_id,
                     packed_c8=self.dsa_offload_packed_c8,
                     execution_plan=layer_plan,
+                    full_cache=self._dsa_full_caches.get(indexer_name),
                 )
             )
 
@@ -5096,17 +5104,28 @@ class NPUModelRunner(GPUModelRunner):
 
         runtime.bind_dram_store(store)
         remote_config = self.ascend_config.dsa_offload_config.remote_store
-        if remote_config is not None:
+        shared_config = self.ascend_config.dsa_offload_config.remote_shared
+        if remote_config is not None or shared_config is not None:
             from vllm_ascend.dsa_offload.remote_store import RemoteKvStore, RemoteStoreShadow
 
             remote_store = RemoteKvStore(
-                remote_config.endpoint, payload_layers=runtime.num_layers,
+                shared_config.store_endpoint if shared_config else remote_config.endpoint, payload_layers=runtime.num_layers,
                 capacity=runtime.max_logical_blocks * runtime.block_size,
             )
-            runtime.remote_store_shadow = RemoteStoreShadow(remote_store, resident_pool.max_num_reqs)
+            runtime.remote_store_shadow = RemoteStoreShadow(
+                remote_store, resident_pool.max_num_reqs,
+                inference="hbm_full_remote_shared" if shared_config else "local_all")
             logger.info("DSA_STORE_SHADOW_TOPOLOGY payload_layer_indices=%s full_layer_indices=%s "
-                        "selection_groups=%s remote_selection_plan=0", ordered_layer_indices,
-                        sorted(indexer_names), next_selection_state_id)
+                        "selection_groups=%s remote_selection_plan=%s", ordered_layer_indices,
+                        sorted(indexer_names), next_selection_state_id, int(shared_config is not None))
+        if shared_config is not None:
+            from vllm_ascend.dsa_offload.remote_shared import RemoteShared
+            remote_layers = []
+            for layer in ordered_layer_indices:
+                context = forward_context[resident_names[layer]].impl.dsa_offload_context
+                packed = context.full_cache if context.full_cache is not None else kv_caches[resident_names[layer]][0]
+                remote_layers.append((context, packed))
+            runtime.remote_shared = RemoteShared(shared_config, runtime, self.dsa_execution_plan, remote_layers)
         cache_layout.set_pool_release_callback(
             runtime.release_pool_index
         )
@@ -5313,6 +5332,9 @@ class NPUModelRunner(GPUModelRunner):
                                     current_layer_spec.c8_k_scale_cache_dtype
                                 ),
                             )
+                            if current_layer_spec.full_kv_token_bytes:
+                                tensor = (*tensor, self._allocate_int8_cache_tensor(
+                                    num_tokens * current_layer_spec.full_kv_token_bytes, alignment))
                         else:
                             tensor = self._allocate_int8_cache_tensor(
                                 kv_cache_tensor.size,
@@ -5582,6 +5604,7 @@ class NPUModelRunner(GPUModelRunner):
             corresponding memory buffer for KV cache.
         """
         kv_caches: dict[str, torch.Tensor | tuple[torch.Tensor, ...]] = {}
+        self._dsa_full_caches: dict[str, torch.Tensor] = {}
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
 
         # Indexer plane 只是一张独立的 dense cache，没有自己的 attention
@@ -5593,13 +5616,14 @@ class NPUModelRunner(GPUModelRunner):
             raw_tensor = kv_cache_raw_tensors[layer_name]
             assert raw_tensor is not None
             if current_kv_cache_spec.cache_sparse_li_c8:
-                if not isinstance(raw_tensor, tuple) or len(raw_tensor) != 2:
+                planes = 3 if current_kv_cache_spec.full_kv_token_bytes else 2
+                if not isinstance(raw_tensor, tuple) or len(raw_tensor) != planes:
                     raise RuntimeError(
                         "DSA C8 Indexer raw cache must contain key and scale: "
                         f"layer={layer_name}"
                     )
-                raw_key, raw_scale = raw_tensor
-                total_bytes = raw_key.numel() + raw_scale.numel()
+                raw_key, raw_scale = raw_tensor[:2]
+                total_bytes = sum(t.numel() for t in raw_tensor)
             else:
                 if not isinstance(raw_tensor, torch.Tensor):
                     raise RuntimeError(
@@ -5631,6 +5655,10 @@ class NPUModelRunner(GPUModelRunner):
                         current_kv_cache_spec.c8_k_scale_cache_dtype
                     ).view(scale_shape),
                 )
+                if current_kv_cache_spec.full_kv_token_bytes:
+                    self._dsa_full_caches[layer_name] = raw_tensor[2].view(torch.float8_e4m3fn).view(
+                        num_blocks, current_kv_cache_spec.block_size, 1,
+                        current_kv_cache_spec.full_kv_token_bytes)
             else:
                 kv_caches[layer_name] = raw_tensor.view(
                     current_kv_cache_spec.dtype
@@ -6422,6 +6450,8 @@ class NPUModelRunner(GPUModelRunner):
                         c8_k_cache_dtype=torch.float8_e4m3fn,
                         c8_k_scale_cache_dtype=torch.float32,
                         c8_scale_dim=1,
+                        full_kv_token_bytes=(656 if self.dsa_execution_plan.placement.value ==
+                                             "hbm_full_remote_shared" else 0),
                     )
 
             elif isinstance(attn_module, CacheOnlyAttentionLayer):

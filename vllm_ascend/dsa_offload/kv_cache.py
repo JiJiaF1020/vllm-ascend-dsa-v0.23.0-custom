@@ -63,6 +63,9 @@ class DSAIndexerKVSpec(FullAttentionSpec):
     c8_k_cache_dtype: torch.dtype = torch.float8_e4m3fn
     c8_k_scale_cache_dtype: torch.dtype = torch.float32
     c8_scale_dim: int = 1
+    # hbm_full_remote_shared：full KV共用Indexer block生命周期，但数据仍是独立plane。
+    # 显式计入KV容量规划，禁止在绑定后额外分配未计费的完整HBM cache。
+    full_kv_token_bytes: int = 0
 
     @classmethod
     def merge(cls, specs: list[DSAIndexerKVSpec]) -> DSAIndexerKVSpec:
@@ -87,7 +90,7 @@ class DSAIndexerKVSpec(FullAttentionSpec):
             token_bytes = self.head_size * get_dtype_size(self.c8_k_cache_dtype) + self.c8_scale_dim * get_dtype_size(
                 self.c8_k_scale_cache_dtype
             )
-        return self.block_size * self.num_kv_heads * token_bytes
+        return self.block_size * self.num_kv_heads * (token_bytes + self.full_kv_token_bytes)
 
 
 @dataclass(frozen=True, kw_only=True)

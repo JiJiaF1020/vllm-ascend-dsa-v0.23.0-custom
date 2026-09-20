@@ -153,8 +153,9 @@ class RemoteStoreShadow:
     Store 不回收旧 handle/物理页。PUT_DONE 只在全部 target 层到齐后查询。
     """
 
-    def __init__(self, store: RemoteKvStore, rows: int) -> None:
+    def __init__(self, store: RemoteKvStore, rows: int, *, inference: str = "local_all") -> None:
         self.store = store
+        self.inference = inference
         self.namespace = uuid.uuid4().int & ((1 << 63) - 1)
         self.next_request = 1
         self.handles = torch.zeros(rows, dtype=torch.int64)
@@ -163,8 +164,8 @@ class RemoteStoreShadow:
         self.layer_pages = np.zeros((store.payload_layers, rows), dtype=np.int32)
         self.put_pages = 0
         self.closed_requests = 0
-        logger.info("DSA_STORE_SHADOW_OPEN mode=store_shadow inference=local_all store_id=%s layers=%s capacity=%s",
-                    store.store_id, store.payload_layers, store.capacity)
+        logger.info("DSA_STORE_OPEN inference=%s store_id=%s layers=%s capacity=%s",
+                    inference, store.store_id, store.payload_layers, store.capacity)
 
     def ensure_requests(self, request_ids: list[str], pool_rows: np.ndarray) -> None:
         for request_id, row_value in zip(request_ids, pool_rows, strict=True):
@@ -246,5 +247,5 @@ class RemoteStoreShadow:
     def close(self) -> None:
         for row in tuple(self.request_ids):
             self.release(row)
-        logger.info("DSA_STORE_SHADOW_CLOSED requests=%s put_pages=%s inference=local_all remote_get=0",
-                    self.closed_requests, self.put_pages)
+        logger.info("DSA_STORE_CLOSED requests=%s put_pages=%s inference=%s remote_get=%s",
+                    self.closed_requests, self.put_pages, self.inference, int(self.inference != "local_all"))

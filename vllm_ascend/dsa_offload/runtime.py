@@ -246,6 +246,7 @@ class DSAOffloadRuntime:
 
         self.dram_store: DSAHotDRAMStore | None = None
         self.remote_store_shadow: RemoteStoreShadow | None = None
+        self.remote_shared = None
         self.ready_shadow = None  # 仅显式验证模式绑定；正常路径不采集、不导入候选扩展。
         self.active_num_reqs = 0
         self.execution_num_reqs = 0
@@ -283,6 +284,8 @@ class DSAOffloadRuntime:
         self.dram_store = store
 
     def release_pool_index(self, pool_index: int) -> None:
+        if self.remote_shared is not None:
+            self.remote_shared.close()
         if self.remote_store_shadow is not None:
             self.remote_store_shadow.release(pool_index)
         store = self.dram_store
@@ -290,6 +293,8 @@ class DSAOffloadRuntime:
             store.release_pool_index(pool_index)
 
     def close_remote_store(self) -> None:
+        if self.remote_shared is not None:
+            self.remote_shared.close()
         if self.remote_store_shadow is not None:
             self.remote_store_shadow.close()
 
@@ -931,6 +936,9 @@ class DSALayerOffloadContext:
     packed_c8: bool = False
 
     execution_plan: LayerExecutionPlan | None = None
+    full_cache: torch.Tensor | None = None
+    full_dump_table: torch.Tensor | None = None
+    full_dump_rows: torch.Tensor | None = None
 
     def execute_decode_selection(
         self,
@@ -948,7 +956,22 @@ class DSALayerOffloadContext:
         candidate_lens: torch.Tensor | None = None,
         query_dequant_scale: torch.Tensor | None = None,
         query_shape: tuple[int, ...] | None = None,
-    ) -> DSAOffloadSelectionOutput:
+        sparse_budget_tokens: torch.Tensor | None = None,
+    ) -> DSAOffloadSelectionOutput | torch.Tensor:
+        if self.full_cache is not None:
+            from vllm_ascend.dsa_offload.ops import quant_lightning_indexer_topk
+            if self.execution_plan.first_payload_layer is None:
+                # 普通full使用真实V和原生causal选择，绝不借用durable D。
+                key, key_scale = self.indexer_cache
+                return quant_lightning_indexer_topk(
+                    query=query.view(query_shape), key=key, weights=weights,
+                    query_dequant_scale=query_dequant_scale.view(query_shape[:-1]), key_dequant_scale=key_scale,
+                    actual_seq_lengths_query=actual_seq_lengths_query, candidate_lens=actual_seq_lengths_key,
+                    block_table=indexer_block_table)
+            return self.runtime.remote_shared.select(
+                self, query.view(query_shape), weights, query_dequant_scale.view(query_shape[:-1]),
+                actual_seq_lengths_query, resident_pool_indices, candidate_lens, actual_seq_lengths_key,
+                row_modes, indexer_block_table, sparse_budget_tokens)
         if self.indexer_cache is None or self.selection_state_id is None:
             raise RuntimeError(f"DSA shared-indexer layer must not run LIDU selection: layer_id={self.layer_id}")
         num_reqs = int(actual_seq_lengths_key.shape[0])
@@ -1119,6 +1142,8 @@ class DSALayerOffloadContext:
         不跑 LIDU（shared 层无 indexer 权重），只对本层 resident/DRAM
         arena 跑 KSC。新鲜度守卫确保所属 full 层在本步已先跑过 LIDU。
         """
+        if self.runtime.remote_shared is not None:
+            return self.runtime.remote_shared.fetch(self)
         if self.indexer_cache is not None or self.selection_source_layer_id is None:
             raise RuntimeError(f"DSA full-indexer layer must use execute_decode_selection: layer_id={self.layer_id}")
         if self.runtime._selection_source_layer != self.selection_source_layer_id:
@@ -1197,6 +1222,10 @@ class DSALayerOffloadContext:
         actual_seq_lengths_kv: torch.Tensor,
         query_rope: torch.Tensor,
     ) -> torch.Tensor:
+        if self.runtime.remote_shared is not None and self.full_cache is None:
+            return self.runtime.remote_shared.attention(
+                self, torch.cat([query, query_rope], dim=-1), resident_cache[0], resident_block_table,
+                actual_seq_lengths_query, scale_value)
         if self.packed_c8:
             if len(resident_cache) != 1:
                 raise RuntimeError("DSA A5 C8 attention requires one packed resident cache")
@@ -1253,17 +1282,33 @@ class DSALayerOffloadContext:
         if self.packed_c8:
             if len(resident_cache) != 1 or arenas.packed is None:
                 raise RuntimeError("DSA A5 C8 dump requires packed HBM and DRAM caches")
+            source_blocks = self.runtime._dump_source_blocks[:self.runtime.dump_job_count]
+            source_tensor = self.runtime.dump_src_block_ids.gpu[:job_count]
+            if self.full_cache is not None:
+                # full plane遵循Indexer完整页生命周期，不能用resident收缩后的block id。
+                table = self.full_dump_table.cpu().numpy()
+                row_ids = self.full_dump_rows.cpu().tolist()
+                row_map = {row: batch for batch, row in enumerate(row_ids)}
+                source_blocks = np.asarray([
+                    table[row_map[int(row)], int(page)] for row, page in zip(
+                        self.runtime._dump_pool_indices[:self.runtime.dump_job_count],
+                        self.runtime._dump_logical_indices[:self.runtime.dump_job_count], strict=True)
+                ], dtype=np.int32)
+                if not source_blocks.size:
+                    return
+                source_tensor = torch.from_numpy(source_blocks).to(resident_cache[0].device)
+                job_count = source_blocks.size
             dump_full_kv_cache_blocks_c8(
                 resident_packed_cache=resident_cache[0],
                 dram_packed_arena=arenas.packed,
-                src_block_ids=self.runtime.dump_src_block_ids.gpu[:job_count],
+                src_block_ids=source_tensor,
                 dst_block_ids=self.runtime.dump_dst_block_ids.gpu[:job_count],
             )
             shadow = self.runtime.remote_store_shadow
             if shadow is not None:
                 real_jobs = self.runtime.dump_job_count
                 shadow.put_layer(
-                    self.layer_id, resident_cache[0], self.runtime._dump_source_blocks[:real_jobs],
+                    self.layer_id, resident_cache[0], source_blocks,
                     self.runtime._dump_pool_indices[:real_jobs], self.runtime._dump_logical_indices[:real_jobs],
                     before_cache_write=before_cache_write,
                 )

@@ -53,6 +53,7 @@ class SmokeConfig:
     dsa_mtp_resident_budget_tokens: tuple[int, ...] = (8192, 12288, 12288)  # 仅卸载 + MTP 生效。
     graph_capture_sizes: tuple[int, ...] = (1, 2, 4, 8, 16)  # 请求数；自动补入 max_num_seqs，再转换成 token 数。
     store_endpoint: str | None = None  # 仅 CLI --store-endpoint；真实写侧穿刺，推理仍是 local_all。
+    remote_shared: dict[str, Any] | None = None  # CLI JSON；真实shared Get，不是store_shadow。
     ready_shadow_dir: str | None = None  # 仅CLI；使用真实LIDU轨迹，候选不改变模型输出。
     ready_shadow_steps: int = 3
     ready_shadow_group: int = 0
@@ -68,6 +69,7 @@ class SmokeConfig:
             f"dp{self.data_parallel_size}_tp{self.tensor_parallel_size}"
             f"_{'offload' if self.enable_offload else 'baseline'}_{self.run_mode}_{mtp}"
             f"{'_store_shadow' if self.store_endpoint else ''}"
+            f"{'_hbm_full_remote_shared' if self.remote_shared else ''}"
         )
 
 
@@ -173,6 +175,15 @@ def main_from_env(defaults: SmokeConfig, *, node_size: int) -> None:
 
 
 def validate_config(config: SmokeConfig) -> None:
+    if config.remote_shared is not None:
+        if (not config.enable_offload or not config.enable_a5_packed_c8 or not config.enable_mtp
+                or config.mtp_num_speculative_tokens != 3 or config.run_mode != "eager"
+                or config.data_parallel_size != 1 or config.tensor_parallel_size != 1
+                or config.max_num_seqs != 1 or config.enable_mtp_graph
+                or config.store_endpoint or config.ready_shadow_dir):
+            raise ValueError("remote shared first smoke requires DP1 TP1 BS1 A5 C8 MTP3 eager; no shadow modes")
+        if not isinstance(config.remote_shared, dict) or not {"store_endpoint", "du_endpoint", "device_eid"} <= config.remote_shared.keys():
+            raise ValueError("remote shared JSON requires store_endpoint, du_endpoint and device_eid")
     if config.ready_shadow_dir is not None and (
         not config.enable_offload or not config.enable_a5_packed_c8 or not config.enable_mtp
         or config.mtp_num_speculative_tokens != 3 or config.run_mode != "eager"
@@ -283,6 +294,9 @@ def build_llm_kwargs(config: SmokeConfig, multi_node: bool = False) -> dict[str,
             additional_config["dsa_sparse_config"]["remote_store"] = {
                 "mode": "store_shadow", "endpoint": config.store_endpoint,
             }
+        if config.remote_shared is not None:
+            additional_config["dsa_sparse_config"].update(
+                placement="hbm_full_remote_shared", remote_shared=config.remote_shared)
         if config.ready_shadow_dir is not None:
             additional_config["dsa_sparse_config"]["ready_shadow"] = {
                 "directory": config.ready_shadow_dir, "steps": config.ready_shadow_steps,
@@ -563,6 +577,7 @@ def main(
     parser.set_defaults(node_size=node_size)
     parser.add_argument("--mtp-eager", action="store_true", help="MTP eager 对照；不改变 target 模式")
     parser.add_argument("--store-endpoint", help="host:port；真实 CREATE/PUT/PUT_DONE/CLOSE，推理仍走本地，不启用远端 Get")
+    parser.add_argument("--remote-shared-config", help="JSON文件；Store/DU/EID配置，启用真实hbm_full_remote_shared功能链")
     parser.add_argument("--dry-run", action="store_true", help="只检查配置和 rank 分配，不加载模型或初始化 NPU")
     parser.add_argument("--ready-shadow-dir", help="有限ready旁路对拍；失败落盘，推理输出仍使用本地LIDU/KSC/SFA")
     parser.add_argument("--ready-shadow-steps", type=int, default=3)
@@ -570,6 +585,10 @@ def main(
     args = parser.parse_args()
     if args.mtp_eager:
         config = replace(config, enable_mtp_graph=False)
+    if args.remote_shared_config:
+        with open(args.remote_shared_config, encoding="utf-8") as source:
+            config = replace(config, remote_shared=json.load(source))
+        print("[dsa-smoke] hbm_full_remote_shared real_store=1 real_get=1; eager functional validation, NOT performance", flush=True)
     if args.store_endpoint:
         config = replace(config, store_endpoint=args.store_endpoint)
         print("[dsa-smoke] mode=store_shadow inference=local_all remote_get=0; synchronous PUT, not a performance run", flush=True)

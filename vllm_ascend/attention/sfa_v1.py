@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import scipy  # type: ignore
@@ -1742,6 +1742,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     candidate_lens=candidate_lens,
                     query_dequant_scale=q_li_scale,
                     query_shape=(tuple(q_li_shape_ori) if q_li_shape_ori is not None else None),
+                    sparse_budget_tokens=sparse_budget_tokens,
                 )
 
             # Prefill 仍复用基线 lightning-indexer。区别仅在于 key cache
@@ -1899,6 +1900,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                         reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
 
+        context = self.dsa_offload_context
+        if context is not None and context.full_cache is not None:
+            context.full_dump_table = attn_metadata.dsa_indexer_block_table
+            context.full_dump_rows = attn_metadata.dsa_resident_pool_indices
+            kv_cache = (context.full_cache,)
+            attn_metadata = replace(
+                attn_metadata, block_table=attn_metadata.dsa_indexer_block_table,
+                slot_mapping=attn_metadata.dsa_indexer_slot_mapping)
         cos = attn_metadata.cos
         sin = attn_metadata.sin
         slot_mapping = attn_metadata.slot_mapping
@@ -1937,6 +1946,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         if dsa_context is not None:
             if kv_cache is None:
                 raise RuntimeError("DSA full-block dump requires a resident cache")
+            if dsa_context.runtime.remote_shared is not None:
+                dsa_context.runtime.remote_shared.dump_before_write(attn_metadata)
             # MTP provisional rows may reuse the same parity tail that still
             # contains a newly confirmed block. The confirmed block must be
             # persisted before any KV write in this layer. Non-MTP/prefill

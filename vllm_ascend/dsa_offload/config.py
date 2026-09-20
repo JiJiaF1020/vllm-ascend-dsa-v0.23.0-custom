@@ -52,6 +52,7 @@ _PUBLIC_CONFIG_KEYS = frozenset(
         "remote_store",
         "ready_shadow",
         "placement",
+        "remote_shared",
     }
 )
 _TRACE_CONFIG_KEYS = frozenset({"enabled", "points", "ranks"})
@@ -158,6 +159,36 @@ class DSAOffloadTraceConfig:
 
 
 @dataclass(frozen=True)
+class DSARemoteSharedConfig:
+    """首轮整网eager验证：每worker一个真实Store与DU连接，EID显式来自连通性probe。"""
+    store_endpoint: str
+    du_endpoint: str
+    device_eid: str
+    eid_index: int = -1
+    pool_eid: str = ""
+
+    @classmethod
+    def from_value(cls, value):
+        if value is None:
+            return None
+        if not isinstance(value, Mapping) or set(value) - {
+            "store_endpoint", "du_endpoint", "device_eid", "eid_index", "pool_eid"
+        }:
+            raise ValueError("invalid remote_shared configuration")
+        result = cls(**value)
+        for endpoint in (result.store_endpoint, result.du_endpoint):
+            host, sep, port = endpoint.rpartition(":")
+            if not host or not sep or not port.isdecimal() or not 0 < int(port) < 65536:
+                raise ValueError("remote_shared endpoints must be host:port")
+        for eid in (result.device_eid, result.pool_eid):
+            if eid and (len(eid) != 32 or any(c not in "0123456789abcdefABCDEF" for c in eid)):
+                raise ValueError("remote_shared EID must contain 32 hexadecimal digits")
+        if not result.device_eid or result.eid_index < -1:
+            raise ValueError("remote_shared requires a device EID and valid EID index")
+        return result
+
+
+@dataclass(frozen=True)
 class DSARemoteStoreConfig:
     """首阶段只验证真实 PUT 生命周期；不把本地推理冒充远端 Get。"""
 
@@ -220,6 +251,7 @@ class DSAOffloadConfig:
     remote_store: DSARemoteStoreConfig | None = None
     ready_shadow: DSAReadyShadowConfig | None = None
     placement: DsaKvPlacement = DsaKvPlacement.LOCAL_ALL
+    remote_shared: DSARemoteSharedConfig | None = None
     model_capabilities: DSAOffloadModelCapabilities | None = field(
         default=None,
         compare=False,
@@ -350,6 +382,7 @@ class DSAOffloadConfig:
             remote_store=DSARemoteStoreConfig.from_value(raw_config.get("remote_store")),
             ready_shadow=DSAReadyShadowConfig.from_value(raw_config.get("ready_shadow")),
             placement=DsaKvPlacement(raw_config.get("placement", "local_all")),
+            remote_shared=DSARemoteSharedConfig.from_value(raw_config.get("remote_shared")),
         )
         config._validate_static_contract()
         if config.enabled and vllm_config is not None:
@@ -367,6 +400,9 @@ class DSAOffloadConfig:
         return config
 
     def _validate_static_contract(self) -> None:
+        if self.remote_shared is not None:
+            if self.placement != DsaKvPlacement.HBM_FULL_REMOTE_SHARED or self.enable_row_mode_decode_graph:
+                raise ValueError("remote_shared currently requires hbm_full_remote_shared and eager execution")
         if self.placement != DsaKvPlacement.LOCAL_ALL:
             if not self.enabled:
                 raise ValueError("remote placement requires enabled=True")
@@ -402,7 +438,7 @@ class DSAOffloadConfig:
         self,
         vllm_config: Any,
     ) -> tuple[DSAOffloadModelCapabilities, int, int]:
-        if self.remote_store is not None or self.ready_shadow is not None:
+        if self.remote_store is not None or self.ready_shadow is not None or self.remote_shared is not None:
             from vllm.config import CompilationMode
 
             if not vllm_config.model_config.enforce_eager or vllm_config.compilation_config.mode != CompilationMode.NONE:
@@ -652,7 +688,7 @@ class DSAOffloadConfig:
 
         compilation_config = vllm_config.compilation_config
         cudagraph_mode = compilation_config.cudagraph_mode
-        if (self.remote_store is not None or self.ready_shadow is not None) and (
+        if (self.remote_store is not None or self.ready_shadow is not None or self.remote_shared is not None) and (
             compilation_config.mode != CompilationMode.NONE or cudagraph_mode != CUDAGraphMode.NONE
         ):
             raise ValueError(f"store/ready shadow cannot run compiled/captured: phase={phase}; use eager mode")

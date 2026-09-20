@@ -126,7 +126,7 @@ class DSAInputBatchCacheLayout:
             dtype=np.bool_,
         )
         self._request_ids: tuple[str, ...] = ()
-        self._pool_release_callback: Callable[[int], None] | None = None
+        self._pool_release_callback: Callable[[int], bool | None] | None = None
         self.mapping_version = 0
         self.row_count = 0
         self.valid = False
@@ -190,9 +190,9 @@ class DSAInputBatchCacheLayout:
 
     def set_pool_release_callback(
         self,
-        callback: Callable[[int], None],
+        callback: Callable[[int], bool | None],
     ) -> None:
-        """绑定 DRAM ledger 的稳定 pool-row 释放入口。"""
+        """绑定pool-row释放入口；返回False表示离线远端绑定保留，不复用该row。"""
 
         self._pool_release_callback = callback
 
@@ -200,10 +200,12 @@ class DSAInputBatchCacheLayout:
         """在请求真正结束时释放 resident 行及其 DRAM ledger。"""
 
         pool_index = self.resident_token_pool.get_index(request_id)
+        recycle = True
         if pool_index is not None and self._pool_release_callback is not None:
             # 外部 CLOSE 失败不能先把 row 放回空闲队列，否则下一请求会复用仍存活的身份。
-            self._pool_release_callback(pool_index)
-        self.resident_token_pool.release(request_id)
+            recycle = self._pool_release_callback(pool_index) is not False
+        if recycle:
+            self.resident_token_pool.release(request_id)
         # finished_req_ids 可能与同一轮新提交的同名 request 重叠。清空这份
         # 仅用于跳过稳态重映射的行序缓存，确保新请求仍会重新 acquire。
         if request_id in self._request_ids:

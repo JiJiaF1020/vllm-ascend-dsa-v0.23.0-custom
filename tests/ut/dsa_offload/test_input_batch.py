@@ -524,6 +524,11 @@ def test_failed_external_close_keeps_resident_row() -> None:
     with pytest.raises(RuntimeError, match="remote CLOSE failed"):
         state.release_request("req-a")
     assert state.resident_token_pool.get_index("req-a") == row
+    # 远端离线模式：请求完成后保留绑定，不把row放回空闲队列。
+    state.set_pool_release_callback(lambda _: False)
+    state.release_request("req-a")
+    assert state.resident_token_pool.get_index("req-a") == row
+    assert state.resident_token_pool.acquire("req-b") != row
     state.set_pool_release_callback(lambda _: None)
     state.release_request("req-a")
     assert state.resident_token_pool.get_index("req-a") is None

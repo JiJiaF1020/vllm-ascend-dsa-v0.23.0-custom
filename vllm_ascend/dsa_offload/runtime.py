@@ -283,9 +283,12 @@ class DSAOffloadRuntime:
             )
         self.dram_store = store
 
-    def release_pool_index(self, pool_index: int) -> None:
+    def release_pool_index(self, pool_index: int) -> bool | None:
         if self.remote_shared is not None:
-            self.remote_shared.close()
+            # 离线单批：结束请求只退役，远端lease/本地row保留到worker shutdown。
+            # 返回False让InputBatch也不回收该row，避免旧绑定被新请求覆盖。
+            self.remote_shared.retire(pool_index)
+            return False
         if self.remote_store_shadow is not None:
             self.remote_store_shadow.release(pool_index)
         store = self.dram_store
@@ -337,6 +340,10 @@ class DSAOffloadRuntime:
         self._forward_epoch += 1
 
         if self.remote_store_shadow is not None:
+            if self.remote_shared is not None:
+                self.remote_shared.validate_requests(
+                    input_batch.req_ids[:num_reqs], state.resident_pool_indices_cpu[:num_reqs],
+                )
             self.remote_store_shadow.ensure_requests(
                 input_batch.req_ids[:num_reqs], state.resident_pool_indices_cpu[:num_reqs],
             )

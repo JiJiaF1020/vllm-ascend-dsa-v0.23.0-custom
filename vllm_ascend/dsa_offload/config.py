@@ -475,8 +475,8 @@ class DSAOffloadConfig:
             tp = parallel_config.tensor_parallel_size
             if heads % tp or heads // tp not in (32, 64):
                 raise ValueError("remote_shared CopySFA requires 32/64 local attention heads")
-            if int(scheduler_config.max_num_seqs) != 1:
-                raise ValueError("remote_shared multi-rank smoke currently requires BS1 per DP; dynamic rows are not supported")
+            if not 1 <= int(scheduler_config.max_num_seqs) <= 32:
+                raise ValueError("remote_shared requires BS1..32 per DP; one offline cohort, no request-row reuse")
         if self.ready_shadow is not None and (
             parallel_config.data_parallel_size != 1 or parallel_config.tensor_parallel_size not in (1, 2)
             or int(scheduler_config.max_num_seqs) != 1

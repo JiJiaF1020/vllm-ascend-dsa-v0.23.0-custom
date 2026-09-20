@@ -2,7 +2,8 @@
 """hbm_full_remote_shared首轮整网功能链；连接/PUT/刷新限定eager图外。
 
 注册command/reply/completion只由算子runtime持有。这里的Tensor均为普通caller-owned
-输入输出；不把远端GVA变成Tensor。固定一批真实MTP3请求，不支持padding或中途换行。
+输入输出；不把远端GVA变成Tensor。首次decode绑定一批真实MTP3请求，允许缩批/重排，
+不支持padding、新请求补入或row复用。结束请求的绑定保留到worker shutdown。
 """
 from __future__ import annotations
 
@@ -30,11 +31,26 @@ class RemoteShared:
                 raise RuntimeError(f"missing {name}; rebuild operator extension and C8 OPP together")
         self.handle = None
         self.rows = None
+        self.active_rows = None
+        self.request_ids = {}
+        self.retired = set()
         self.bound = None
         self.buffers = {}
         self.current = None
         self.previous_out = None
         self.calls = self.fetches = self.sfas = 0
+
+    def validate_requests(self, request_ids, rows):
+        """不把同名新请求或新row静默绑定到仍存活的旧session。"""
+        for request_id, row in zip(request_ids, rows, strict=True):
+            row = int(row)
+            if row in self.retired or (self.handle is not None and self.request_ids.get(row) != request_id):
+                raise ValueError("remote shared supports one offline cohort: no new requests or retired-row reuse after BIND")
+
+    def retire(self, row):
+        self.retired.add(int(row))
+        logger.info("DSA_SHARED_RETIRED %s row=%s connection_retained=1 store_retained=1 row_reusable=0",
+                    self.identity, row)
 
     def dump_before_write(self, metadata):
         runtime = self.runtime
@@ -80,6 +96,8 @@ class RemoteShared:
             False, self.config.eid_index, self.config.pool_eid)
         wm.acknowledge_binding(torch.arange(b), bound[:, 1], (bound[:, 2] // 128).int())
         self.rows, self.bound, self.budget = host_rows, bound, budgets[0]
+        self.active_rows = host_rows
+        self.request_ids = {row: shadow.request_ids[row] for row in host_rows}
         self.groups = (b + 15) // 16
         self.period = ((self.runtime.num_layers * self.groups + 7) // 8) * 8
         self.arange_tail = torch.arange(256, dtype=torch.int32, device=self.runtime.device)
@@ -87,7 +105,10 @@ class RemoteShared:
         logger.info("DSA_SHARED_CONNECT_OK %s wire=5 backend=real_store groups=%s", self.identity, len(self.plan.groups))
 
     def _buffer(self, context, batch):
+        # 仅保存各SG当前活跃shape；上一轮已完整消费，不累计32种batch的scratch。
         key = context.execution_plan.group
+        if key in self.buffers and self.buffers[key]["status"].shape[0] != batch:
+            del self.buffers[key]
         if key not in self.buffers:
             device = self.runtime.device
             empty = lambda shape, dtype: torch.empty(shape, dtype=dtype, device=device)
@@ -95,8 +116,8 @@ class RemoteShared:
                 prepared=empty((batch*4, 1, 2304), torch.int32),
                 logical=empty((batch*4, 1, 2048), torch.int32),
                 full=empty((batch*4, 1, 2304), torch.int32),
-                generation=empty((self.groups,), torch.int64),
-                ticket=torch.zeros((self.groups, 2), dtype=torch.int64, device=device),
+                generation=empty(((batch+15)//16,), torch.int64),
+                ticket=torch.zeros(((batch+15)//16, 2), dtype=torch.int64, device=device),
                 status=empty((batch, 4), torch.int64),
                 maximum=empty((1,), torch.float32), total=empty((1,), torch.float32),
                 tail_info=empty((batch, 2), torch.int32))
@@ -105,7 +126,7 @@ class RemoteShared:
     def _generation(self, data, layer):
         start = self.runtime._forward_epoch * self.period + layer * self.groups + 1
         # 图外eager验证；后续图版将固定shape的generation H2D放到step边界。
-        data["generation"].copy_(torch.arange(start, start+self.groups, dtype=torch.int64,
+        data["generation"].copy_(torch.arange(start, start+data["generation"].numel(), dtype=torch.int64,
                                             device=self.runtime.device))
 
     @staticmethod
@@ -127,20 +148,29 @@ class RemoteShared:
         budgets = budgets.cpu().tolist()
         if self.handle is None:
             self._connect(rows, candidates, budgets)
-        if rows.cpu().tolist() != self.rows or budgets != [self.budget]*b:
-            raise ValueError("remote shared active connection cannot change batch/rows/budget")
-        if bool((candidates.cpu() > self.bound[:, 2]).any()):
+        host_rows = rows.cpu().tolist()
+        if (not 1 <= b <= len(self.rows) or len(set(host_rows)) != b or
+                any(row not in self.request_ids or row in self.retired for row in host_rows) or
+                budgets != [self.budget]*b):
+            raise ValueError("remote shared requires live rows from the initial cohort and one unchanged HBM budget")
+        # generation的layer/group步幅固定为连接容量；只改变本次调用的活跃group数。
+        # 缩批/重排会让旧plan中部分row不再出现在下一条命令，必须先用全row APPLIED
+        # 快照确认旧plan，否则Pool仍等待已经退出请求的确认而无法接受下一轮。
+        changed = host_rows != self.active_rows
+        if changed or bool((candidates.cpu() > self.bound[host_rows, 2]).any()):
             shadow = self.runtime.remote_store_shadow
             wm = shadow.watermarks
-            done = wm.done[:b].to(torch.int64) * 128
-            if bool((candidates.cpu() > done).any()):
+            done = wm.done[self.rows].to(torch.int64) * 128
+            if bool((candidates.cpu() > done[host_rows]).any()):
                 raise RuntimeError("remote candidate D exceeds all-layer PUT_DONE; this eager PoC cannot GET a page still being dumped by later layers")
-            bound = torch.stack((shadow.handles[:b], wm.done_versions[:b], done), dim=1).contiguous()
+            bound = torch.stack((shadow.handles[self.rows], wm.done_versions[self.rows], done), dim=1).contiguous()
             # 所有上一轮shared已完成APPLIED；刷新会同步设备并等待Host CQE/commit。
             self.native.lis_send_pool_refresh(self.handle, bound)
             self.bound = bound
-            wm.acknowledge_binding(torch.arange(b), bound[:, 1], (bound[:, 2] // 128).int())
-            logger.info("DSA_SHARED_REFRESH_OK bound=%s", bound[:, 2].tolist())
+            wm.acknowledge_binding(torch.tensor(self.rows), bound[:, 1], (bound[:, 2] // 128).int())
+            logger.info("DSA_SHARED_REFRESH_OK bound=%s active_rows=%s batch_changed=%s connection_retained=1",
+                        bound[:, 2].tolist(), host_rows, changed)
+        self.active_rows = host_rows
         tail_length = visible.cpu() - candidates.cpu()
         if bool(((tail_length < 4) | (tail_length > 256)).any()):
             raise ValueError("framework causal tail must fit 256 tokens including four queries")
@@ -161,7 +191,7 @@ class RemoteShared:
         data.update(rows=rows, actual_q=actual_q, context=context, epoch=self.runtime._forward_epoch)
         self.current = data
         self.runtime._selection_source_layer = context.layer_id
-        self.calls += self.groups
+        self.calls += data["generation"].numel()
         logger.info("DSA_SHARED_SELECT source=%s payload=%s epoch=%s commands=%s", context.layer_id,
                     context.execution_plan.first_payload_layer, self.runtime._forward_epoch, self.calls)
         return DSAOffloadSelectionOutput(data["full"], data["tail_info"], visible)
@@ -176,7 +206,7 @@ class RemoteShared:
             torch.ops.custom.pool_fetch_shared_out(self.previous_out, data["rows"], data["generation"],
                                                   data["status"], data["ticket"])
             self._check_ticket(data, "GATHER_ONLY")
-            self.fetches += self.groups
+            self.fetches += data["generation"].numel()
         return DSAOffloadSelectionOutput(data["prepared"], data["tail_info"])
 
     def attention(self, context, query, packed, table, actual_q, scale):
@@ -208,7 +238,7 @@ class RemoteShared:
             return
         self.native.lis_send_pool_close(self.handle)
         self.handle = None
-        self.rows = self.bound = self.current = self.previous_out = None
+        self.rows = self.active_rows = self.bound = self.current = self.previous_out = None
         self.buffers.clear()
         logger.info("DSA_SHARED_DRAIN_OK %s select=%s gather_only=%s scatter_sfa=%s real_store=1",
                     self.identity, self.calls, self.fetches, self.sfas)

@@ -180,9 +180,9 @@ def validate_config(config: SmokeConfig) -> None:
         if (not config.enable_offload or not config.enable_a5_packed_c8 or not config.enable_mtp
                 or config.mtp_num_speculative_tokens != 3 or config.run_mode != "eager"
                 or config.tensor_parallel_size not in (1, 2)
-                or config.max_num_seqs != 1 or config.enable_mtp_graph
+                or not 1 <= config.max_num_seqs <= 32 or config.enable_mtp_graph
                 or config.store_endpoint or config.ready_shadow_dir):
-            raise ValueError("remote shared smoke requires TP1/TP2, BS1 per DP, A5 C8 MTP3 eager; no shadow modes")
+            raise ValueError("remote shared smoke requires TP1/TP2, BS1..32 per DP, A5 C8 MTP3 eager; one offline cohort, no row reuse or shadow modes")
         # 只加载stdlib配置模块；dry-run与spawn之前不能初始化torch/vLLM/NPU。
         path = Path(__file__).resolve().parents[2] / "vllm_ascend/dsa_offload/remote_shared_config.py"
         remote = runpy.run_path(str(path))["DSARemoteSharedConfig"].from_value(config.remote_shared)

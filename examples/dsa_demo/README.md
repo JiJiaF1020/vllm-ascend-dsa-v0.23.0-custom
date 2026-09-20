@@ -52,6 +52,13 @@
 
 ## 单机多卡运行：simple_test_1p.py 使用样例
 
+真实`--remote-shared-config`链目前支持每DP BS1..32、TP1/TP2、MTP3 eager。
+首次decode绑定一批请求，之后允许缩批/重排；请求结束保留row和连接，到worker退出统一释放。
+暂不支持后补新请求或row复用。请给整批prefill足够token/HBM预算，并检查
+`DSA_SHARED_CONNECT_BEGIN rows=...`是否确实包含期望的32请求；只设`MAX_NUM_SEQS=32`
+不能保证首批实际BS32。该路径需最新C8 OPP+Torch extension，详细步骤见算子仓
+`docs/shared_placement_review.md` §8.9，不沿用下面普通本地路径的graph设置。
+
 在仓库根目录运行：单机 8 卡 DP4TP2 + 卸载 + target graph + MTP3 graph。可在末尾加 `--dry-run` 只检查配置。
 
 ```bash

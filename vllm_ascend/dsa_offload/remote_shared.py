@@ -82,12 +82,17 @@ class RemoteShared:
     def _connect(self, rows, candidates, budgets):
         host_rows = rows.cpu().tolist()
         b = len(host_rows)
-        if host_rows != list(range(b)) or not 1 <= b <= 32 or len(set(budgets)) != 1:
-            raise ValueError("first remote shared run requires fixed dense pool rows 0..B-1 and one HBM budget")
+        binding_rows = list(range(b))
+        if (sorted(host_rows) != binding_rows or not 1 <= b <= 32
+                or len(budgets) != b or len(set(budgets)) != 1):
+            raise ValueError(
+                "first remote shared run requires the pool row set 0..B-1 (any batch order) "
+                f"and one HBM budget; {self.identity} rows={host_rows} budgets={budgets}")
         shadow = self.runtime.remote_store_shadow
         wm = shadow.watermarks
         done = wm.done[:b] * 128
-        if bool((done < candidates.cpu()).any()) or bool((shadow.handles[:b] == 0).any()):
+        # PUT_DONE/binding按稳定pool row存放；candidate与query按本轮batch顺序存放。
+        if bool((done[host_rows] < candidates.cpu()).any()) or bool((shadow.handles[:b] == 0).any()):
             raise RuntimeError("shared remote GET precedes all-layer PUT_DONE; complete prefill PUT first")
         bound = torch.stack((shadow.handles[:b], wm.done_versions[:b], done.to(torch.int64)), dim=1).contiguous()
         owners = torch.full((len(self.plan.groups), b, budgets[0]), -1, dtype=torch.int32)
@@ -96,8 +101,8 @@ class RemoteShared:
                 mirror = self.runtime.resident_token_pool.get_cache_slots(group.group)
                 mirror[:b, :self.runtime.max_model_len].fill_(-1)
         host, port = self.config.du_endpoint.rsplit(":", 1)
-        logger.info("DSA_SHARED_CONNECT_BEGIN %s endpoint=%s rows=%s slots=%s handles=%s namespace=%s",
-                    self.identity, self.config.du_endpoint, host_rows, budgets[0],
+        logger.info("DSA_SHARED_CONNECT_BEGIN %s endpoint=%s active_rows=%s bound_rows=%s slots=%s handles=%s namespace=%s",
+                    self.identity, self.config.du_endpoint, host_rows, binding_rows, budgets[0],
                     bound[:, 0].tolist(), shadow.namespace)
         self.handle = self.native.lis_send_pool_connect_selection(
             host, int(port), self.config.device_eid, str(self.runtime.device), owners,
@@ -105,7 +110,8 @@ class RemoteShared:
             [group.source_layer for group in self.plan.groups], shadow.store.store_id, bound,
             False, self.config.eid_index, self.config.pool_eid)
         wm.acknowledge_binding(torch.arange(b), bound[:, 1], (bound[:, 2] // 128).int())
-        self.rows, self.bound, self.budget = host_rows, bound, budgets[0]
+        # REFRESH仍按稳定row生成全量快照，不能继承首次batch的排列。
+        self.rows, self.bound, self.budget = binding_rows, bound, budgets[0]
         self.active_rows = host_rows
         self.request_ids = {row: shadow.request_ids[row] for row in host_rows}
         self.groups = (b + 15) // 16

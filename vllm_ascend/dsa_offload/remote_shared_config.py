@@ -44,17 +44,19 @@ class RemoteSharedDebug:
     ranks: tuple[tuple[int, int], ...] = ((0, 0),)
     compare_li: bool = True
     topk_print_limit: int = 16
+    capture_kv: bool = False
 
     @classmethod
     def from_value(cls, value):
         if value is None:
             return None
         if not isinstance(value, Mapping) or set(value) - {
-            "directory", "steps", "topk_rows", "ranks", "compare_li", "topk_print_limit"
+            "directory", "steps", "topk_rows", "ranks", "compare_li", "topk_print_limit", "capture_kv"
         } or not isinstance(value.get("directory"), str) or not value["directory"].strip():
             raise ValueError("remote_shared.debug requires directory and supported debug fields")
         result = cls(**value)
         if (type(result.steps) is not int or result.steps < 1 or type(result.compare_li) is not bool
+                or type(result.capture_kv) is not bool
                 or type(result.topk_print_limit) is not int or not 1 <= result.topk_print_limit <= 2048
                 or not isinstance(result.topk_rows, (list, tuple)) or not result.topk_rows
                 or any(type(r) is not int or r < 0 for r in result.topk_rows)
@@ -63,7 +65,7 @@ class RemoteSharedDebug:
                        or any(type(v) is not int or v < 0 for v in r) for r in result.ranks)):
             raise ValueError("invalid remote_shared debug steps/rows/ranks/print limit")
         return cls(result.directory, result.steps, tuple(result.topk_rows),
-                   tuple(tuple(r) for r in result.ranks), result.compare_li, result.topk_print_limit)
+                   tuple(tuple(r) for r in result.ranks), result.compare_li, result.topk_print_limit, result.capture_kv)
 
 
 @dataclass(frozen=True)

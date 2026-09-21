@@ -356,7 +356,7 @@ class RemoteShared:
         if not self.graph_enabled:
             self._check_status(payload, context.layer_id)
             if self.debug is not None:
-                self.debug.consume(context, data, payload)
+                self.debug.consume(context, data, payload, packed, table)
             self.sfas += 1
             logger.info("DSA_SHARED_CONSUMED %s layer=%s mirror=%s applied=%s", self.identity, context.layer_id,
                         context.execution_plan.mirror_writer, context.execution_plan.applied)

@@ -10,6 +10,30 @@ from pathlib import Path
 
 import torch
 
+from vllm_ascend.dsa_offload.remote_store import PAGE_TOKENS, TOKEN_BYTES
+
+
+def installed_kv_snapshot(packed, table, batch_position, records):
+    """完整CopySFA后读取真实slot；table按batch位置索引，不能用稳定pool row。
+
+    仅eager诊断：原始字节解释+选中行D2H，不复制整个KV arena，不重跑安装。
+    """
+    if (packed.ndim != 4 or tuple(packed.shape[1:]) != (PAGE_TOKENS, 1, TOKEN_BYTES)
+            or packed.element_size() != 1 or not packed.is_contiguous()):
+        raise ValueError("KV debug requires contiguous packed [P,128,1,656] byte storage")
+    slots = records[:, 1].long()
+    if not slots.numel():
+        return torch.empty((0, TOKEN_BYTES), dtype=torch.uint8), torch.empty(0, dtype=torch.int64)
+    if bool(((slots < 0) | (slots >= table.shape[1] * PAGE_TOKENS)).any()):
+        raise ValueError("KV debug destination slot outside block table")
+    blocks = table[batch_position].detach().cpu().long()[slots // PAGE_TOKENS]
+    if bool(((blocks < 0) | (blocks >= packed.shape[0])).any()):
+        raise ValueError("KV debug physical block outside packed allocation")
+    physical = blocks * PAGE_TOKENS + slots % PAGE_TOKENS
+    raw = packed.view(torch.uint8).reshape(-1, TOKEN_BYTES)
+    selected = raw.index_select(0, physical.to(packed.device)).to(device="cpu", non_blocking=False)
+    return selected.contiguous(), physical
+
 
 def difference(actual, reference, limit=16):
     a, b = actual.tolist(), reference.tolist()
@@ -106,16 +130,16 @@ class RemoteSharedDebugSession:
         except Exception as error:
             self._error("li_reference", context.layer_id, error)
 
-    def consume(self, context, data, payload):
+    def consume(self, context, data, payload, packed, table):
         sample = data.get("debug")
         if not self.enabled or sample is None or sample["epoch"] != self.owner.runtime._forward_epoch:
             return
         try:
-            self._consume(context, data, payload, sample)
+            self._consume(context, data, payload, sample, packed, table)
         except Exception as error:
             self._error("reply_snapshot", context.layer_id, error)
 
-    def _consume(self, context, data, payload, sample):
+    def _consume(self, context, data, payload, sample, packed, table):
         rows = data["rows"].cpu().tolist()
         if rows != sample["rows"]:
             raise ValueError("debug batch order changed since LISSend")
@@ -183,6 +207,9 @@ class RemoteSharedDebugSession:
                 per_request.append(dict(row=row, request_handle=handle, fetch_tokens=misses))
                 if row in self.config.topk_rows:
                     saved = dict(metadata=record, logical_topk=logical.clone(), records=records.clone())
+                    if self.config.capture_kv:
+                        saved["installed_kv"], saved["physical_token_indices"] = installed_kv_snapshot(
+                            packed, table, i, records)
                     if sent is not None:
                         saved["sent_topk"] = sent.clone()
                     for name in ("li_same_domain", "li_full"):

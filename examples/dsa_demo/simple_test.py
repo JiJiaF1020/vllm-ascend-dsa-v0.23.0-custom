@@ -434,9 +434,9 @@ def run_dp_rank(
             kwargs["profiler_config"] = ProfilerConfig(
                 profiler="torch",
                 torch_profiler_dir=str(profile_dir),
-                torch_profiler_with_stack=True,
-                torch_profiler_record_shapes=True,
-                torch_profiler_with_memory=True,
+                torch_profiler_with_stack=False,
+                torch_profiler_record_shapes=False,
+                torch_profiler_with_memory=False,
             )
         print(
             f"[dsa-smoke] rank={dp_rank}/{config.data_parallel_size} local_rank={local_dp_rank} "

@@ -37,10 +37,41 @@ class RemoteSharedDevice:
 
 
 @dataclass(frozen=True)
+class RemoteSharedDebug:
+    directory: str
+    steps: int = 3
+    topk_rows: tuple[int, ...] = (0,)
+    ranks: tuple[tuple[int, int], ...] = ((0, 0),)
+    compare_li: bool = True
+    topk_print_limit: int = 16
+
+    @classmethod
+    def from_value(cls, value):
+        if value is None:
+            return None
+        if not isinstance(value, Mapping) or set(value) - {
+            "directory", "steps", "topk_rows", "ranks", "compare_li", "topk_print_limit"
+        } or not isinstance(value.get("directory"), str) or not value["directory"].strip():
+            raise ValueError("remote_shared.debug requires directory and supported debug fields")
+        result = cls(**value)
+        if (type(result.steps) is not int or result.steps < 1 or type(result.compare_li) is not bool
+                or type(result.topk_print_limit) is not int or not 1 <= result.topk_print_limit <= 2048
+                or not isinstance(result.topk_rows, (list, tuple)) or not result.topk_rows
+                or any(type(r) is not int or r < 0 for r in result.topk_rows)
+                or not isinstance(result.ranks, (list, tuple)) or not result.ranks
+                or any(not isinstance(r, (list, tuple)) or len(r) != 2
+                       or any(type(v) is not int or v < 0 for v in r) for r in result.ranks)):
+            raise ValueError("invalid remote_shared debug steps/rows/ranks/print limit")
+        return cls(result.directory, result.steps, tuple(result.topk_rows),
+                   tuple(tuple(r) for r in result.ranks), result.compare_li, result.topk_print_limit)
+
+
+@dataclass(frozen=True)
 class DSARemoteSharedConfig:
     store_endpoint: str
     devices: tuple[tuple[int, RemoteSharedDevice], ...] = ()
     single: RemoteSharedDevice | None = None
+    debug: RemoteSharedDebug | None = None
 
     @classmethod
     def from_value(cls, value):
@@ -49,11 +80,12 @@ class DSARemoteSharedConfig:
         if not isinstance(value, Mapping) or "store_endpoint" not in value:
             raise ValueError("remote_shared requires store_endpoint")
         _endpoint(value["store_endpoint"])
+        debug = RemoteSharedDebug.from_value(value.get("debug"))
         if "devices" not in value:
             # 兼容已有DP1/TP1单EID文件，多rank不得静默复用它。
-            single = RemoteSharedDevice.from_value({k: v for k, v in value.items() if k != "store_endpoint"})
-            return cls(value["store_endpoint"], single=single)
-        if set(value) != {"store_endpoint", "devices"} or not isinstance(value["devices"], Mapping):
+            single = RemoteSharedDevice.from_value({k: v for k, v in value.items() if k not in ("store_endpoint", "debug")})
+            return cls(value["store_endpoint"], single=single, debug=debug)
+        if set(value) - {"store_endpoint", "devices", "debug"} or not isinstance(value["devices"], Mapping):
             raise ValueError("remote_shared accepts store_endpoint and devices keyed by physical device ID")
         devices = []
         for key, item in value["devices"].items():
@@ -68,9 +100,11 @@ class DSARemoteSharedConfig:
                 raise ValueError(f"remote_shared requires one independent {name} per physical device")
         if any(device.eid_index < 0 or not device.pool_eid for _, device in devices):
             raise ValueError("device table requires exact eid_index and pool_eid from probe")
-        return cls(value["store_endpoint"], tuple(sorted(devices)))
+        return cls(value["store_endpoint"], tuple(sorted(devices)), debug=debug)
 
     def validate_topology(self, dp: int, tp: int) -> None:
+        if self.debug and any(d >= dp or t >= tp for d, t in self.debug.ranks):
+            raise ValueError("remote_shared debug rank outside DP/TP topology")
         if dp < 1 or tp not in (1, 2):
             raise ValueError("remote_shared supports TP1/TP2 and positive DP size")
         if dp * tp > 1 and not self.devices:

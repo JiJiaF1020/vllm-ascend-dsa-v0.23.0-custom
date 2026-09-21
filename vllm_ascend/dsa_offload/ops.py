@@ -132,6 +132,7 @@ def quant_lightning_indexer_topk(
     actual_seq_lengths_query: torch.Tensor,
     candidate_lens: torch.Tensor,
     block_table: torch.Tensor,
+    sparse_mode: int = 3,
 ) -> torch.Tensor:
     """调用 A5 原生 Quant-LI，只负责精确 score/top-2048。"""
 
@@ -153,7 +154,7 @@ def quant_lightning_indexer_topk(
         layout_query="TND",
         layout_key="PA_BSND",
         sparse_count=DSA_SFA_COMPUTE_TOPK,
-        sparse_mode=3,
+        sparse_mode=sparse_mode,
     )
     expected_numel = int(query.shape[0]) * DSA_SFA_COMPUTE_TOPK
     if isinstance(result, torch.Tensor):

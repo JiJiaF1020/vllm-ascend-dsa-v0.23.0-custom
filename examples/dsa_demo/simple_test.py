@@ -194,6 +194,8 @@ def validate_config(config: SmokeConfig) -> None:
         path = Path(__file__).resolve().parents[2] / "vllm_ascend/dsa_offload/remote_shared_config.py"
         remote = runpy.run_path(str(path))["DSARemoteSharedConfig"].from_value(config.remote_shared)
         remote.validate_topology(config.data_parallel_size, config.tensor_parallel_size)
+        if remote.debug is not None and config.run_mode != "eager":
+            raise ValueError("remote_shared debug requires RUN_MODE=eager; not a performance run")
     if config.ready_shadow_dir is not None and (
         not config.enable_offload or not config.enable_a5_packed_c8 or not config.enable_mtp
         or config.mtp_num_speculative_tokens != 3 or config.run_mode != "eager"
@@ -487,6 +489,14 @@ def run_dp_rank(
                     flush=True,
                 )
             payload["outputs"] = records
+            if config.remote_shared and config.remote_shared.get("debug") is not None:
+                from vllm_ascend.dsa_offload.remote_shared_debug import remote_shared_debug_report
+
+                reports = llm.collective_rpc(remote_shared_debug_report)
+                payload["remote_debug"] = reports
+                print("DSA_REMOTE_DEBUG_SUMMARY " + json.dumps(reports), flush=True)
+                if not reports or not all(report["passed"] for report in reports):
+                    payload["status"] = "failed_remote_debug"
             if config.ready_shadow_dir is not None:
                 from vllm_ascend.dsa_offload.ready_shadow import ready_shadow_report
 
@@ -503,6 +513,8 @@ def run_dp_rank(
             wait_frontend_barrier(store, "shutdown", dp_rank, config.data_parallel_size)
         else:
             shutdown_barrier.wait(timeout=config.process_timeout_seconds)
+        if payload.get("status") == "failed_remote_debug":
+            raise RuntimeError("remote debug mismatch or insufficient coverage; see DSA_REMOTE_DEBUG_SUMMARY")
     except BaseException:
         if shutdown_barrier is not None:
             shutdown_barrier.abort()

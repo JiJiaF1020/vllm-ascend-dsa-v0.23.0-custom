@@ -472,6 +472,10 @@ class DSAOffloadConfig:
         observability_config = vllm_config.observability_config
         if self.remote_shared is not None:
             self.remote_shared.validate_topology(parallel_config.data_parallel_size, parallel_config.tensor_parallel_size)
+            if self.remote_shared.debug is not None and (
+                self.enable_row_mode_decode_graph or not vllm_config.model_config.enforce_eager
+            ):
+                raise ValueError("remote_shared debug requires eager; diagnostics must not enter capture/replay")
             heads = int(getattr(vllm_config.model_config.hf_text_config, "num_attention_heads", 0))
             tp = parallel_config.tensor_parallel_size
             if heads % tp or heads // tp not in (32, 64):

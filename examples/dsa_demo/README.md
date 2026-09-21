@@ -197,6 +197,36 @@ PUT/PUT_DONE、REFRESH和步末status检查均在图外，仍有Host同步开销
 启动日志建议的最大KV内存。此次只改框架Python，不要求重编Pool、hcomm或OPP；仍需已有
 LISSend/ScatterSFA/APPLIED正确部署。仅完成静态检查，不能视为DP4/TP2设备验收已通过。
 
+## eager远端请求对拍
+
+在已通过的`--remote-shared-config` JSON中增加`debug`字段：
+
+```json
+"debug": {
+  "directory": "./remote_debug_run1", "steps": 3,
+  "topk_rows": [0], "ranks": [[0, 0]],
+  "compare_li": true, "topk_print_limit": 16
+}
+```
+
+设置`VLLM_ASCEND_SMOKE_RUN_MODE=eager`、`VLLM_ASCEND_SMOKE_ENABLE_MTP_GRAPH=0`，
+其余模型、DP/TP及MTP3参数保持原样。`ranks`为DP/TP编号，`topk_rows`为稳定pool row。
+所选rank打印前steps次远端forward中各层全部活跃请求的实际搬运token数（四路union miss），
+并将指定row的LISSend、同候选范围原生LI、full原生LI保存为CPU `.pt`，终端默认仅打印前16项。
+
+观察`DSA_LI_COMPARE`、`DSA_REMOTE_IO`和generate后的`DSA_REMOTE_DEBUG_SUMMARY`。
+同候选范围LI集合不同视为失败；full LI含tail，集合不同仅作策略对照。IO摘要来自真实
+reply，不是根据输入推测；GATHER_ONLY复用计划但加载当前层数据。目录中`summary.csv`
+提供Store handle/version等身份，用于算子仓`tools/dump_remote_kv.py`手动读原始页。
+`group_*_bytes`字段每请求重复，不能逐行相加。
+
+需要新版算子extension的`lis_send_pool_debug_read`，不需因此重编OPP/hcomm。
+手动页dump另需新版Store。完整部署、数据口径、dump命令见算子仓
+`docs/shared_placement_review.md`的§8.11。
+诊断会增加LI调用、同步、D2H和落盘，不能用于性能比较；未覆盖足够step/row或发生差异时，
+等generate及DP结束屏障后统一报错，不在TP层内因数值差异提前退出。真实设备错误仍可能中断运行。
+关闭诊断只需删除`debug`字段，原图模式不变。
+
 ## 双击HCCL连通性测试
 
 在**两台机器的容器内、仓库根目录下，各运行同一条命令**。

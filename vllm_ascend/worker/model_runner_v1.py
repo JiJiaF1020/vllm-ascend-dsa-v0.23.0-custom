@@ -5177,6 +5177,7 @@ class NPUModelRunner(GPUModelRunner):
             runtime.remote_shared = RemoteShared(shared_device, runtime, self.dsa_execution_plan, remote_layers,
                                                 dp_rank=self.dp_rank, tp_rank=get_tp_group().rank_in_group,
                                                 physical_device=physical_device,
+                                                debug_config=shared_config.debug,
                                                 graph_enabled=self._remote_decode_graph_enabled())
         cache_layout.set_pool_release_callback(
             runtime.release_pool_index

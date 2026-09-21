@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 class RemoteShared:
     def __init__(self, config, runtime, plan, layers, *, dp_rank=0, tp_rank=0, physical_device=None,
-                 graph_enabled=False):
+                 graph_enabled=False, debug_config=None):
         import kvcache_scatter_copy_custom_ops  # noqa: F401
         from kvcache_scatter_copy_custom_ops import custom_ops_lib
 
@@ -48,6 +48,14 @@ class RemoteShared:
         self.layer_buffers = {}
         self.step_data = None
         self.graph_inputs = {}
+        self.debug = None
+        if debug_config is not None:
+            if graph_enabled:
+                raise ValueError("remote_shared debug requires eager")
+            if not hasattr(self.native, "lis_send_pool_debug_read"):
+                raise RuntimeError("remote_shared debug requires updated operator extension")
+            from vllm_ascend.dsa_offload.remote_shared_debug import RemoteSharedDebugSession
+            self.debug = RemoteSharedDebugSession(self, debug_config, dp_rank, tp_rank, physical_device)
 
     def validate_requests(self, request_ids, rows):
         """不把同名新请求或新row静默绑定到仍存活的旧session。"""
@@ -293,6 +301,9 @@ class RemoteShared:
             pool.get_cache_slots(context.execution_plan.group), data["prepared"], None, data["logical"])
         if not self.graph_enabled:
             self._check_ticket(payload, "LISSend")
+        if self.debug is not None:
+            self.debug.select(context, data, query, key, weights, scale, key_scale, actual_q,
+                              rows, candidates, visible, table)
         tokens = candidates[:, None, None] + self.arange_tail[None, None, :]
         valid = tokens < (visible[:, None, None] - 3 + self.causal_query[None, :, None])
         tail = torch.where(valid, tokens.expand(b, 4, 256), -1).reshape(4*b, 1, 256)
@@ -344,6 +355,8 @@ class RemoteShared:
         # 功能验收逐层检查，不把这里的同步端到端时间作为性能成绩。
         if not self.graph_enabled:
             self._check_status(payload, context.layer_id)
+            if self.debug is not None:
+                self.debug.consume(context, data, payload)
             self.sfas += 1
             logger.info("DSA_SHARED_CONSUMED %s layer=%s mirror=%s applied=%s", self.identity, context.layer_id,
                         context.execution_plan.mirror_writer, context.execution_plan.applied)

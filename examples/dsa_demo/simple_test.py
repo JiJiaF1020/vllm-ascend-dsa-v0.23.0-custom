@@ -43,7 +43,7 @@ class SmokeConfig:
     enable_mtp: bool = True
     synthetic_draft: bool = False  # [TO BE REMOVE] 无MTP权重，合成三token，仅target/IO功能穿刺。
     mtp_num_speculative_tokens: int = 3
-    enable_mtp_graph: bool = True  # baseline 暂不支持 MTP 图，底座会自动使用 eager。
+    enable_mtp_graph: bool = True  # 本地/远端卸载支持独立MTP3图；baseline与synthetic仍用eager。
     enable_profile: bool = False
     profile_dir: str = "./profiles"
     result_dir: str | None = "./results"  # 自动区分拓扑、卸载、图模式和 rank；None 不保存。
@@ -187,9 +187,12 @@ def validate_config(config: SmokeConfig) -> None:
         if (not config.enable_offload or not config.enable_a5_packed_c8 or not config.enable_mtp
                 or config.mtp_num_speculative_tokens != 3 or config.run_mode not in ("eager", "graph")
                 or config.tensor_parallel_size not in (1, 2)
-                or not 1 <= config.max_num_seqs <= 32 or config.enable_mtp_graph
+                or not 1 <= config.max_num_seqs <= 32
                 or config.store_endpoint or config.ready_shadow_dir):
-            raise ValueError("remote shared smoke requires TP1/TP2, BS1..32 per DP, A5 C8 MTP3 eager/graph and draft eager; one offline cohort, no row reuse or shadow modes")
+            raise ValueError(
+                "remote shared smoke requires TP1/TP2, BS1..32 per DP, A5 C8 MTP3 eager/graph; "
+                "one offline cohort, no row reuse or shadow modes"
+            )
         # 只加载stdlib配置模块；dry-run与spawn之前不能初始化torch/vLLM/NPU。
         path = Path(__file__).resolve().parents[2] / "vllm_ascend/dsa_offload/remote_shared_config.py"
         remote = runpy.run_path(str(path))["DSARemoteSharedConfig"].from_value(config.remote_shared)

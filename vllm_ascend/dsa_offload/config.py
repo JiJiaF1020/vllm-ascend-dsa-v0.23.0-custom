@@ -483,9 +483,10 @@ class DSAOffloadConfig:
             if not 1 <= int(scheduler_config.max_num_seqs) <= 32:
                 raise ValueError("remote_shared requires BS1..32 per DP; one offline cohort, no request-row reuse")
             if self.enable_row_mode_decode_graph:
-                spec = vllm_config.speculative_config
-                if spec is None or not bool(getattr(spec, "enforce_eager", False)):
-                    raise ValueError("remote_shared decode graph currently requires an eager drafter (enforce_eager=True)")
+                # GLM MTP3可独立捕获draft图；具体支持范围由proposer门禁判定，
+                # 不支持的draft配置仍回退eager，不改变target远端图的契约。
+                if vllm_config.speculative_config is None:
+                    raise ValueError("remote_shared decode graph requires MTP3 speculative decoding")
                 if getattr(vllm_config, "lora_config", None) is not None:
                     raise ValueError("remote_shared late graph capture does not support LoRA graph keys")
         if self.ready_shadow is not None and (

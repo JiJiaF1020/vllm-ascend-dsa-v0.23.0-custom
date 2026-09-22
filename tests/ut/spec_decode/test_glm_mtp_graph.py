@@ -1014,7 +1014,7 @@ def test_draft_loading_validates_before_disabling_compile(monkeypatch, graph, lo
     future = ast.parse("from __future__ import annotations").body
     ns = {}
     exec(compile(ast.Module(body=future + [guard], type_ignores=[]), "<DSA guard>", "exec"), ns)
-    contract = SimpleNamespace(enabled=True, enable_row_mode_decode_graph=True)
+    contract = SimpleNamespace(enabled=True, enable_row_mode_decode_graph=True, remote_store=None, ready_shadow=None)
     validate = lambda cfg: ns["validate_finalized_graph_contract"](contract, cfg, phase="platform")
 
     @dataclass

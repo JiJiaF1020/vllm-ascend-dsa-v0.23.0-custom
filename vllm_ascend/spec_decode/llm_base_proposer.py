@@ -557,6 +557,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 runtime_mode=CUDAGraphMode.FULL,
                 use_eagle=self.use_eagle,
                 enable_enpu=self.enable_enpu,
+                capture_at_runtime=self.use_glm_mtp_graph and self.runner._remote_decode_graph_enabled(),
             )
 
     def _maybe_share_topk_indices(self, target_language_model: nn.Module) -> None:
@@ -647,7 +648,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
         if replay:
             logger.info_once("[GLM MTP graph] Replaying separate merged 3-step draft graph (with device preprocessing)")
-        else:
+        elif self._runnable.concrete_aclgraph_entries[descriptor].aclgraph is not None:
             logger.info(
                 "[GLM MTP graph] Captured 3-step draft graph: tokens=%d, padded_reqs=%d", num_tokens, graph_batch_size
             )

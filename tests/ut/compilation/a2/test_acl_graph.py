@@ -290,6 +290,36 @@ class TestACLGraphWrapper(TestBase):
         # Should return the original output (not weak ref)
         self.assertEqual(result, "test_output")
 
+        # Runtime MTP capture must execute a warmup, then capture + first replay.
+        # Keep startup capture unchanged, and do not pretend the draft owns a
+        # target remote runtime just to bypass the startup-capture guard.
+        wrapper = ACLGraphWrapper(
+            self.mock_runnable,
+            self.mock_vllm_config,
+            CUDAGraphMode.FULL,
+            self.mock_cudagraph_options,
+            capture_at_runtime=True,
+        )
+        mock_npu_graph.replay.reset_mock()
+        mock_torch.npu.NPUGraph.reset_mock()
+        mock_validate_cudagraph_capturing_enabled.reset_mock()
+        self.mock_runnable.reset_mock()
+        self.mock_forward_context.capturing = False
+        self.assertEqual(wrapper(test_tensor, "arg2"), "test_output")
+        entry = wrapper.concrete_aclgraph_entries[self.mock_batch_descriptor]
+        self.assertTrue(entry.warmed_up)
+        self.assertIsNone(entry.aclgraph)
+        mock_torch.npu.NPUGraph.assert_not_called()
+        mock_npu_graph.replay.assert_not_called()
+        self.assertEqual(wrapper(test_tensor, "arg2"), "test_output")
+        mock_torch.npu.NPUGraph.assert_called_once()
+        mock_npu_graph.replay.assert_called_once()
+        self.assertFalse(self.mock_forward_context.capturing)
+        self.assertEqual(wrapper(test_tensor, "arg2"), "weak_ref_output")
+        self.assertEqual(mock_npu_graph.replay.call_count, 2)
+        self.assertEqual(self.mock_runnable.call_count, 2)
+        mock_validate_cudagraph_capturing_enabled.assert_not_called()
+
     @patch("vllm_ascend.compilation.acl_graph.torch")
     @patch("vllm_ascend.compilation.acl_graph.validate_cudagraph_capturing_enabled")
     @patch("vllm_ascend.compilation.acl_graph.get_forward_context")

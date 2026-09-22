@@ -125,6 +125,38 @@ class TestSimpleScripts(unittest.TestCase):
                     self.assertEqual(spec["draft_tensor_parallel_size"], tp)
                     self.assertEqual(spec["enforce_eager"], not (offload and graph and mode == "graph"))
 
+    def test_remote_shared_independent_mtp_graph(self):
+        remote = {
+            "store_endpoint": "127.0.0.1:19080",
+            "devices": {
+                str(i): {
+                    "du_endpoint": f"127.0.0.1:{20000 + i}",
+                    "device_eid": f"{i + 1:032x}",
+                    "eid_index": 0,
+                    "pool_eid": f"{256:032x}",
+                }
+                for i in range(8)
+            },
+        }
+        for tp, dp, bs, graph, synthetic in itertools.product(
+            (1, 2), (1, 4), (1, 32), (False, True), (False, True)
+        ):
+            with self.subTest(tp=tp, dp=dp, bs=bs, graph=graph, synthetic=synthetic):
+                config = replace(
+                    self.config,
+                    tensor_parallel_size=tp,
+                    data_parallel_size=dp,
+                    max_num_seqs=bs,
+                    remote_shared=remote,
+                    enable_mtp_graph=graph,
+                    synthetic_draft=synthetic,
+                )
+                kwargs = self.smoke.build_llm_kwargs(config)
+                self.assertFalse(kwargs["enforce_eager"])
+                self.assertEqual(config.mtp_graph_enabled, graph and not synthetic)
+                self.assertEqual(kwargs["speculative_config"]["enforce_eager"], not config.mtp_graph_enabled)
+                self.assertEqual(kwargs["additional_config"]["dsa_sparse_config"]["remote_shared"], remote)
+
     def test_mtp_budget_defaults_and_environment(self):
         for mtp in (False, True):
             config = replace(self.config, enable_mtp=mtp)
@@ -262,7 +294,7 @@ class TestSimpleScripts(unittest.TestCase):
     def test_all_config_fields_have_registered_overrides(self):
         from dataclasses import fields
 
-        cli_only = {"store_endpoint", "ready_shadow_dir", "ready_shadow_steps", "ready_shadow_group"}
+        cli_only = {"store_endpoint", "remote_shared", "ready_shadow_dir", "ready_shadow_steps", "ready_shadow_group"}
         names = {field.name for field in fields(self.config)} - cli_only
         values = {"VLLM_ASCEND_SMOKE_" + name.upper(): "test" for name in names}
         with patch.dict(os.environ, values, clear=True):

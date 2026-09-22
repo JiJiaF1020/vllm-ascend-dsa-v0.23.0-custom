@@ -60,6 +60,7 @@ class ACLGraphEntry:
     # for aclgraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: list[int] | None = None
+    warmed_up: bool = False
 
 
 class ACLGraphWrapper:
@@ -96,6 +97,7 @@ class ACLGraphWrapper:
         *,
         use_eagle: bool = False,
         enable_enpu: bool = False,
+        capture_at_runtime: bool = False,
     ):
         self.runnable = runnable
         self.vllm_config = vllm_config
@@ -119,6 +121,9 @@ class ACLGraphWrapper:
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
         self.enable_enpu = enable_enpu
         self.use_eagle = use_eagle
+        # 仅独立GLM MTP图启用：远端target跳过启动期capture，每个图key先
+        # 执行一轮真实预热，下一轮capture并立即replay，不能返回未执行的输出。
+        self.capture_at_runtime = capture_at_runtime
         _acl_graph_wrappers.add(self)
 
     def __getattr__(self, key: str):
@@ -159,6 +164,11 @@ class ACLGraphWrapper:
             remote.validate_graph_inputs(batch_descriptor, forward_context.attn_metadata, args, kwargs)
 
         if entry.aclgraph is None:
+            if self.capture_at_runtime and not entry.warmed_up:
+                output = self.runnable(*args, **kwargs)
+                entry.warmed_up = True
+                logger.info("[GLM MTP graph] Runtime warmup: batch=%s", batch_descriptor)
+                return output
             if self.aclgraph_options.debug_log_enable:
                 # Since we capture aclgraph for many different shapes and
                 # capturing is fast, we don't need to log it for every
@@ -166,9 +176,9 @@ class ACLGraphWrapper:
                 # piecewise mode.
                 logger.debug("Capturing a aclgraph on (%s,%s)", self.runtime_mode.name, entry.batch_descriptor)
             # validate that aclgraph capturing is legal at this point.
-            if remote is None:
+            if remote is None and not self.capture_at_runtime:
                 validate_cudagraph_capturing_enabled()
-            else:
+            elif remote is not None:
                 logger.info("DSA_SHARED_GRAPH_CAPTURE_BEGIN %s batch=%s", remote.identity, batch_descriptor)
 
             input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
@@ -232,13 +242,16 @@ class ACLGraphWrapper:
 
             compilation_counter.num_cudagraph_captured += 1
 
-            if remote is not None:
+            if remote is not None or self.capture_at_runtime:
                 # 启动期capture不需要输出；真实decode必须执行一次刚捕获的图。
                 # CaptureBegin/End只记录任务，不能读取上轮status冒充本轮完成。
                 forward_context.capturing = False
                 aclgraph.replay()
-                logger.info("DSA_SHARED_GRAPH_CAPTURE_END %s first_replay=1 batch=%s",
-                            remote.identity, batch_descriptor)
+                if remote is not None:
+                    logger.info("DSA_SHARED_GRAPH_CAPTURE_END %s first_replay=1 batch=%s",
+                                remote.identity, batch_descriptor)
+                else:
+                    logger.info("[GLM MTP graph] Runtime capture complete: first_replay=1 batch=%s", batch_descriptor)
 
             # important: we need to return the output, rather than
             # the weak ref of the output, so that pytorch can correctly

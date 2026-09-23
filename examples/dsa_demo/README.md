@@ -156,6 +156,56 @@ VLLM_ASCEND_SMOKE_PROFILE_DIR=./vllm_profile/2p_dp16_64k_bs8_offload  \
 python examples/dsa_demo/simple_test_2p.py
 ```
 
+### 双机分别使用本机 Pool：真实远端 shared
+
+当前已适配配置与启动入口，双机真实通信/推理仍待实机验收。每台启动自己的
+`urma_pool_server`（一个Store及本机各卡独立DU服务），沿用单机已验证的Pool启动参数。
+两机Pool之间不通信、不共享backing；跨机HCCL/EP通信仍由框架负责。不改DU、gather、
+wire或算子，无需为本次修改重编Pool、extension、C8 OPP或hcomm，只更新框架Python。
+
+每台各准备一份`--remote-shared-config` JSON，保留原来的`store_endpoint`、`devices`、
+可选`validate/debug`字段：
+
+- `store_endpoint`指向本机Pool的Store；每个`du_endpoint`指向同一Pool对应的DU服务。
+  容器内填写实际可达地址，不确定host网络时不要盲用`127.0.0.1`。
+- `devices`只放本机8张卡的物理ID、真实EID、`eid_index`和`pool_eid`。
+  两机物理ID均可为0～7；第二台不要改为8～15，也不要复制第一台的EID。
+- `simple_test_2p.py`自动补入`node_count=2`，校验本机设备数为`全局DP / node_count * TP`。
+  JSON显式提供的`node_count`必须与启动入口一致。单机入口默认1，旧配置继续有效。
+  直接通过框架`additional_config`接入而不使用此脚本时，需要自己填写正确的`node_count`。
+- 全局DP rank保持0～15；每个TP组必须在同一节点。debug的rank仍为全局DP/TP rank。
+  worker建链前仍用HCCP inventory核对真实物理ID及EID/index，不通过校验就拒绝连接。
+
+两台分别执行（第二台把rank改为1，配置路径换成自己的文件；模型、采样与其它参数一致）：
+
+```bash
+export VLLM_ASCEND_SMOKE_MODEL_PATH=/path/to/model
+export VLLM_ASCEND_SMOKE_DATA_PARALLEL_SIZE=16
+export VLLM_ASCEND_SMOKE_TENSOR_PARALLEL_SIZE=1
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=1
+export VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=1
+export VLLM_ASCEND_SMOKE_ENABLE_MTP=1
+export VLLM_ASCEND_SMOKE_RUN_MODE=eager
+export VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0
+
+python examples/dsa_demo/simple_test_2p.py \
+  --node-rank 0 --master-addr <第一台主机IP> \
+  --master-port 29500 --sync-port 29600 \
+  --remote-shared-config /path/to/remote-shared-node0.json --dry-run
+```
+
+先分别dry-run：节点0的全局rank应为0～7，节点1为8～15，`required_local_npus=8`，
+透传的`additional_config.dsa_sparse_config.remote_shared.node_count=2`。
+dry-run不需要启动Pool，也不验证URMA连通性；确认后两台去掉`--dry-run`一起执行。
+检查两台`DSA_SHARED_CONNECT_BEGIN`的host、全局dp、physical、endpoint和namespace，
+确认各自访问本机服务。可以先跑`check_two_node_dp16_ep16.sh`隔离HCCL/MC2问题。
+
+eager功能通过后再切`RUN_MODE=graph`；沿用原有真实数据预热、延迟capture和DP模式一致性，
+不新增跨机远端内存或图输入。所有rank均须验证多步回放与退出drain，不能只看rank0。
+`MAX_NUM_SEQS`是每个DP的batch，并非全局batch；提高前检查每卡HBM容量。每台Store按
+本机8个worker的活跃请求及层/页数预留容量。当前仍限定离线固定请求批次，不支持请求
+跨DP迁移、row复用或抢占恢复；Pool重启后需要重建连接，不能复用旧图和旧handle。
+
 ## 真实远端 shared 的 decode FULL 图（待实机验收）
 
 先保持已经跑通的Store/DU/EID JSON及模型路径，只把target切到`graph`；drafter仍eager。

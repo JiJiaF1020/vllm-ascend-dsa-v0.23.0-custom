@@ -261,8 +261,8 @@ def resolve_node_launch(
     config: SmokeConfig, args: argparse.Namespace
 ) -> tuple[str, int, int | None, list[tuple[int, int]]]:
     validate_config(config)
-    if config.remote_shared is not None and args.node_size != 1:
-        raise ValueError("remote_shared physical-device table currently supports one NPU host; multi-node needs node identity")
+    if config.remote_shared is not None and config.remote_shared.get("node_count", 1) != args.node_size:
+        raise ValueError("remote_shared.node_count must match launcher node-size")
     if args.node_size < 1 or not 0 <= args.node_rank < args.node_size:
         raise ValueError("node-size must be positive and node-rank must be in [0, node-size)")
     if config.data_parallel_size % args.node_size:
@@ -608,7 +608,7 @@ def main(
     parser.set_defaults(node_size=node_size)
     parser.add_argument("--mtp-eager", action="store_true", help="MTP eager 对照；不改变 target 模式")
     parser.add_argument("--store-endpoint", help="host:port；真实 CREATE/PUT/PUT_DONE/CLOSE，推理仍走本地，不启用远端 Get")
-    parser.add_argument("--remote-shared-config", help="JSON文件；Store/DU/EID配置，启用真实hbm_full_remote_shared功能链")
+    parser.add_argument("--remote-shared-config", help="本机JSON文件；Store/DU/EID配置，各节点分别加载自己的Pool配置")
     parser.add_argument("--dry-run", action="store_true", help="只检查配置和 rank 分配，不加载模型或初始化 NPU")
     parser.add_argument("--ready-shadow-dir", help="有限ready旁路对拍；失败落盘，推理输出仍使用本地LIDU/KSC/SFA")
     parser.add_argument("--ready-shadow-steps", type=int, default=3)
@@ -619,6 +619,14 @@ def main(
     if args.remote_shared_config:
         with open(args.remote_shared_config, encoding="utf-8") as source:
             config = replace(config, remote_shared=json.load(source))
+    if config.remote_shared is not None:
+        # 在父进程校验和spawn之前固定本机配置；节点数必须原样传到框架worker。
+        remote_shared = dict(config.remote_shared)
+        remote_shared.setdefault("node_count", args.node_size)
+        config = replace(config, remote_shared=remote_shared)
+        print(f"[dsa-smoke] remote_shared host={socket.gethostname()} "
+              f"node={args.node_rank}/{args.node_size} config={args.remote_shared_config} "
+              f"store={remote_shared.get('store_endpoint')}", flush=True)
         print("[dsa-smoke] hbm_full_remote_shared real_store=1 real_get=1; target=" + config.run_mode +
               "; PUT/REFRESH/status checks outside decode graph", flush=True)
     if args.store_endpoint:

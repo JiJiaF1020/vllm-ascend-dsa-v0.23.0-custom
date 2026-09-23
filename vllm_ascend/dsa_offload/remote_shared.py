@@ -11,6 +11,7 @@ remote_shared配置中validate默认False；显式True或开启debug时恢复Hos
 from __future__ import annotations
 
 import logging
+import socket
 
 import torch
 
@@ -27,7 +28,7 @@ class RemoteShared:
         from kvcache_scatter_copy_custom_ops import custom_ops_lib
 
         self.native, self.config, self.runtime, self.plan = custom_ops_lib, config, runtime, plan
-        self.identity = f"dp={dp_rank} tp={tp_rank} physical={physical_device}"
+        self.identity = f"host={socket.gethostname()} dp={dp_rank} tp={tp_rank} physical={physical_device}"
         self.layers = layers  # (context, packed KV)；只有真实target层，不含MTP proposer。
         self.contexts = {context.layer_id: context for context, _ in layers}
         self.dump_epoch = -1

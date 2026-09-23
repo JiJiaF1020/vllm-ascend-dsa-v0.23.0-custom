@@ -4,6 +4,9 @@
 注册command/reply/completion只由算子runtime持有。这里的Tensor均为普通caller-owned
 输入输出；不把远端GVA变成Tensor。首次decode绑定一批真实MTP3请求，允许缩批/重排，
 不支持padding、新请求补入或row复用。结束请求的绑定保留到worker shutdown。
+
+remote_shared配置中validate默认False；显式True或开启debug时恢复Host验收检查。
+关闭验收不取消设备completion/APPLIED、PUT_DONE/绑定和图地址生命周期检查。
 """
 from __future__ import annotations
 
@@ -19,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 class RemoteShared:
     def __init__(self, config, runtime, plan, layers, *, dp_rank=0, tp_rank=0, physical_device=None,
-                 graph_enabled=False, debug_config=None):
+                 graph_enabled=False, debug_config=None, validate=False):
         import kvcache_scatter_copy_custom_ops  # noqa: F401
         from kvcache_scatter_copy_custom_ops import custom_ops_lib
 
@@ -43,6 +46,7 @@ class RemoteShared:
         self.previous_status = None
         self.calls = self.fetches = self.sfas = 0
         self.graph_enabled = graph_enabled
+        self.validate = validate or debug_config is not None
         self.prepared_epoch = -1
         self.warmed_batches = set()
         self.layer_buffers = {}
@@ -163,13 +167,14 @@ class RemoteShared:
         candidates = metadata.dsa_candidate_lens
         budgets = metadata.dsa_sparse_budget_tokens.cpu().tolist()
         b = rows.numel()
-        if metadata.cum_query_lens.cpu().tolist() != [4*(i+1) for i in range(b)]:
-            raise ValueError("remote shared decode requires four queries per request")
-        if metadata.dsa_row_modes.cpu().tolist() != [DSA_ROW_MODE_SPARSE]*b:
-            raise ValueError("remote shared decode requires all rows SPARSE")
-        tail = metadata.seq_lens.cpu() - candidates.cpu()
-        if bool(((tail < 4) | (tail > 256)).any()):
-            raise ValueError("framework causal tail must fit 256 tokens including four queries")
+        if self.validate:
+            if metadata.cum_query_lens.cpu().tolist() != [4*(i+1) for i in range(b)]:
+                raise ValueError("remote shared decode requires four queries per request")
+            if metadata.dsa_row_modes.cpu().tolist() != [DSA_ROW_MODE_SPARSE]*b:
+                raise ValueError("remote shared decode requires all rows SPARSE")
+            tail = metadata.seq_lens.cpu() - candidates.cpu()
+            if bool(((tail < 4) | (tail > 256)).any()):
+                raise ValueError("framework causal tail must fit 256 tokens including four queries")
         self.dump_before_write(metadata)
         self._prepare_binding(rows, candidates, budgets)
         for context, _ in self.layers:
@@ -181,23 +186,25 @@ class RemoteShared:
         self.step_data = (b, metadata)
 
     def finish_decode(self):
-        """图外检查真实status；不把Host诊断算进设备FULL graph时间。"""
+        """维护步末记账；仅显式验收模式同步读取设备status/ticket。"""
         if self.step_data is None:
             return
         b, _ = self.step_data
-        for context, _ in self.layers:
-            if context.full_cache is not None:
-                continue
-            data = self._payload(context, b)
-            self._check_status(data, context.layer_id)
-            if context.execution_plan.applied:
-                self._check_ticket(data, "APPLIED")
+        if self.validate:
+            for context, _ in self.layers:
+                if context.full_cache is not None:
+                    continue
+                data = self._payload(context, b)
+                self._check_status(data, context.layer_id)
+                if context.execution_plan.applied:
+                    self._check_ticket(data, "APPLIED")
         self.warmed_batches.add(b)
         self.calls += sum(bool(g.remote_layers) for g in self.plan.groups) * ((b+15)//16)
         self.fetches += sum(max(0, len(g.remote_layers)-1) for g in self.plan.groups) * ((b+15)//16)
         self.sfas += sum(len(g.remote_layers) for g in self.plan.groups)
-        logger.info("DSA_SHARED_STEP_OK %s epoch=%s batch=%s checked=ScatterSFA,APPLIED",
-                    self.identity, self.prepared_epoch, b)
+        if self.validate:
+            logger.info("DSA_SHARED_STEP_OK %s epoch=%s batch=%s checked=ScatterSFA,APPLIED",
+                        self.identity, self.prepared_epoch, b)
         self.step_data = None
 
     def validate_graph_inputs(self, key, metadata, args, kwargs):
@@ -253,8 +260,9 @@ class RemoteShared:
                         bound[:, 2].tolist(), host_rows, changed)
         self.active_rows = host_rows
 
-    @staticmethod
-    def _check_status(data, layer):
+    def _check_status(self, data, layer):
+        if not self.validate:
+            return
         status = data["status"].cpu()
         expected = data["generation"].cpu().repeat_interleave(16)[:status.shape[0]]
         if not torch.equal(status[:, 0], expected) or bool(status[:, 1].any()):
@@ -266,8 +274,9 @@ class RemoteShared:
         data["generation"].copy_(torch.arange(start, start+data["generation"].numel(), dtype=torch.int64,
                                             device=self.runtime.device))
 
-    @staticmethod
-    def _check_ticket(data, phase):
+    def _check_ticket(self, data, phase):
+        if not self.validate:
+            return
         ticket = data["ticket"].cpu()
         if not torch.equal(ticket[:, 0], data["generation"].cpu()) or bool(ticket[:, 1].any()):
             raise RuntimeError(f"{phase} submission failed: {ticket.tolist()}")
@@ -281,14 +290,16 @@ class RemoteShared:
             if self.prepared_epoch != self.runtime._forward_epoch:
                 raise RuntimeError("remote decode must be prepared before model forward/capture")
         else:
-            if actual_q.cpu().tolist() != [4*(i+1) for i in range(b)]:
-                raise ValueError("remote shared requires four queries per request")
-            if row_modes.cpu().tolist() != [DSA_ROW_MODE_SPARSE]*b:
-                raise ValueError("remote shared decode requires all rows SPARSE")
+            if self.validate:
+                if actual_q.cpu().tolist() != [4*(i+1) for i in range(b)]:
+                    raise ValueError("remote shared requires four queries per request")
+                if row_modes.cpu().tolist() != [DSA_ROW_MODE_SPARSE]*b:
+                    raise ValueError("remote shared decode requires all rows SPARSE")
             self._prepare_binding(rows, candidates, budgets.cpu().tolist())
-            tail_length = visible.cpu() - candidates.cpu()
-            if bool(((tail_length < 4) | (tail_length > 256)).any()):
-                raise ValueError("framework causal tail must fit 256 tokens including four queries")
+            if self.validate:
+                tail_length = visible.cpu() - candidates.cpu()
+                if bool(((tail_length < 4) | (tail_length > 256)).any()):
+                    raise ValueError("framework causal tail must fit 256 tokens including four queries")
         data = self._buffer(context, b)
         payload_context = self.contexts[context.execution_plan.first_payload_layer]
         payload = self._payload(payload_context, b)
@@ -315,7 +326,7 @@ class RemoteShared:
         self.runtime._selection_source_layer = context.layer_id
         if not self.graph_enabled:
             self.calls += payload["generation"].numel()
-            logger.info("DSA_SHARED_SELECT source=%s payload=%s epoch=%s commands=%s", context.layer_id,
+            logger.debug("DSA_SHARED_SELECT source=%s payload=%s epoch=%s commands=%s", context.layer_id,
                         context.execution_plan.first_payload_layer, self.runtime._forward_epoch, self.calls)
         return DSAOffloadSelectionOutput(data["full"], data["tail_info"], visible)
 
@@ -352,13 +363,13 @@ class RemoteShared:
                                                   payload["status"], data["ticket"])
             if not self.graph_enabled:
                 self._check_ticket(payload, "APPLIED")
-        # 功能验收逐层检查，不把这里的同步端到端时间作为性能成绩。
+        # 显式验收才逐层同步检查；设备侧status/APPLIED依赖始终保留。
         if not self.graph_enabled:
             self._check_status(payload, context.layer_id)
             if self.debug is not None:
                 self.debug.consume(context, data, payload, packed, table)
             self.sfas += 1
-            logger.info("DSA_SHARED_CONSUMED %s layer=%s mirror=%s applied=%s", self.identity, context.layer_id,
+            logger.debug("DSA_SHARED_CONSUMED %s layer=%s mirror=%s applied=%s", self.identity, context.layer_id,
                         context.execution_plan.mirror_writer, context.execution_plan.applied)
         return out
 

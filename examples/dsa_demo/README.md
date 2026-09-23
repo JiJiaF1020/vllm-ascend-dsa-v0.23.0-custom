@@ -184,14 +184,22 @@ python examples/dsa_demo/simple_test_1p.py --remote-shared-config /绝对路径/
 执行次序：真实prefill/PUT → 首次真实decode eager预热 → 同shape下一步capture并执行一次
 → 后续replay。启动日志`DSA_SHARED_GRAPH_DEFERRED`表示跳过无连接的dummy capture，
 不是禁用图；随后应出现`DSA_SHARED_GRAPH_CAPTURE_BEGIN/END first_replay=1`、
-`Replaying aclgraph`和逐步`DSA_SHARED_STEP_OK ... checked=ScatterSFA,APPLIED`。
+`Replaying aclgraph`。显式验收模式才输出逐步`DSA_SHARED_STEP_OK ... checked=ScatterSFA,APPLIED`。
 需看msprof确认LISSend、GATHER_ONLY、ScatterSFA及APPLIED确实在图内。
 
 每层generation/status独立，generation每step在图外H2D；已捕获shape的buffer保留到关闭。
-PUT/PUT_DONE、REFRESH和步末status检查均在图外，仍有Host同步开销；这轮以功能为准。
+PUT/PUT_DONE、REFRESH仍在图外，保留必要的Host同步。
 所有DP均预热、均为Q=4且token数一致时才FULL；缩批只能命中精确capture size，
 不一致时全体eager，不创建远端PAD请求。Q不足4、非SPARSE等原远端限制没有因此解除。
 图内地址变化会明确报错，不会静默使用旧metadata。
+
+`--remote-shared-config` JSON顶层可设置`"validate": true`恢复Host验收检查，默认False。
+默认不做逐层ticket/status的同步D2H，也不做prepare/select中的累计query、SPARSE模式及
+causal tail值检查；这些输入契约仍须满足，并非放开非Q4或超长tail支持。开启`debug`也会
+恢复验收检查。性能测试应移除`debug`并关闭`validate`；否则检查本身会串行化设备下发。
+默认模式保留设备completion/status/APPLIED依赖、PUT_DONE水位、row绑定与复用限制、
+图输入地址检查。`finish_decode`仅记账，不代表Host已核验设备成功；错误不再保证逐层即时报告。
+`prepare_decode`的budget/rows/candidate绑定读取仍有D2H，不能把本改动当成消除了全部步间同步。
 
 延迟捕获的graph/workspace占用未计入启动期KV容量估算，需保留HBM余量，不能直接使用
 启动日志建议的最大KV内存。此次只改框架Python，不要求重编Pool、hcomm或OPP；仍需已有

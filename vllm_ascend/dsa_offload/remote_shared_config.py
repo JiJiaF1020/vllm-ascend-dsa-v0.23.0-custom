@@ -74,6 +74,8 @@ class DSARemoteSharedConfig:
     devices: tuple[tuple[int, RemoteSharedDevice], ...] = ()
     single: RemoteSharedDevice | None = None
     debug: RemoteSharedDebug | None = None
+    # 显式验收模式：恢复逐层status/ticket及decode输入值的同步D2H检查。
+    validate: bool = False
 
     @classmethod
     def from_value(cls, value):
@@ -83,11 +85,15 @@ class DSARemoteSharedConfig:
             raise ValueError("remote_shared requires store_endpoint")
         _endpoint(value["store_endpoint"])
         debug = RemoteSharedDebug.from_value(value.get("debug"))
+        validate = value.get("validate", False)
+        if type(validate) is not bool:
+            raise ValueError("remote_shared.validate must be a boolean")
         if "devices" not in value:
             # 兼容已有DP1/TP1单EID文件，多rank不得静默复用它。
-            single = RemoteSharedDevice.from_value({k: v for k, v in value.items() if k not in ("store_endpoint", "debug")})
-            return cls(value["store_endpoint"], single=single, debug=debug)
-        if set(value) - {"store_endpoint", "devices", "debug"} or not isinstance(value["devices"], Mapping):
+            single = RemoteSharedDevice.from_value({k: v for k, v in value.items()
+                                                   if k not in ("store_endpoint", "debug", "validate")})
+            return cls(value["store_endpoint"], single=single, debug=debug, validate=validate)
+        if set(value) - {"store_endpoint", "devices", "debug", "validate"} or not isinstance(value["devices"], Mapping):
             raise ValueError("remote_shared accepts store_endpoint and devices keyed by physical device ID")
         devices = []
         for key, item in value["devices"].items():
@@ -102,7 +108,7 @@ class DSARemoteSharedConfig:
                 raise ValueError(f"remote_shared requires one independent {name} per physical device")
         if any(device.eid_index < 0 or not device.pool_eid for _, device in devices):
             raise ValueError("device table requires exact eid_index and pool_eid from probe")
-        return cls(value["store_endpoint"], tuple(sorted(devices)), debug=debug)
+        return cls(value["store_endpoint"], tuple(sorted(devices)), debug=debug, validate=validate)
 
     def validate_topology(self, dp: int, tp: int) -> None:
         if self.debug and any(d >= dp or t >= tp for d, t in self.debug.ranks):

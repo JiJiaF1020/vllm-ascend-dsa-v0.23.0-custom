@@ -5178,6 +5178,7 @@ class NPUModelRunner(GPUModelRunner):
                                                 dp_rank=self.dp_rank, tp_rank=get_tp_group().rank_in_group,
                                                 physical_device=physical_device,
                                                 debug_config=shared_config.debug,
+                                                validate=shared_config.validate,
                                                 graph_enabled=self._remote_decode_graph_enabled())
         cache_layout.set_pool_release_callback(
             runtime.release_pool_index

@@ -5152,13 +5152,13 @@ class NPUModelRunner(GPUModelRunner):
                 custom_ops_lib.aiv_urma_query_eids(str(self.device)))
             logger.info("DSA_SHARED_DEVICE dp=%s tp=%s logical=%s physical=%s store=%s du=%s "
                         "device_eid=%s eid_index=%s pool_eid=%s", self.dp_rank, get_tp_group().rank_in_group,
-                        self.device, physical_device, shared_config.store_endpoint, shared_device.du_endpoint,
+                        self.device, physical_device, shared_device.store_endpoint, shared_device.du_endpoint,
                         shared_device.device_eid, shared_device.eid_index, shared_device.pool_eid)
         if remote_config is not None or shared_config is not None:
             from vllm_ascend.dsa_offload.remote_store import RemoteKvStore, RemoteStoreShadow
 
             remote_store = RemoteKvStore(
-                shared_config.store_endpoint if shared_config else remote_config.endpoint, payload_layers=runtime.num_layers,
+                shared_device.store_endpoint if shared_config else remote_config.endpoint, payload_layers=runtime.num_layers,
                 capacity=runtime.max_logical_blocks * runtime.block_size,
             )
             runtime.remote_store_shadow = RemoteStoreShadow(

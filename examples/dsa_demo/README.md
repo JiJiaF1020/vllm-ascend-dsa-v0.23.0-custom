@@ -176,6 +176,20 @@ wire或算子，无需为本次修改重编Pool、extension、C8 OPP或hcomm，�
 - 全局DP rank保持0～15；每个TP组必须在同一节点。debug的rank仍为全局DP/TP rank。
   worker建链前仍用HCCP inventory核对真实物理ID及EID/index，不通过校验就拒绝连接。
 
+同一台机器按NUMA运行多个独立Pool时，每个`devices[物理ID]`可增加`store_endpoint`，
+不填则沿用顶层默认值。例如NPU0/1的DU端口为19090/19091、Store为19080；NPU2/3的
+DU端口为19092/19093、Store为19081，则在设备2/3的原有完整配置里补充：
+
+```json
+"store_endpoint": "127.0.0.1:19081"
+```
+
+这是一条新增字段示例，不是完整配置；保持各卡原来的真实EID/index/pool_eid和DU端口。
+worker根据HCCP真实物理卡号选择Store后，CREATE、PUT、PUT_DONE和CLOSE都走选中的
+Store；DU连接携带同一个Store ID及request handle/version，服务端会拒绝Store错配。
+`DSA_SHARED_DEVICE`打印生效的Store/DU组合。每个wrapper使用独立backing，NPU到NUMA
+关系由配置明确指定，不假定NPU编号等于DP rank或NUMA ID。未配置覆盖时单Store行为不变。
+
 两台分别执行（第二台把rank改为1，配置路径换成自己的文件；模型、采样与其它参数一致）：
 
 ```bash

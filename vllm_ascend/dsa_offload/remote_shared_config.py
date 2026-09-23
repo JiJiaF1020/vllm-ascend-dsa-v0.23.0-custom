@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 def _endpoint(value: str) -> None:
@@ -18,22 +18,27 @@ class RemoteSharedDevice:
     device_eid: str
     eid_index: int = -1
     pool_eid: str = ""
+    # 可覆盖全局默认Store；同一worker的CREATE/PUT与DU必须属于同一Pool。
+    store_endpoint: str | None = None
 
     @classmethod
     def from_value(cls, value):
         if not isinstance(value, Mapping) or set(value) - {
-            "du_endpoint", "device_eid", "eid_index", "pool_eid"
+            "du_endpoint", "device_eid", "eid_index", "pool_eid", "store_endpoint"
         } or not {"du_endpoint", "device_eid"} <= value.keys():
             raise ValueError("remote_shared device requires du_endpoint/device_eid")
         result = cls(**value)
         _endpoint(result.du_endpoint)
+        if result.store_endpoint is not None:
+            _endpoint(result.store_endpoint)
         for eid in (result.device_eid, result.pool_eid):
             if eid and (len(eid) != 32 or any(c not in "0123456789abcdefABCDEF" for c in eid)
                         or int(eid, 16) == 0):
                 raise ValueError("remote_shared requires real 32-digit hexadecimal EIDs")
         if not result.device_eid or type(result.eid_index) is not int or result.eid_index < -1:
             raise ValueError("remote_shared requires a device EID and valid EID index")
-        return cls(result.du_endpoint, result.device_eid.lower(), result.eid_index, result.pool_eid.lower())
+        return cls(result.du_endpoint, result.device_eid.lower(), result.eid_index, result.pool_eid.lower(),
+                   result.store_endpoint)
 
 
 @dataclass(frozen=True)
@@ -144,4 +149,4 @@ class DSARemoteSharedConfig:
                    (selected.eid_index == -1 or int(row["eid_index"]) == selected.eid_index)
                    for row in inventory):
             raise ValueError(f"remote_shared EID/index does not belong to current physical NPU {phy_id}; rerun probe")
-        return phy_id, selected
+        return phy_id, replace(selected, store_endpoint=selected.store_endpoint or self.store_endpoint)

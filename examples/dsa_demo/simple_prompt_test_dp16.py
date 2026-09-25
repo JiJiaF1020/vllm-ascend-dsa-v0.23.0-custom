@@ -23,7 +23,8 @@
 ``disabled`` 用于验证基线隔离，``cache-init`` 只验证双平面 KV cache
 初始化，``eager`` 和 ``graph`` 分别验证 DSA eager 与 FULL decode graph。
 DP>1 时每台机器的父进程只创建本机离线前端进程，并通过 ``VLLM_DP_*``
-建立全局 SPMD 协调；MTP drafter 保持 eager，target model 使用 FULL decode graph。
+建立全局 SPMD 协调；target model 使用 FULL decode graph，
+``ENABLE_MTP_GRAPH=True`` 时 MTP drafter 启用三轮合并 draft 图，否则保持 eager。
 默认输入为 chinese_64k 长序列（64000 token），超过
 ``DSA_SPARSE_ACTIVATION_TOKENS``，覆盖真正的 sparse/ENTER 路径；
 ``SHORT_PROMPTS`` 保留用于 DENSE 短 prompt 对照。
@@ -71,9 +72,16 @@ GPU_MEMORY_UTILIZATION = 0.90
 QUANTIZATION = "ascend"
 ENABLE_EXPERT_PARALLEL = True
 ENABLE_MTP = True
+# True 且 RUN_MODE="graph" 时启用 GLM MTP 三轮合并 draft 图（MTP 头入图）；
+# False 时 MTP drafter 保持 eager。
+ENABLE_MTP_GRAPH = True
 MTP_NUM_SPECULATIVE_TOKENS = 3
 
 ENABLE_A5_PACKED_C8_DSA = True
+
+# DSA 卸载总开关：False 为不卸载基线对照，RUN_MODE 仍可保持 "graph"
+# 测 MTP3+图模式；此时下面两个卸载增强开关必须一起关闭。
+ENABLE_DSA_OFFLOAD = True
 
 ENABLE_FUSED_COPYSFA = False
 ENABLE_GROUPED_C8_KV = False
@@ -263,13 +271,17 @@ def build_llm_kwargs(dp_rank: int, multi_node: bool) -> dict[str, Any]:
         raise ValueError(
             "DSA compromise MTP requires MTP_NUM_SPECULATIVE_TOKENS=3"
         )
-    if ENABLE_FUSED_COPYSFA and not (ENABLE_MTP and ENABLE_A5_PACKED_C8_DSA):
+    if ENABLE_FUSED_COPYSFA and not (
+        ENABLE_DSA_OFFLOAD and ENABLE_MTP and ENABLE_A5_PACKED_C8_DSA
+    ):
         raise ValueError(
-            "ENABLE_FUSED_COPYSFA requires packed-C8 DSA + MTP3"
+            "ENABLE_FUSED_COPYSFA requires DSA offload + packed-C8 + MTP3"
         )
-    if ENABLE_GROUPED_C8_KV and not (ENABLE_MTP and ENABLE_A5_PACKED_C8_DSA):
+    if ENABLE_GROUPED_C8_KV and not (
+        ENABLE_DSA_OFFLOAD and ENABLE_MTP and ENABLE_A5_PACKED_C8_DSA
+    ):
         raise ValueError(
-            "ENABLE_GROUPED_C8_KV requires packed-C8 DSA + MTP3"
+            "ENABLE_GROUPED_C8_KV requires DSA offload + packed-C8 + MTP3"
         )
     graph_enabled = RUN_MODE == "graph"
     kwargs: dict[str, Any] = {
@@ -305,7 +317,7 @@ def build_llm_kwargs(dp_rank: int, multi_node: bool) -> dict[str, Any]:
                 "enable_sparse_li_c8": ENABLE_A5_PACKED_C8_DSA,
             }
         )
-    if RUN_MODE != "disabled":
+    if RUN_MODE != "disabled" and ENABLE_DSA_OFFLOAD:
         additional_config.update(
             {
                 "dsa_sparse_config": build_dsa_config(graph_enabled),
@@ -317,8 +329,11 @@ def build_llm_kwargs(dp_rank: int, multi_node: bool) -> dict[str, Any]:
         kwargs["speculative_config"] = {
             "method": "mtp",
             "num_speculative_tokens": MTP_NUM_SPECULATIVE_TOKENS,
-            # 只约束 drafter；target 仍由顶层配置进入 FULL decode graph。
-            "enforce_eager": True,
+            # enforce_eager 只约束 drafter；ENABLE_MTP_GRAPH=True 时 drafter
+            # 随 target 的 FULL decode graph 走三轮合并图，否则保持 eager。
+            "enforce_eager": not (graph_enabled and ENABLE_MTP_GRAPH),
+            # GLM MTP 图要求 draft TP 与 target TP 一致，需显式传递。
+            "draft_tensor_parallel_size": TENSOR_PARALLEL_SIZE,
         }
     if graph_enabled:
         decode_query_len = (
@@ -456,7 +471,10 @@ def run_dp_rank(
             f"mode={RUN_MODE} model={MODEL_PATH!r} prompts={len(local_prompts)} "
             f"tp={TENSOR_PARALLEL_SIZE} ep={TENSOR_PARALLEL_SIZE * DATA_PARALLEL_SIZE} "
             f"max_model_len={MAX_MODEL_LEN} max_num_seqs={MAX_NUM_SEQS} "
-            f"a5_packed_c8={ENABLE_A5_PACKED_C8_DSA} mtp={ENABLE_MTP}"
+            f"a5_packed_c8={ENABLE_A5_PACKED_C8_DSA} mtp={ENABLE_MTP} "
+            f"dsa_offload={ENABLE_DSA_OFFLOAD} "
+            f"fused_copysfa={ENABLE_FUSED_COPYSFA} "
+            f"grouped_c8_kv={ENABLE_GROUPED_C8_KV}"
         )
         llm = LLM(**kwargs)
 

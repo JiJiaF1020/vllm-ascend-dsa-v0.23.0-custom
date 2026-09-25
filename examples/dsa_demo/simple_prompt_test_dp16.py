@@ -24,8 +24,11 @@
 初始化，``eager`` 和 ``graph`` 分别验证 DSA eager 与 FULL decode graph。
 DP>1 时每台机器的父进程只创建本机离线前端进程，并通过 ``VLLM_DP_*``
 建立全局 SPMD 协调；MTP drafter 保持 eager，target model 使用 FULL decode graph。
-默认短 prompt 主要覆盖 DENSE；验证真正的 sparse/ENTER 路径时，应换成
-token 长度超过 ``DSA_SPARSE_ACTIVATION_TOKENS`` 的文本。
+默认输入为 chinese_64k 长序列（64000 token），超过
+``DSA_SPARSE_ACTIVATION_TOKENS``，覆盖真正的 sparse/ENTER 路径；
+``SHORT_PROMPTS`` 保留用于 DENSE 短 prompt 对照。
+``ENABLE_FUSED_COPYSFA`` 与 ``ENABLE_GROUPED_C8_KV`` 可组合出 4 种卸载模式，
+用于双机 DP16 下的 decode offloading 性能对比。
 """
 
 from __future__ import annotations
@@ -40,55 +43,53 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from novel_dataset import chinese_20k
-
-LONG_PROMPTS = chinese_20k * 16
+from novel_dataset import chinese_64k
 
 # =========================
 # 用户配置
 # =========================
 
-MODEL_PATH = "/home/models/GLM-5.2-w4a4c8-mxfp4"
-RUN_MODE = "cache-init"  # disabled / cache-init / eager / graph
+MODEL_PATH = "/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4"
+RUN_MODE = "graph"  # disabled / cache-init / eager / graph
 
-# 第一轮默认验收步骤 2：双机 DP16TP1EP16、DSA cache-init、无 MTP、eager。
-# 硬件与 cache-init 通过后，只将 RUN_MODE 改为 "eager" 即进入步骤 3。
+# 默认穿刺测试拓扑：双机 DP16TP1EP16（每机 8 卡）、DSA graph、MTP3。
 TENSOR_PARALLEL_SIZE = 1
 DATA_PARALLEL_SIZE = 16
 
-# 每个 DP rank 使用同一输入，便于步骤 3 直接逐 token 比较跨 rank 一致性。
-SHORT_PROMPTS = ["请用一句话介绍你自己。"] * DATA_PARALLEL_SIZE
-PROMPTS = SHORT_PROMPTS
-
 # 全局总 NPU 数 = TP * DP；每机 NPU 数 = TP * (DP / node-size)。
 DP_PROCESS_TIMEOUT_SECONDS = 3600
-# max_num_seqs 按 DP rank 计算；16 条短 prompt 在 DP16 下每个 rank 1 条。
-MAX_NUM_SEQS = 1
-MAX_MODEL_LEN = 4096
-# 关闭 chunked prefill 时 token budget 不得小于 max_model_len；步骤 6 将两者一起改为 24576。
-MAX_NUM_BATCHED_TOKENS = 4096
-ENABLE_CHUNKED_PREFILL = False
-MAX_TOKENS = 32
-GPU_MEMORY_UTILIZATION = 0.82
+# max_num_seqs 按 DP rank 计算；默认每卡 batchsize=16。
+MAX_NUM_SEQS = 16
+
+PROMPTS = chinese_64k * (DATA_PARALLEL_SIZE * MAX_NUM_SEQS)  # 默认 chinese_64k 长序列：DP16 × 每卡 16 条 = 256 条。 
+MAX_MODEL_LEN = 131072
+# 关闭 chunked prefill 时 token budget 不得小于 max_model_len；默认开启 chunked prefill。
+MAX_NUM_BATCHED_TOKENS = 8192
+ENABLE_CHUNKED_PREFILL = True
+MAX_TOKENS = 256
+GPU_MEMORY_UTILIZATION = 0.90
 QUANTIZATION = "ascend"
 ENABLE_EXPERT_PARALLEL = True
-ENABLE_MTP = False
+ENABLE_MTP = True
 MTP_NUM_SPECULATIVE_TOKENS = 3
 
-# A5/950 上的 DSA 首版只支持 LI C8 与 SFA C8 同时开启；A3/910C 保持 False。
-# disabled 模式也会保留这个 vLLM-Ascend 原生物理布局开关，便于用同一 C8
-# cache 编码公平对照“原生 C8”与“DSA C8”。
 ENABLE_A5_PACKED_C8_DSA = True
 
+ENABLE_FUSED_COPYSFA = False
+ENABLE_GROUPED_C8_KV = False
+
 ENABLE_PROFILE = False
-PROFILE_DIR = "/home/w00916487/vllm_profile/tp8_offload_seq20k_bs16/"
+PROFILE_DIR = f"/home/w00916487/vllm_profile/offload_64k_bs{MAX_NUM_SEQS}_{ENABLE_FUSED_COPYSFA}_{ENABLE_GROUPED_C8_KV}/"
 RESULT_JSON: str | None = None
 
 DSA_PROMPT_BUDGET_THRESHOLDS = [32768, 65536]
-DSA_INDEXER_MLA_BLOCK_RATIO = 3
+DSA_INDEXER_MLA_BLOCK_RATIO = 4
 DSA_MAX_ACTIVE_REQS = 256
 DSA_HOT_CPU_BLOCK_MULTIPLE = 1.0
-DSA_GRAPH_CAPTURE_SIZES = [1, 2, 4, 8]
+DSA_GRAPH_CAPTURE_SIZES = [1, 2, 4, 8, MAX_NUM_SEQS]
+DSA_RESIDENT_BUDGET_TOKENS = [6144, 10240, 12288]  # 非 MTP 三个长度档的 HBM 驻留预算
+# MTP 三档驻留预算：128 对齐、非递减。
+DSA_MTP_RESIDENT_BUDGET_TOKENS = [10240, 14336, 14336]
 DSA_TRACE_POINTS = {
     # 当前仅解析预留合同，尚无稳定日志 consumer；验收默认关闭。
     "enabled": False,
@@ -228,12 +229,14 @@ def build_dsa_config(enable_graph: bool) -> dict[str, Any]:
         10240 if ENABLE_MTP else 6144
     )
     resident_budget_tokens = (
-        [10240, 10240, 10240]
+        DSA_MTP_RESIDENT_BUDGET_TOKENS
         if ENABLE_MTP
-        else [10240, 10240, 10240]
+        else DSA_RESIDENT_BUDGET_TOKENS
     )
     return {
         "enabled": True,
+        "enable_fused_copy_sfa": ENABLE_FUSED_COPYSFA,
+        "enable_grouped_c8_kv": ENABLE_GROUPED_C8_KV,
         "split_indexer_cache": True,
         "indexer_mla_block_ratio": DSA_INDEXER_MLA_BLOCK_RATIO,
         "sparse_activation_tokens": sparse_activation_tokens,
@@ -259,6 +262,14 @@ def build_llm_kwargs(dp_rank: int, multi_node: bool) -> dict[str, Any]:
     if ENABLE_MTP and MTP_NUM_SPECULATIVE_TOKENS != 3:
         raise ValueError(
             "DSA compromise MTP requires MTP_NUM_SPECULATIVE_TOKENS=3"
+        )
+    if ENABLE_FUSED_COPYSFA and not (ENABLE_MTP and ENABLE_A5_PACKED_C8_DSA):
+        raise ValueError(
+            "ENABLE_FUSED_COPYSFA requires packed-C8 DSA + MTP3"
+        )
+    if ENABLE_GROUPED_C8_KV and not (ENABLE_MTP and ENABLE_A5_PACKED_C8_DSA):
+        raise ValueError(
+            "ENABLE_GROUPED_C8_KV requires packed-C8 DSA + MTP3"
         )
     graph_enabled = RUN_MODE == "graph"
     kwargs: dict[str, Any] = {

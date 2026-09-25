@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 class RemoteShared:
     def __init__(self, config, runtime, plan, layers, *, dp_rank=0, tp_rank=0, physical_device=None,
-                 graph_enabled=False, debug_config=None, validate=False):
+                 graph_enabled=False, debug_config=None, validate=False, worker_parking=False):
         import kvcache_scatter_copy_custom_ops  # noqa: F401
         from kvcache_scatter_copy_custom_ops import custom_ops_lib
 
@@ -48,6 +48,11 @@ class RemoteShared:
         self.calls = self.fetches = self.sfas = 0
         self.graph_enabled = graph_enabled
         self.validate = validate or debug_config is not None
+        self.worker_parking = worker_parking
+        self.notified_epoch = -1
+        self.last_payload_layer = max((layer for group in plan.groups for layer in group.remote_layers), default=None)
+        if worker_parking and not hasattr(self.native, "lis_send_pool_begin_step"):
+            raise RuntimeError("worker_parking requires updated operator extension and Pool")
         self.prepared_epoch = -1
         self.warmed_batches = set()
         self.layer_buffers = {}
@@ -129,6 +134,8 @@ class RemoteShared:
         self.request_ids = {row: shadow.request_ids[row] for row in host_rows}
         self.groups = (b + 15) // 16
         self.period = ((self.runtime.num_layers * self.groups + 7) // 8) * 8
+        if self.worker_parking:
+            self.native.lis_send_pool_begin_step(self.handle, 0, [])
         self.arange_tail = torch.arange(256, dtype=torch.int32, device=self.runtime.device)
         self.causal_query = torch.arange(4, dtype=torch.int32, device=self.runtime.device)
         logger.info("DSA_SHARED_CONNECT_OK %s wire=5 backend=real_store groups=%s", self.identity, len(self.plan.groups))
@@ -185,6 +192,25 @@ class RemoteShared:
                 self._buffer(context, b)
         self.prepared_epoch = self.runtime._forward_epoch
         self.step_data = (b, metadata)
+
+    def notify_step_submitted(self):
+        """图外、model forward下发后调用；不读取设备Tensor，不等待设备完成或TCP ACK。"""
+        if not self.worker_parking or self.handle is None or self.last_payload_layer is None:
+            return
+        epoch = self.runtime._forward_epoch
+        if epoch == self.notified_epoch:
+            return
+        if self.graph_enabled:
+            if self.step_data is None or self.prepared_epoch != epoch:
+                return
+            batch = self.step_data[0]
+        else:
+            if self.current is None or self.current["epoch"] != epoch:
+                return
+            batch = self.current["rows"].numel()
+        start = epoch * self.period + self.last_payload_layer * self.groups + 1
+        self.native.lis_send_pool_begin_step(self.handle, epoch + 1, list(range(start, start + (batch + 15) // 16)))
+        self.notified_epoch = epoch
 
     def finish_decode(self):
         """维护步末记账；仅显式验收模式同步读取设备status/ticket。"""

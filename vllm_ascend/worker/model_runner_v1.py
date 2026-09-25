@@ -2925,6 +2925,11 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            # Host准备和NPU下发完成后才唤醒Pool，避免worker忙轮询争抢准备阶段CPU。
+            runtime = getattr(self, "dsa_offload_runtime", None)
+            remote = getattr(runtime, "remote_shared", None)
+            if remote is not None:
+                remote.notify_step_submitted()
         if self._remote_decode_graph_enabled():
             self.dsa_offload_runtime.remote_shared.finish_decode()
         with record_function_or_nullcontext("post process"):
@@ -5179,6 +5184,7 @@ class NPUModelRunner(GPUModelRunner):
                                                 physical_device=physical_device,
                                                 debug_config=shared_config.debug,
                                                 validate=shared_config.validate,
+                                                worker_parking=shared_config.worker_parking,
                                                 graph_enabled=self._remote_decode_graph_enabled())
         cache_layout.set_pool_release_callback(
             runtime.release_pool_index

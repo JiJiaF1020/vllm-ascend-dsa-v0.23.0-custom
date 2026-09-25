@@ -299,6 +299,23 @@ reply，不是根据输入推测；GATHER_ONLY复用计划但加载当前层数�
 等generate及DP结束屏障后统一报错，不在TP层内因数值差异提前退出。真实设备错误仍可能中断运行。
 关闭诊断只需删除`debug`字段，原图模式不变。
 
+## 可选Pool worker步间休眠
+
+在原`--remote-shared-config` JSON顶层加入 `"worker_parking": true`，默认关闭。
+先更新Pool和算子Torch extension（需包含`lis_send_pool_begin_step`），再更新框架Python；
+此功能不需重编C8 OPP/hcomm，不新增端口。
+
+唤醒通知位于`_model_forward()`返回后、`finish_decode()`/后处理之前：此时Host准备已完成、
+NPU任务已提交，但不等待设备执行完。每rank用已有DU TCP连接单向发64B，无ACK、无D2H，
+C++发送释放GIL。图内不增加节点。真实命令先于TCP到达时，poll也会兜底唤醒。
+Pool在本步全部网络组最终CQE及索引收尾后让worker和merge helper休眠，poll仍忙轮询。
+步内不会逐层睡醒；不改变APPLIED/plan/buffer复用语义。
+
+第一轮建议保持现有绑核、batch和层数，只对比开/关此选项。确认Host准备阶段线程能够睡眠，
+再看首层ScatterSFA等待和整步延迟是否改善；通知时机、OS唤醒仍可能引入首层额外等待。
+旧Pool不能接收此控制帧，关闭选项并重启连接可恢复原模式。详细部署见算子仓
+`test/urma_mock_pool/README.md`的“步间休眠”章节。
+
 ## 双击HCCL连通性测试
 
 在**两台机器的容器内、仓库根目录下，各运行同一条命令**。

@@ -83,6 +83,7 @@ class DSARemoteSharedConfig:
     validate: bool = False
     # 全局DP均分到各节点；devices只列本机卡，TP组不跨节点。
     node_count: int = 1
+    worker_parking: bool = False
 
     @classmethod
     def from_value(cls, value):
@@ -93,6 +94,9 @@ class DSARemoteSharedConfig:
         _endpoint(value["store_endpoint"])
         debug = RemoteSharedDebug.from_value(value.get("debug"))
         validate = value.get("validate", False)
+        worker_parking = value.get("worker_parking", False)
+        if type(worker_parking) is not bool:
+            raise ValueError("remote_shared.worker_parking must be a boolean")
         if type(validate) is not bool:
             raise ValueError("remote_shared.validate must be a boolean")
         node_count = value.get("node_count", 1)
@@ -101,9 +105,10 @@ class DSARemoteSharedConfig:
         if "devices" not in value:
             # 兼容已有DP1/TP1单EID文件，多rank不得静默复用它。
             single = RemoteSharedDevice.from_value({k: v for k, v in value.items()
-                                                   if k not in ("store_endpoint", "debug", "validate", "node_count")})
-            return cls(value["store_endpoint"], single=single, debug=debug, validate=validate, node_count=node_count)
-        if set(value) - {"store_endpoint", "devices", "debug", "validate", "node_count"} or not isinstance(value["devices"], Mapping):
+                                                   if k not in ("store_endpoint", "debug", "validate", "node_count", "worker_parking")})
+            return cls(value["store_endpoint"], single=single, debug=debug, validate=validate,
+                       node_count=node_count, worker_parking=worker_parking)
+        if set(value) - {"store_endpoint", "devices", "debug", "validate", "node_count", "worker_parking"} or not isinstance(value["devices"], Mapping):
             raise ValueError("remote_shared accepts store_endpoint and devices keyed by physical device ID")
         devices = []
         for key, item in value["devices"].items():
@@ -118,7 +123,8 @@ class DSARemoteSharedConfig:
                 raise ValueError(f"remote_shared requires one independent {name} per physical device")
         if any(device.eid_index < 0 or not device.pool_eid for _, device in devices):
             raise ValueError("device table requires exact eid_index and pool_eid from probe")
-        return cls(value["store_endpoint"], tuple(sorted(devices)), debug=debug, validate=validate, node_count=node_count)
+        return cls(value["store_endpoint"], tuple(sorted(devices)), debug=debug, validate=validate,
+                   node_count=node_count, worker_parking=worker_parking)
 
     def validate_topology(self, dp: int, tp: int) -> None:
         if self.debug and any(d >= dp or t >= tp for d, t in self.debug.ranks):

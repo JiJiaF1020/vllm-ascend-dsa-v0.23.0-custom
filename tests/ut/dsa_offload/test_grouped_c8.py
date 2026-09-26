@@ -53,7 +53,11 @@ def test_virtual_pa_addresses_equal_interleaved_storage(lane, start):
         actual = pa[virtual_table[row, mapped // 128].long(), mapped % 128]
         assert torch.equal(actual, expected)
     slots = torch.tensor([-7, -1, 0, 127, 128, 255, 256])
-    assert torch.equal(lane_slots(slots, lane)[:2], slots[:2])
+    mapped = lane_slots(slots, lane)
+    # 算子只按符号跳过 padding（scatter-copy: slot < 0；SFA: index >= 0 二分），
+    # 因此负 sentinel 只需保持为负，非负值仍精确映射到 4*s+lane。
+    assert torch.all(mapped[:2] < 0)
+    assert torch.equal(mapped[2:], slots[2:] * 4 + lane)
 
 
 def test_kv_write_changes_only_its_lane_and_preserves_padding():

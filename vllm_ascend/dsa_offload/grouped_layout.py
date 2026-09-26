@@ -7,6 +7,8 @@ allocation as [4*B, 128, 1, 656]. A physical token slot s in lane l becomes
 changes the number of valid attention entries or the causal sequence lengths.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 import torch
@@ -37,15 +39,22 @@ def indexshare_groups(indexer_types: tuple[str, ...] | None) -> tuple[tuple[int,
 def lane_slots(slots: torch.Tensor, lane: int) -> torch.Tensor:
     if not 0 <= lane < GROUP_SIZE:
         raise ValueError(f"Invalid grouped KV lane: {lane}")
-    # Keep padding sentinels negative, including lanes 1..3.
-    return torch.where(slots >= 0, slots * GROUP_SIZE + lane, slots)
+    # lane < GROUP_SIZE 保证负的 padding sentinel 在 * GROUP_SIZE + lane 后
+    # 仍为负数，无需 where() 保留原值。
+    return slots * GROUP_SIZE + lane
+
+
+_EXPAND_BLOCK_OFFSETS: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
 
 
 def expanded_block_table(block_table: torch.Tensor) -> torch.Tensor:
-    offsets = torch.arange(GROUP_SIZE, dtype=block_table.dtype, device=block_table.device)
-    expanded = block_table.unsqueeze(-1) * GROUP_SIZE + offsets
-    expanded = torch.where(block_table.unsqueeze(-1) >= 0, expanded, block_table.unsqueeze(-1))
-    return expanded.flatten(-2).contiguous()
+    key = (block_table.device, block_table.dtype)
+    offsets = _EXPAND_BLOCK_OFFSETS.get(key)
+    if offsets is None:
+        offsets = torch.arange(GROUP_SIZE, dtype=block_table.dtype, device=block_table.device)
+        _EXPAND_BLOCK_OFFSETS[key] = offsets
+    # 负的 padding 块号在 * GROUP_SIZE + offset 后仍为负，无需 where()。
+    return (block_table.unsqueeze(-1) * GROUP_SIZE + offsets).flatten(-2)
 
 
 @dataclass(frozen=True)

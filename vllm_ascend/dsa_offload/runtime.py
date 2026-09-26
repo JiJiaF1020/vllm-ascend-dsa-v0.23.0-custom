@@ -44,6 +44,10 @@ from vllm_ascend.dsa_offload.contracts import (
     DSA_LIDU_OUTPUT_CAPACITY,
     DSA_ROW_MODE_SPARSE,
 )
+from vllm_ascend.dsa_offload.grouped_layout import (
+    expanded_block_table,
+    lane_slots,
+)
 from vllm_ascend.dsa_offload.ops import (
     DSAFusedCopyPlan,
     DSALightningIndexerOutputs,
@@ -362,6 +366,17 @@ class DSAOffloadRuntime:
         # shared indexer 新鲜度守卫：每个执行 view 先清空，再记录最近一次
         # 跑过 LIDU 的 full 层；shared 层据此拒绝跨 step 的陈旧输出。
         self._selection_source_layer: int | None = None
+        # Grouped C8 KV 索引变换的 step 级复用缓存：同一次 forward 内所有层
+        # 共享同一 block_table / slot_mapping，命中条件为 forward epoch +
+        # 源张量身份（强引用保证 id 不被复用）+ _version + shape 全部一致；
+        # 进入新执行 view 时随 selection 守卫一起清空。
+        self._grouped_expand_cache: tuple[
+            int, torch.Tensor, int, tuple[int, ...], torch.Tensor,
+        ] | None = None
+        self._grouped_lane_slot_cache: dict[
+            int,
+            tuple[int, torch.Tensor, int, tuple[int, ...], torch.Tensor],
+        ] = {}
 
     def bind_dram_store(self, store: DSAWorkerDRAMStore) -> None:
         if self.dram_store is not None:
@@ -605,6 +620,57 @@ class DSAOffloadRuntime:
     def _reset_selection_source(self) -> None:
         """进入新的执行 view 前清空上一步的 full 层来源标记。"""
         self._selection_source_layer = None
+        self._grouped_expand_cache = None
+        self._grouped_lane_slot_cache.clear()
+
+    def expanded_block_table_cached(
+        self,
+        block_table: torch.Tensor,
+    ) -> torch.Tensor:
+        """Grouped C8 KV 的 PA block-table 展开；同一次 forward 只算一次。"""
+        entry = self._grouped_expand_cache
+        if (
+            entry is not None
+            and entry[0] == self._forward_epoch
+            and entry[1] is block_table
+            and entry[2] == block_table._version
+            and entry[3] == tuple(block_table.shape)
+        ):
+            return entry[4]
+        expanded = expanded_block_table(block_table)
+        self._grouped_expand_cache = (
+            self._forward_epoch,
+            block_table,
+            block_table._version,
+            tuple(block_table.shape),
+            expanded,
+        )
+        return expanded
+
+    def lane_slots_cached(self, slots: torch.Tensor, lane: int) -> torch.Tensor:
+        """Grouped C8 KV 的 lane slot 映射；同一次 forward 内按 lane 复用。
+
+        只允许用于 step 级共享输入（如 slot_mapping）：组内各层的
+        sparse_indices 内容随 LIDU 逐组改写，不得走此缓存。
+        """
+        entry = self._grouped_lane_slot_cache.get(lane)
+        if (
+            entry is not None
+            and entry[0] == self._forward_epoch
+            and entry[1] is slots
+            and entry[2] == slots._version
+            and entry[3] == tuple(slots.shape)
+        ):
+            return entry[4]
+        mapped = lane_slots(slots, lane)
+        self._grouped_lane_slot_cache[lane] = (
+            self._forward_epoch,
+            slots,
+            slots._version,
+            tuple(slots.shape),
+            mapped,
+        )
+        return mapped
 
     def prepare_forward(
         self,

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm_ascend.dsa_offload.grouped_layout import GroupedResidentCache, expanded_block_table, lane_slots
+from vllm_ascend.dsa_offload.grouped_layout import GroupedResidentCache, lane_slots
 from vllm_ascend.dsa_offload.ops import DSAFusedCopyPlan, dump_full_cache_plane_bytes
 from vllm_ascend.dsa_offload.runtime import DSALayerOffloadContext
 
@@ -17,7 +17,8 @@ class DSAGroupedLayerOffloadContext(DSALayerOffloadContext):
     lane: int
 
     def map_cache_slots(self, slots: torch.Tensor) -> torch.Tensor:
-        return lane_slots(slots, self.lane)
+        # slot_mapping 在同一次 forward 内跨层不变，按 lane 复用映射结果。
+        return self.runtime.lane_slots_cached(slots, self.lane)
 
     def _copy_or_defer_c8(
         self,
@@ -74,7 +75,7 @@ class DSAGroupedLayerOffloadContext(DSALayerOffloadContext):
             sparse_indices=lane_slots(sparse_indices, self.lane).contiguous(),
             scale_value=float(scale_value),
             sparse_block_size=1,
-            block_table=expanded_block_table(block_table),
+            block_table=self.runtime.expanded_block_table_cached(block_table),
             actual_seq_lengths_query=actual_seq_lengths_query,
             # These are entry counts/causal lengths, NOT byte addresses. Do not
             # multiply them by four when translating PA indices.
@@ -128,7 +129,7 @@ class DSAGroupedLayerOffloadContext(DSALayerOffloadContext):
                 plan.outputs.topk_slots.contiguous(),
                 plan.outputs.miss_count.contiguous(),
                 lane_slots(selection.sparse_indices, 0).contiguous(),
-                expanded_block_table(resident_block_table),
+                self.runtime.expanded_block_table_cached(resident_block_table),
                 float(scale_value),
                 output,
             )

@@ -4,7 +4,7 @@
 import dataclasses
 import weakref
 from collections.abc import Callable
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import patch
@@ -280,8 +280,12 @@ class ACLGraphWrapper:
         is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
         if not self.enable_enpu and need_sync:
-            torch.npu.current_stream().synchronize()
-        entry.aclgraph.replay()
+            with (remote.host_range("graph_replay_pre_sync", batch_descriptor.num_reqs)
+                  if remote is not None else nullcontext()):
+                torch.npu.current_stream().synchronize()
+        with (remote.host_range("graph_replay_submit", batch_descriptor.num_reqs)
+              if remote is not None else nullcontext()):
+            entry.aclgraph.replay()
         if remote is not None:
             logger.debug("DSA_SHARED_GRAPH_REPLAY %s epoch=%s batch=%s",
                          remote.identity, remote.prepared_epoch, batch_descriptor)

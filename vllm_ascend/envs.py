@@ -77,6 +77,8 @@ SMOKE_ENV_FIELDS = (
 )
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # 图外 remote decode Host MSTX；0/1，默认0；非敏感，不新增设备同步。
+    "VLLM_ASCEND_DSA_HOST_MSTX": lambda: os.getenv("VLLM_ASCEND_DSA_HOST_MSTX", "0") == "1",
     **{
         name: lambda name=name: os.getenv(name)
         for name in (SMOKE_ENV_PREFIX + field.upper() for field in SMOKE_ENV_FIELDS)

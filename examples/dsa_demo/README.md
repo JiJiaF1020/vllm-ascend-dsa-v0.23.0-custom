@@ -337,3 +337,54 @@ ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash examples/dsa_demo/check_two_node_
 [PASS] node=... completed DP16/EP16 communication preflight
 [PASS] HCCL all_reduce + all_to_all + requested MC2 checks passed
 ```
+## Remote decode 图外 Host MSTX
+
+排查步首同步或首个 MoE 等待时，在原启动命令前设置：
+
+```bash
+export VLLM_ASCEND_DSA_HOST_MSTX=1
+python3 examples/dsa_demo/simple_test_1p.py --remote-shared-config /path/to/remote-shared.json
+```
+
+默认关闭；开关在 worker 创建 RemoteShared 时读取。使用框架内部 profiler 时，设置
+`SmokeConfig.enable_profile=True`（或 `VLLM_ASCEND_SMOKE_ENABLE_PROFILE=1`）；
+内部 `TorchNPUProfilerWrapper` 会用同一个 Host MSTX 开关联动 `msprof_tx` 采集选项，
+无需外部 msprof，也不要再套另一套 profiler。仅设置 Host MSTX 环境变量不会启动
+profiler，不改变 validate/debug 配置；输出位置仍沿用原 `profile_dir/run_name/dp_rank_*`。
+
+从算子仓启动 Pool 和模型时，脚本会继承环境变量。例如只采框架内部 profiler：
+
+```bash
+export VLLM_ASCEND_DSA_HOST_MSTX=1
+export VLLM_ASCEND_SMOKE_ENABLE_PROFILE=1
+python3 tools/profile_pool_inference.py --no-perf \
+  --framework-repo /home/w00919836/scp-va \
+  --remote-config /path/to/remote-shared.json \
+  --output tmp/pool-host-mstx-01
+```
+
+这里 `--no-perf` 只关闭 Pool CPU 的 perf/SPE 采样，不会关闭框架内部 profiler。
+其它 Pool 容量、层数、设备、NUMA 参数继续沿用本次实际配置；框架日志在输出目录的
+`raw/model.log`，框架 trace 仍在上面的 `profile_dir`，不是 Pool 的 overlap CSV。
+
+新增区间使用 `torch_npu.npu.mstx.range_start(..., stream=None)`，只标记 Host，
+不插入设备 Event、同步、D2H 或图内算子。接口语义见
+[官方 MSTX API](https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu-mstx-range_start.md)。
+
+时间线搜索 `DSA_HOST/`；标签包含 host、DP/TP、physical device、epoch 和 batch：
+
+- `prepare_decode`：图外准备总区间。
+  - `metadata_readback`：原预算读回与可选输入检查。
+  - `dump_before_write`：满块检查/实际 PUT；无任务时也有短区间。
+  - `prepare_binding`：原 rows/candidates 读回及绑定检查，内嵌实际触发的 `connect`、`pool_refresh`。
+  - `generation_update`：各层 buffer 准备及 generation 下发。
+- `graph_replay_pre_sync`：已有图每次 replay 前原本需要执行的同步；原路径跳过同步时不出现。
+- `graph_replay_submit`：已有图的 Host replay 调用，不等于设备执行时间。
+- `finish_decode`：步末记账，以及 validate 开启时原有的 status/ticket D2H。
+
+这些区间用于 remote target；不在逐层 forward 或 draft 内加入标记。首次 capture 后的
+首轮 replay 尚未使用上述两个 replay 区间，仍以原 CAPTURE_BEGIN/END 日志定位。
+epoch 是 target forward 编号，不是生成 token 数。嵌套区间不能直接相加；
+长 Host 同步应继续追踪它在等哪个先前设备任务，并对比同轮各 rank 到达第一次 MoE 的时刻。
+默认关闭时不调用 MSTX；打开后仍有 Host 打点成本，需与关闭时对照。
+只更新框架 Python，无需重编 OPP、Torch extension 或 Pool。

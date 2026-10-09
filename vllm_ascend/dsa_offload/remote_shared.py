@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import logging
 import socket
+from contextlib import contextmanager
 
 import torch
 
+from vllm_ascend import envs
 from vllm_ascend.dsa_offload.contracts import DSA_ROW_MODE_SPARSE
 from vllm_ascend.dsa_offload.ops import DSAOffloadSelectionOutput
 
@@ -29,6 +31,11 @@ class RemoteShared:
 
         self.native, self.config, self.runtime, self.plan = custom_ops_lib, config, runtime, plan
         self.identity = f"host={socket.gethostname()} dp={dp_rank} tp={tp_rank} physical={physical_device}"
+        self.host_mstx = None
+        if envs.VLLM_ASCEND_DSA_HOST_MSTX:
+            from torch_npu.npu import mstx
+
+            self.host_mstx = mstx
         self.layers = layers  # (context, packed KV)；只有真实target层，不含MTP proposer。
         self.contexts = {context.layer_id: context for context, _ in layers}
         self.dump_epoch = -1
@@ -66,6 +73,21 @@ class RemoteShared:
                 raise RuntimeError("remote_shared debug requires updated operator extension")
             from vllm_ascend.dsa_offload.remote_shared_debug import RemoteSharedDebugSession
             self.debug = RemoteSharedDebugSession(self, debug_config, dp_rank, tp_rank, physical_device)
+
+    @contextmanager
+    def host_range(self, stage, batch):
+        """仅供图外调用；标签不读Tensor值，stream=None不向设备插入打点任务。"""
+        if self.host_mstx is None:
+            yield
+            return
+        label = (f"DSA_HOST/{stage} {self.identity} "
+                 f"epoch={self.runtime._forward_epoch} batch={batch}")
+        range_id = self.host_mstx.range_start(label, stream=None)
+        try:
+            yield
+        finally:
+            if range_id:
+                self.host_mstx.range_end(range_id)
 
     def validate_requests(self, request_ids, rows):
         """不把同名新请求或新row静默绑定到仍存活的旧session。"""
@@ -171,25 +193,33 @@ class RemoteShared:
         self.step_data = None
         if not metadata.dsa_decode_forward:
             return
+        with self.host_range("prepare_decode", metadata.dsa_resident_pool_indices.numel()):
+            self._prepare_decode(metadata)
+
+    def _prepare_decode(self, metadata):
         rows = metadata.dsa_resident_pool_indices
         candidates = metadata.dsa_candidate_lens
-        budgets = metadata.dsa_sparse_budget_tokens.cpu().tolist()
         b = rows.numel()
-        if self.validate:
-            if metadata.cum_query_lens.cpu().tolist() != [4*(i+1) for i in range(b)]:
-                raise ValueError("remote shared decode requires four queries per request")
-            if metadata.dsa_row_modes.cpu().tolist() != [DSA_ROW_MODE_SPARSE]*b:
-                raise ValueError("remote shared decode requires all rows SPARSE")
-            tail = metadata.seq_lens.cpu() - candidates.cpu()
-            if bool(((tail < 4) | (tail > 256)).any()):
-                raise ValueError("framework causal tail must fit 256 tokens including four queries")
-        self.dump_before_write(metadata)
-        self._prepare_binding(rows, candidates, budgets)
-        for context, _ in self.layers:
-            if context.full_cache is None:
-                self._generation(self._payload(context, b), context.layer_id)
-            elif context.execution_plan.first_payload_layer is not None:
-                self._buffer(context, b)
+        with self.host_range("metadata_readback", b):
+            budgets = metadata.dsa_sparse_budget_tokens.cpu().tolist()
+            if self.validate:
+                if metadata.cum_query_lens.cpu().tolist() != [4*(i+1) for i in range(b)]:
+                    raise ValueError("remote shared decode requires four queries per request")
+                if metadata.dsa_row_modes.cpu().tolist() != [DSA_ROW_MODE_SPARSE]*b:
+                    raise ValueError("remote shared decode requires all rows SPARSE")
+                tail = metadata.seq_lens.cpu() - candidates.cpu()
+                if bool(((tail < 4) | (tail > 256)).any()):
+                    raise ValueError("framework causal tail must fit 256 tokens including four queries")
+        with self.host_range("dump_before_write", b):
+            self.dump_before_write(metadata)
+        with self.host_range("prepare_binding", b):
+            self._prepare_binding(rows, candidates, budgets)
+        with self.host_range("generation_update", b):
+            for context, _ in self.layers:
+                if context.full_cache is None:
+                    self._generation(self._payload(context, b), context.layer_id)
+                elif context.execution_plan.first_payload_layer is not None:
+                    self._buffer(context, b)
         self.prepared_epoch = self.runtime._forward_epoch
         self.step_data = (b, metadata)
 
@@ -216,6 +246,10 @@ class RemoteShared:
         """维护步末记账；仅显式验收模式同步读取设备status/ticket。"""
         if self.step_data is None:
             return
+        with self.host_range("finish_decode", self.step_data[0]):
+            self._finish_decode()
+
+    def _finish_decode(self):
         b, _ = self.step_data
         if self.validate:
             for context, _ in self.layers:
@@ -265,7 +299,8 @@ class RemoteShared:
 
     def _prepare_binding(self, rows, candidates, budgets):
         if self.handle is None:
-            self._connect(rows, candidates, budgets)
+            with self.host_range("connect", rows.numel()):
+                self._connect(rows, candidates, budgets)
         host_rows = rows.cpu().tolist()
         if (not 1 <= len(host_rows) <= len(self.rows) or len(set(host_rows)) != len(host_rows) or
                 any(row not in self.request_ids or row in self.retired for row in host_rows) or
@@ -280,7 +315,8 @@ class RemoteShared:
                 raise RuntimeError("remote candidate D exceeds all-layer PUT_DONE")
             bound = torch.stack((shadow.handles[self.rows], wm.done_versions[self.rows], done), dim=1).contiguous()
             # 缩批/重排用全row APPLIED快照确认旧plan；REFRESH内部同步设备及Host commit。
-            self.native.lis_send_pool_refresh(self.handle, bound)
+            with self.host_range("pool_refresh", rows.numel()):
+                self.native.lis_send_pool_refresh(self.handle, bound)
             self.bound = bound
             wm.acknowledge_binding(torch.tensor(self.rows), bound[:, 1], (bound[:, 2] // 128).int())
             logger.info("DSA_SHARED_REFRESH_OK bound=%s active_rows=%s batch_changed=%s connection_retained=1",

@@ -2642,6 +2642,25 @@ class NPUModelRunner(GPUModelRunner):
                 ):
                     force_dsa_row_mode_eager = True
 
+                if self.dsa_offload_enabled and logger.isEnabledFor(logging.DEBUG):
+                    state = self.input_batch.dsa_cache_layout
+                    logger.debug(
+                        "DSA_GRAPH_GATE role=target dp=%s tp=%s epoch=%s batch=%s "
+                        "tokens=%s query_lengths=%s expected_query_len=%s stages=%s "
+                        "reason=%s gate_full=%s force_dsa_eager=%s enforce_eager=%s "
+                        "cascade=%s encoder_reqs=%s",
+                        self.dp_rank, get_tp_group().rank_in_group,
+                        self.dsa_offload_runtime._forward_epoch, num_reqs,
+                        num_tokens_unpadded, num_scheduled_tokens_np.tolist(),
+                        self.uniform_decode_query_len,
+                        state.stages_cpu[:num_reqs].tolist() if state is not None else None,
+                        dsa_graph_decision.reason if dsa_graph_decision is not None else "row_mode_graph_disabled",
+                        dsa_graph_decision.use_full_graph if dsa_graph_decision is not None else False,
+                        force_dsa_row_mode_eager, self.model_config.enforce_eager,
+                        cascade_attn_prefix_lens is not None,
+                        len(scheduler_output.scheduled_encoder_inputs),
+                    )
+
                 (
                     cudagraph_mode,
                     batch_desc,
@@ -2703,11 +2722,12 @@ class NPUModelRunner(GPUModelRunner):
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
                         "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
-                        "should_ubatch: %s, num_tokens_across_dp: %s",
+                        "should_ubatch: %s, num_tokens_across_dp_shape: %s",
                         cudagraph_mode,
                         batch_desc,
                         should_ubatch,
-                        num_tokens_across_dp,
+                        # Tensor repr can read back device values and sync.
+                        tuple(num_tokens_across_dp.shape) if num_tokens_across_dp is not None else None,
                     )
 
                 num_tokens_padded = batch_desc.num_tokens
@@ -3597,6 +3617,8 @@ class NPUModelRunner(GPUModelRunner):
 
         num_tokens_before_cudagraph = num_tokens_padded
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
+        local_cudagraph_mode = cudagraph_mode
+        synced_cudagraph_mode = None
         num_tokens_padded = batch_descriptor.num_tokens
         if enable_sp(self.vllm_config):
             assert batch_descriptor.num_tokens % self.vllm_config.parallel_config.tensor_parallel_size == 0, (
@@ -3661,6 +3683,19 @@ class NPUModelRunner(GPUModelRunner):
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
+        if self.dsa_offload_enabled and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "DSA_GRAPH_DISPATCH role=target dp=%s tp=%s epoch=%s batch=%s "
+                "tokens=%s all_decode=%s uniform=%s force_eager=%s "
+                "local_mode=%s dp_mode=%s final_mode=%s descriptor=%s "
+                "has_lora=%s encoder=%s cascade=%s force_uniform_decode=%s",
+                self.dp_rank, get_tp_group().rank_in_group,
+                self.dsa_offload_runtime._forward_epoch, num_reqs, num_tokens,
+                bool(is_all_decode), bool(uniform_decode), force_eager,
+                local_cudagraph_mode, synced_cudagraph_mode, cudagraph_mode,
+                batch_descriptor, has_lora, has_encoder_output, use_cascade_attn,
+                force_uniform_decode,
+            )
         if self.synthetic_draft:
             logger.info("DSA_SYNTHETIC_DRAFT_DISPATCH mode=%s uniform=%s descriptor=%s force_eager=%s",
                         cudagraph_mode, uniform_decode, batch_descriptor, force_eager)

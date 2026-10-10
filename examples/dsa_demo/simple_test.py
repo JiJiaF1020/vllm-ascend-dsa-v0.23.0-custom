@@ -87,7 +87,6 @@ NATIVE_RUNTIME_ENV_OVERRIDES = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "VLLM_ASCEND_ENABLE_FUSED_MC2": "0",
     "VLLM_ASCEND_ENABLE_MLAPO": "1",
-    "VLLM_LOGGING_LEVEL": "INFO",
     "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
 }
 
@@ -402,6 +401,7 @@ def run_dp_rank(
 ) -> None:
     # 必须先设置 rank/device 环境，再导入任何 vLLM/torch 模块。
     os.environ.update(NATIVE_RUNTIME_ENV_OVERRIDES)
+    os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
     os.environ.update(
         {
             "VLLM_DP_RANK": str(dp_rank),
@@ -543,6 +543,7 @@ def run_node_dp(config: SmokeConfig, args: argparse.Namespace) -> None:
     master_ip, master_port, sync_port, ranks = resolve_node_launch(config, args)
     # PYTHONHASHSEED 等需要在 spawn 启动解释器前生效；导入底座时不修改环境。
     os.environ.update(NATIVE_RUNTIME_ENV_OVERRIDES)
+    os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
     context = multiprocessing.get_context("spawn")
     barrier = context.Barrier(config.data_parallel_size) if args.node_size == 1 else None
     ep_size = config.tensor_parallel_size * config.data_parallel_size if config.enable_expert_parallel else 1

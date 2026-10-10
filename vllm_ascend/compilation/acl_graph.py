@@ -144,6 +144,7 @@ class ACLGraphWrapper:
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
+        remote = getattr(forward_context, "dsa_remote_runtime", None)
 
         if aclgraph_runtime_mode == CUDAGraphMode.NONE or aclgraph_runtime_mode != self.runtime_mode:
             # CUDAGraphMode.NONE could mean the profile run, a warmup run, or
@@ -152,6 +153,13 @@ class ACLGraphWrapper:
             # matches. This enables properly dispatching to the correct
             # CUDAGraphWrapper when nesting multiple instances with different
             # runtime modes.
+            if remote is not None:
+                logger.debug(
+                    "DSA_SHARED_GRAPH_BYPASS %s epoch=%s role=%s mode=%s wrapper_mode=%s batch=%s",
+                    remote.identity, remote.runtime._forward_epoch,
+                    "draft" if _EXTRA_CTX.is_draft_model else "target",
+                    aclgraph_runtime_mode, self.runtime_mode, batch_descriptor,
+                )
             return self.runnable(*args, **kwargs)
 
         if batch_descriptor not in self.concrete_aclgraph_entries:
@@ -159,12 +167,14 @@ class ACLGraphWrapper:
             self.concrete_aclgraph_entries[batch_descriptor] = ACLGraphEntry(batch_descriptor=batch_descriptor)
 
         entry = self.concrete_aclgraph_entries[batch_descriptor]
-        remote = getattr(forward_context, "dsa_remote_runtime", None)
         if remote is not None:
             remote.validate_graph_inputs(batch_descriptor, forward_context.attn_metadata, args, kwargs)
 
         if entry.aclgraph is None:
             if self.capture_at_runtime and not entry.warmed_up:
+                if remote is not None:
+                    logger.debug("DSA_SHARED_GRAPH_WARMUP %s epoch=%s batch=%s",
+                                 remote.identity, remote.runtime._forward_epoch, batch_descriptor)
                 output = self.runnable(*args, **kwargs)
                 entry.warmed_up = True
                 logger.info("[GLM MTP graph] Runtime warmup: batch=%s", batch_descriptor)
@@ -179,7 +189,8 @@ class ACLGraphWrapper:
             if remote is None and not self.capture_at_runtime:
                 validate_cudagraph_capturing_enabled()
             elif remote is not None:
-                logger.info("DSA_SHARED_GRAPH_CAPTURE_BEGIN %s batch=%s", remote.identity, batch_descriptor)
+                logger.info("DSA_SHARED_GRAPH_CAPTURE_BEGIN %s epoch=%s batch=%s",
+                            remote.identity, remote.prepared_epoch, batch_descriptor)
 
             input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
             entry.input_addresses = input_addresses
@@ -248,8 +259,8 @@ class ACLGraphWrapper:
                 forward_context.capturing = False
                 aclgraph.replay()
                 if remote is not None:
-                    logger.info("DSA_SHARED_GRAPH_CAPTURE_END %s first_replay=1 batch=%s",
-                                remote.identity, batch_descriptor)
+                    logger.info("DSA_SHARED_GRAPH_CAPTURE_END %s epoch=%s first_replay=1 batch=%s",
+                                remote.identity, remote.prepared_epoch, batch_descriptor)
                 else:
                     logger.info("[GLM MTP graph] Runtime capture complete: first_replay=1 batch=%s", batch_descriptor)
 
@@ -279,6 +290,9 @@ class ACLGraphWrapper:
         # When FULL + EAGLE draft (merge path), replay does not need this barrier.
         is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
+        if remote is not None:
+            logger.debug("DSA_SHARED_GRAPH_REPLAY_BEGIN %s epoch=%s pre_sync=%s batch=%s",
+                         remote.identity, remote.prepared_epoch, not self.enable_enpu and need_sync, batch_descriptor)
         if not self.enable_enpu and need_sync:
             with (remote.host_range("graph_replay_pre_sync", batch_descriptor.num_reqs)
                   if remote is not None else nullcontext()):

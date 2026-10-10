@@ -105,11 +105,16 @@ class RemoteShared:
         runtime = self.runtime
         if (not runtime.dump_before_cache_write or not runtime.dump_job_count
                 or self.dump_epoch == runtime._forward_epoch):
+            logger.debug(
+                "DSA_SHARED_PREWRITE_SKIP %s epoch=%s enabled=%s pages_per_layer=%s last_dump_epoch=%s",
+                self.identity, runtime._forward_epoch, runtime.dump_before_cache_write,
+                runtime.dump_job_count, self.dump_epoch,
+            )
             return
         # 已确认满块来自上一轮KV；必须在任一层prolog覆盖双tail之前保存。
         # 图外集中完成所有层PUT，避免源full等待尚未执行的shared层而死锁。
-        logger.info("DSA_SHARED_PREWRITE_BEGIN epoch=%s pages_per_layer=%s",
-                    runtime._forward_epoch, runtime.dump_job_count)
+        logger.info("DSA_SHARED_PREWRITE_BEGIN %s epoch=%s pages_per_layer=%s",
+                    self.identity, runtime._forward_epoch, runtime.dump_job_count)
         for context, packed in self.layers:
             context.dump_full_blocks(
                 resident_cache=(packed,), before_cache_write=True,
@@ -117,7 +122,7 @@ class RemoteShared:
                 full_dump_rows=metadata.dsa_resident_pool_indices,
             )
         self.dump_epoch = runtime._forward_epoch
-        logger.info("DSA_SHARED_PREWRITE_END epoch=%s", self.dump_epoch)
+        logger.info("DSA_SHARED_PREWRITE_END %s epoch=%s", self.identity, self.dump_epoch)
 
     def _connect(self, rows, candidates, budgets):
         host_rows = rows.cpu().tolist()

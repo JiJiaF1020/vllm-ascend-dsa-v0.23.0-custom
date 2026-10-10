@@ -18,6 +18,62 @@ from tests.ut.base import TestBase
 
 
 class TestLoggerModule(TestBase):
+    def test_console_logging_after_file_handler(self):
+        import io
+        import tempfile
+        from unittest.mock import patch
+
+        import vllm_ascend.logger as logger_module
+
+        # Platform installs file logging first; workers may only call the file
+        # entry point. A FileHandler must not count as an initialized console.
+        isolated_logger = logging.Logger("vllm_ascend", logging.WARNING)
+        console = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_handler = logger_module.RotatingAscendFileHandler(tmpdir)
+            isolated_logger.addHandler(file_handler)
+            try:
+                with (
+                    patch.object(logger_module.logging, "getLogger", return_value=isolated_logger),
+                    patch.object(logger_module.envs, "VLLM_LOGGING_LEVEL", "DEBUG"),
+                    patch.object(logger_module.envs, "VLLM_LOGGING_STREAM", "ext://sys.stderr"),
+                    patch.object(logger_module, "_use_color", return_value=False),
+                    patch.object(logger_module.sys, "stderr", console),
+                ):
+                    logger_module.configure_ascend_logging()
+                    logger_module.configure_ascend_logging()
+                    isolated_logger.debug("DSA debug visible")
+                    isolated_logger.info("DSA info visible")
+                self.assertEqual(len(isolated_logger.handlers), 2)
+                self.assertEqual(isolated_logger.level, logging.DEBUG)
+                self.assertFalse(isolated_logger.propagate)
+                self.assertEqual(console.getvalue().count("DSA debug visible"), 1)
+                self.assertEqual(console.getvalue().count("DSA info visible"), 1)
+            finally:
+                for handler in isolated_logger.handlers:
+                    handler.close()
+
+    def test_console_logging_updates_existing_level(self):
+        from unittest.mock import patch
+
+        import vllm_ascend.logger as logger_module
+
+        isolated_logger = logging.Logger("vllm_ascend", logging.INFO)
+        handler = logging.StreamHandler()
+        handler.setLevel(logging.INFO)
+        isolated_logger.addHandler(handler)
+        try:
+            with (
+                patch.object(logger_module.logging, "getLogger", return_value=isolated_logger),
+                patch.object(logger_module.envs, "VLLM_LOGGING_LEVEL", "DEBUG"),
+            ):
+                logger_module.configure_ascend_logging()
+            self.assertEqual(len(isolated_logger.handlers), 1)
+            self.assertEqual(isolated_logger.level, logging.DEBUG)
+            self.assertEqual(handler.level, logging.DEBUG)
+        finally:
+            handler.close()
+
     def test_is_ascend_module_with_ascend_path(self):
         from vllm_ascend.logger import _is_ascend_module
 

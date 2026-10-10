@@ -156,6 +156,8 @@ def _setup_file_logging(log_dir: str | None = None) -> None:
 
 def configure_ascend_file_logging() -> None:
     global _file_logging_configured, _file_handler
+    # Worker initialization can enter here without configure_ascend_logging().
+    configure_ascend_logging()
     log_dir = _LOG_DIR
     try:
         from vllm_ascend.ascend_config import get_ascend_config
@@ -184,8 +186,14 @@ def configure_ascend_logging() -> None:
     This approach is safe for upstream tests and multiprocessing.
     """
     ascend_logger = logging.getLogger("vllm_ascend")
-    if ascend_logger.handlers:
-        return
+    ascend_logger.setLevel(envs.VLLM_LOGGING_LEVEL)
+    ascend_logger.propagate = False
+    # FileHandler is also a StreamHandler: a file installed first must not
+    # suppress console initialization or leave the namespace at root's level.
+    for existing in ascend_logger.handlers:
+        if isinstance(existing, logging.StreamHandler) and not isinstance(existing, logging.FileHandler):
+            existing.setLevel(envs.VLLM_LOGGING_LEVEL)
+            return
 
     # Parse stream parameter
     if envs.VLLM_LOGGING_STREAM == "ext://sys.stdout":

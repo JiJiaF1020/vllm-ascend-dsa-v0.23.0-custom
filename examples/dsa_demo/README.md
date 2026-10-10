@@ -388,3 +388,45 @@ epoch 是 target forward 编号，不是生成 token 数。嵌套区间不能直
 长 Host 同步应继续追踪它在等哪个先前设备任务，并对比同轮各 rank 到达第一次 MoE 的时刻。
 默认关闭时不调用 MSTX；打开后仍有 Host 打点成本，需与关闭时对照。
 只更新框架 Python，无需重编 OPP、Torch extension 或 Pool。
+
+### 排查某一步未重放 target FULL 图
+
+在启动 frontend/worker **之前**设置，重启进程生效：
+
+```bash
+export VLLM_LOGGING_LEVEL=DEBUG
+export VLLM_ASCEND_DSA_HOST_MSTX=1
+python3 examples/dsa_demo/simple_test_1p.py --remote-shared-config /path/to/remote-shared.json \
+  > model-debug.log 2>&1
+rg 'DSA_GRAPH_|DSA_SHARED_(CONNECT|PREWRITE|REFRESH|GRAPH_)|GLM MTP graph' model-debug.log
+```
+
+经 `profile_pool_inference.py` 启动时同样继承上述环境变量，查看其 `raw/model.log`。
+demo 不再把显式设置的 DEBUG 覆盖成 INFO。Ascend 文件日志先初始化也不会再阻止
+console handler 初始化；worker 只调用文件日志入口时也会配置 console。RemoteShared
+的普通 `logger.info` 没有 rank0 限制；`CONNECT_OK` 每次连接打印，并非每步打印。
+日志默认还写入 `~/ascend/log/vllm_ascend/`（可由 `ascend_log_path` 修改）。
+
+按同一 DP/TP、epoch 关联下列记录，不要仅凭 stream ID 或 Python forward 标签认定断图：
+
+| 标记 | 用途 |
+| --- | --- |
+| `DSA_GRAPH_GATE` | target 本地准入：实际每请求 query 长度、阶段、reason，以及 enforce-eager/cascade/encoder 阻断条件 |
+| `DSA_GRAPH_DISPATCH` | 本地 `local_mode`、DP 协同的 `dp_mode`、最终 `final_mode` 与 capture descriptor；DP1 的 dp_mode 为 None |
+| `DSA_SHARED_GRAPH_BYPASS` | 当前 wrapper 直接调用 runnable；NONE 表示未走图，wrapper mode 不匹配也会经过此分支，不能单独推断所有嵌套图都未执行 |
+| `DSA_SHARED_GRAPH_WARMUP` / `CAPTURE_BEGIN/END` | eager warmup 或真实 capture；这时存在 Python forward 属于预期，END 的 first_replay=1 表示首次重放已提交 |
+| `DSA_SHARED_GRAPH_REPLAY_BEGIN` / `DSA_SHARED_GRAPH_REPLAY` | 缓存图 replay 前/提交返回；前者含 pre_sync，夹在中间的长时间结合 MSTX 判断是在等同步还是提交；不是设备完成日志 |
+| `DSA_SHARED_PREWRITE_SKIP` / `PREWRITE_BEGIN/END` | 区分没有 dump 任务、已处理本 epoch，与实际进入满块保存；包含 rank/epoch |
+
+例如本 rank `local_mode=FULL`、`dp_mode=NONE`、`final_mode=NONE`，应继续找其它
+DP rank 同轮的 gate/dispatch，而不是归因于“某个 rank 太慢”；协调规则按模式而非耗时降级。
+`reason=non_uniform_decode` 应核对 query_lengths；`remote_exact_shape_required` 核对
+capture sizes；`remote_decode_warmup` 是该 batch shape 尚未预热。
+`DSA_GRAPH_DISPATCH` 也可能来自 dummy 调度；真实 target 轮次还应有对应 GATE，
+epoch 是本 rank 的 forward 计数，不保证不同 rank 永远一一相等。
+
+本次只新增 Host 日志，未修改门禁、图内算子、stream/event、FX 参数或外部注册地址。
+日志使用现有 Host 元数据，不增加 Tensor 回读；普通 batch DEBUG 日志也不再打印
+`num_tokens_across_dp` 的设备内容，仅打印 shape，避免 Tensor repr 隐式同步。
+DEBUG 本身会增加文件/console I/O，并启用原有 graph 输入地址检查，**只用于定位，
+不能拿这一轮的时延作为性能基线**。本机无法验证实际 NPU replay，请以远端日志和 MSTX 为准。

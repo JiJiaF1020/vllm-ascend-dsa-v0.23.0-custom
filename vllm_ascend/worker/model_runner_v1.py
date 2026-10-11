@@ -848,7 +848,7 @@ class NPUModelRunner(GPUModelRunner):
             return evaluate_remote_decode_graph(
                 decision, num_tokens=total_num_scheduled_tokens,
                 capture_sizes=self.compilation_config.cudagraph_capture_sizes,
-                warmed=remote is not None and num_reqs in remote.warmed_batches,
+                warmed=remote is not None and bool(remote.warmed_batches),
             )
         return decision
 
@@ -4242,6 +4242,8 @@ class NPUModelRunner(GPUModelRunner):
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
         remote_idle = (self._remote_decode_graph_enabled() and uniform_decode
                        and not is_profile and not profile_cpp and not force_attention and not is_graph_capturing)
+        remote_idle_connected = (remote_idle and self.dsa_offload_runtime.remote_shared.handle is not None
+                                 and bool(self.dsa_offload_runtime.remote_shared.warmed_batches))
         _cudagraph_mode, batch_desc, _, num_tokens_across_dp, _ = self._determine_batch_execution_and_padding(
             num_tokens=num_tokens_unpadded,
             num_reqs=num_reqs,
@@ -4250,7 +4252,7 @@ class NPUModelRunner(GPUModelRunner):
             use_cascade_attn=False,
             allow_microbatching=allow_microbatching,
             force_eager=(is_profile or (cudagraph_runtime_mode == CUDAGraphMode.NONE) or profile_cpp
-                         or (self._remote_decode_graph_enabled() and not remote_idle)),
+                         or (self._remote_decode_graph_enabled() and not remote_idle_connected)),
             # `force_uniform_decode` is used for cudagraph capture; because for
             # capturing mixed prefill-decode batches, we sometimes use
             # num_tokens == num_reqs which looks like a uniform decode batch to the

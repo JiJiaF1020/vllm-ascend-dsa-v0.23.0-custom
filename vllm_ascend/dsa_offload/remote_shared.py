@@ -4,7 +4,7 @@
 注册command/reply/completion只由算子runtime持有。这里的Tensor均为普通caller-owned
 输入输出；不把远端GVA变成Tensor。首次decode绑定一批真实MTP3请求，允许缩批/重排，
 模型允许padding，远端节点只处理真实请求前缀；不支持新请求补入或row复用。
-图按(模型BatchDescriptor, active B)特化；结束请求的绑定保留到worker shutdown。
+图仅按模型BatchDescriptor缓存；设备rows=-1标识PAD，结束请求绑定保留到worker shutdown。
 
 remote_shared配置中validate默认False；显式True或开启debug时恢复Host验收检查。
 关闭验收不取消设备completion/APPLIED、PUT_DONE/绑定和图地址生命周期检查。
@@ -18,7 +18,7 @@ from contextlib import contextmanager
 import torch
 
 from vllm_ascend import envs
-from vllm_ascend.dsa_offload.contracts import DSA_ROW_MODE_SPARSE
+from vllm_ascend.dsa_offload.contracts import DSA_ROW_MODE_PAD, DSA_ROW_MODE_SPARSE
 from vllm_ascend.dsa_offload.ops import DSAOffloadSelectionOutput
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,8 @@ class RemoteShared:
         from kvcache_scatter_copy_custom_ops import custom_ops_lib
 
         self.native, self.config, self.runtime, self.plan = custom_ops_lib, config, runtime, plan
+        if graph_enabled and getattr(self.native, "lis_send_padding_version", lambda: 0)() < 1:
+            raise RuntimeError("remote fixed-capacity graph requires PAD-aware extension and matching C8/ordinary OPP")
         self.identity = f"host={socket.gethostname()} dp={dp_rank} tp={tp_rank} physical={physical_device}"
         self.host_mstx = None
         if envs.VLLM_ASCEND_DSA_HOST_MSTX:
@@ -169,7 +171,7 @@ class RemoteShared:
         logger.info("DSA_SHARED_CONNECT_OK %s wire=5 backend=real_store groups=%s", self.identity, len(self.plan.groups))
 
     def _buffer(self, context, batch):
-        # 图持有每种batch的地址；缩批不能删除已经捕获的buffer。
+        # 按图容量而非active B持有地址；同容量缩批只更新输入值。
         key = (context.execution_plan.group, batch)
         if key not in self.buffers:
             device = self.runtime.device
@@ -180,6 +182,7 @@ class RemoteShared:
                 full=empty((batch*4, 1, 2304), torch.int32),
                 ticket=torch.zeros(((batch+15)//16, 2), dtype=torch.int64, device=device),
                 maximum=empty((1,), torch.float32), total=empty((1,), torch.float32),
+                rows=empty((batch,), torch.int32),
                 tail_info=empty((batch, 2), torch.int32))
         return self.buffers[key]
 
@@ -211,7 +214,13 @@ class RemoteShared:
         logger.debug("DSA_SHARED_GRAPH_ROWS %s epoch=%s active=%s graph_rows=%s pad=%s remote_commands_per_layer=%s",
                      self.identity, self.runtime._forward_epoch, b, graph_b, graph_b-b, (b+15)//16)
         if b == 0:
-            # serving idle图只维持模型/集合通信，不建链、不刷新、不发命令。
+            # 已连接rank可在同容量图中replay全PAD；从未建链的idle仍仅走eager。
+            if self.handle is not None:
+                for context, _ in self.layers:
+                    if context.full_cache is None:
+                        self._generation(self._payload(context, graph_b), context.layer_id)
+                    elif context.execution_plan.first_payload_layer is not None:
+                        self._buffer(context, graph_b)
             self.prepared_epoch = self.runtime._forward_epoch
             self.step_data = (0, metadata)
             return
@@ -234,9 +243,9 @@ class RemoteShared:
         with self.host_range("generation_update", b):
             for context, _ in self.layers:
                 if context.full_cache is None:
-                    self._generation(self._payload(context, b), context.layer_id)
+                    self._generation(self._payload(context, graph_b), context.layer_id)
                 elif context.execution_plan.first_payload_layer is not None:
-                    self._buffer(context, b)
+                    self._buffer(context, graph_b)
         self.prepared_epoch = self.runtime._forward_epoch
         self.step_data = (b, metadata)
 
@@ -269,7 +278,7 @@ class RemoteShared:
             self._finish_decode()
 
     def _finish_decode(self):
-        b, _ = self.step_data
+        b, metadata = self.step_data
         if b == 0:
             self.step_data = None
             return
@@ -277,7 +286,7 @@ class RemoteShared:
             for context, _ in self.layers:
                 if context.full_cache is not None:
                     continue
-                data = self._payload(context, b)
+                data = self._payload(context, metadata.dsa_resident_pool_indices.numel())
                 self._check_status(data, context.layer_id)
                 if context.execution_plan.applied:
                     self._check_ticket(data, "APPLIED")
@@ -296,10 +305,10 @@ class RemoteShared:
                 or self.prepared_epoch != self.runtime._forward_epoch):
             raise RuntimeError("remote FULL graph requires prepared decode/idle metadata; startup dummy is forbidden")
         b = self.step_data[0]
-        if b != self.runtime.active_num_reqs or key[1] != b:
-            raise RuntimeError("remote graph specialization does not match active batch")
-        if b and (self.handle is None or b not in self.warmed_batches):
-            raise RuntimeError("remote active graph requires connected, warmed real decode")
+        if b != self.runtime.active_num_reqs:
+            raise RuntimeError("remote prepared metadata does not match active batch")
+        if self.handle is None or not self.warmed_batches:
+            raise RuntimeError("remote graph requires an existing connection and one warmed real decode")
         signature = []
 
         def record(name, value):
@@ -352,7 +361,7 @@ class RemoteShared:
     def _check_status(self, data, layer):
         if not self.validate:
             return
-        status = data["status"].cpu()
+        status = data["status"].cpu()[:self.runtime.active_num_reqs]
         expected = data["generation"].cpu().repeat_interleave(16)[:status.shape[0]]
         if not torch.equal(status[:, 0], expected) or bool(status[:, 1].any()):
             raise RuntimeError(f"ScatterSFA failed at layer {layer}: {status.tolist()}")
@@ -366,19 +375,15 @@ class RemoteShared:
     def _check_ticket(self, data, phase):
         if not self.validate:
             return
-        ticket = data["ticket"].cpu()
-        if not torch.equal(ticket[:, 0], data["generation"].cpu()) or bool(ticket[:, 1].any()):
+        groups = (self.runtime.active_num_reqs + 15) // 16
+        ticket = data["ticket"].cpu()[:groups]
+        if not torch.equal(ticket[:, 0], data["generation"].cpu()[:groups]) or bool(ticket[:, 1].any()):
             raise RuntimeError(f"{phase} submission failed: {ticket.tolist()}")
 
     def select(self, context, query, weights, scale, actual_q, rows, candidates, visible, row_modes, table, budgets):
-        graph_b = rows.numel()
-        b = self.runtime.active_num_reqs if self.graph_enabled else graph_b
-        if not 0 < b <= graph_b or query.shape != (4*graph_b, 32, 128):
-            raise ValueError("remote shared decode requires MTP3 Q=4 and a nonempty real request prefix")
-        # 前缀view不搬运Tensor，不把PAD row或PAD mirror交给远端算子。
-        query, weights, scale = query[:4*b], weights[:4*b], scale[:4*b]
-        actual_q, rows, candidates = actual_q[:b], rows[:b], candidates[:b]
-        visible, row_modes, table, budgets = visible[:b], row_modes[:b], table[:b], budgets[:b]
+        b = rows.numel()
+        if not 0 < b <= 32 or query.shape != (4*b, 32, 128):
+            raise ValueError("remote shared decode requires fixed MTP3 Q=4 capacity B=1..32")
         pool = self.runtime.resident_token_pool
         if self.graph_enabled:
             if self.prepared_epoch != self.runtime._forward_epoch:
@@ -395,6 +400,10 @@ class RemoteShared:
                 if bool(((tail_length < 4) | (tail_length > 256)).any()):
                     raise ValueError("framework causal tail must fit 256 tokens including four queries")
         data = self._buffer(context, b)
+        # 图内按设备row_modes生成固定地址的PAD哨兵；不读取Host active B，
+        # 不把本地padding_pool_index伪装成远端已绑定row。
+        data["rows"].copy_(torch.where(row_modes == DSA_ROW_MODE_PAD, -1, rows))
+        rows = data["rows"]
         payload_context = self.contexts[context.execution_plan.first_payload_layer]
         payload = self._payload(payload_context, b)
         if not self.graph_enabled:
@@ -415,7 +424,7 @@ class RemoteShared:
         data["full"][:, :, :2048].copy_(data["logical"])
         data["full"][:, :, 2048:].copy_(tail)
         data["prepared"][:, :, 2048:].copy_(torch.where(tail >= 0, self.budget + (tail & 255), -1))
-        data.update(rows=rows, actual_q=actual_q, context=context, epoch=self.runtime._forward_epoch)
+        data.update(actual_q=actual_q, context=context, epoch=self.runtime._forward_epoch)
         self.current = data
         self.runtime._selection_source_layer = context.layer_id
         if not self.graph_enabled:
@@ -457,20 +466,16 @@ class RemoteShared:
             return torch.zeros((*query.shape[:-1], 512), dtype=query.dtype, device=query.device)
         payload = self._payload(context, b)
         out = torch.empty((*query.shape[:-1], 512), dtype=query.dtype, device=query.device)
-        active_out = out[:4*b]
-        # 只填PAD输出；真实前缀由ScatterSFA覆盖。下游o_proj/MoE仍执行完整padding尺寸。
-        if out.shape[0] > 4*b:
-            out[4*b:].zero_()
         torch.ops.nanovllm_dsa.copy_sfa_mtp_c8_out(
-            query[:4*b].contiguous(), packed, data["prepared"], table[:b].contiguous(), actual_q[:b], data["rows"],
+            query.contiguous(), packed, data["prepared"], table.contiguous(), actual_q, data["rows"],
             payload["generation"], data["ticket"],
             self.runtime.resident_token_pool.get_cache_slots(context.execution_plan.group),
-            scale, active_out, data["maximum"], data["total"], payload["status"],
+            scale, out, data["maximum"], data["total"], payload["status"],
             context.execution_plan.mirror_writer == "scatter_sfa")
-        self.previous_out = active_out
+        self.previous_out = out
         self.previous_status = payload["status"]
         if context.execution_plan.applied:
-            torch.ops.custom.remote_du_applied_out(active_out, data["rows"], payload["generation"],
+            torch.ops.custom.remote_du_applied_out(out, data["rows"], payload["generation"],
                                                   payload["status"], data["ticket"])
             if not self.graph_enabled:
                 self._check_ticket(payload, "APPLIED")

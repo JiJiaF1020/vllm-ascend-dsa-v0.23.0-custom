@@ -964,7 +964,7 @@ class DSALayerOffloadContext:
         sparse_budget_tokens: torch.Tensor | None = None,
     ) -> DSAOffloadSelectionOutput | torch.Tensor:
         remote = self.runtime.remote_shared
-        if remote is not None and remote.graph_enabled and self.runtime.active_num_reqs == 0:
+        if remote is not None and remote.graph_enabled and remote.handle is None and self.runtime.active_num_reqs == 0:
             return remote.idle_selection(self, resident_pool_indices, actual_seq_lengths_key)
         if self.full_cache is not None:
             from vllm_ascend.dsa_offload.ops import quant_lightning_indexer_topk
@@ -1231,7 +1231,7 @@ class DSALayerOffloadContext:
         query_rope: torch.Tensor,
     ) -> torch.Tensor:
         remote = self.runtime.remote_shared
-        if remote is not None and remote.graph_enabled and self.runtime.active_num_reqs == 0:
+        if remote is not None and remote.graph_enabled and remote.handle is None and self.runtime.active_num_reqs == 0:
             # 只跳过attention，不跳过forward后续o_proj/MoE的TP/EP集合通信。
             return torch.zeros_like(query)
         if self.runtime.remote_shared is not None and self.full_cache is None:
@@ -1245,13 +1245,6 @@ class DSALayerOffloadContext:
             if resident_seq_lengths is None:
                 raise RuntimeError("DSA A5 C8 selection has no resident sequence lengths")
             packed_query = torch.cat([query, query_rope], dim=-1)
-            query_rows = packed_query.shape[0]
-            if remote is not None and remote.graph_enabled:
-                # source full的选择只包含真实B；原生SFA也使用相同前缀。
-                b = self.runtime.active_num_reqs
-                packed_query = packed_query[:4*b]
-                resident_block_table = resident_block_table[:b]
-                actual_seq_lengths_query = actual_seq_lengths_query[:b]
             result = sparse_flash_attention_for_offload_c8(
                 query=packed_query,
                 packed_kv=resident_cache[0],
@@ -1261,11 +1254,6 @@ class DSALayerOffloadContext:
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 resident_seq_lengths=resident_seq_lengths,
             )
-            if result.shape[0] < query_rows:
-                padded = result.new_empty((query_rows, *result.shape[1:]))
-                padded[:result.shape[0]].copy_(result)
-                padded[result.shape[0]:].zero_()
-                result = padded
             if self.runtime.ready_shadow is not None:
                 self.runtime.ready_shadow.after_attention(
                     self, packed_query, resident_cache[0], result, scale_value)

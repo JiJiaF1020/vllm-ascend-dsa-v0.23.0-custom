@@ -253,15 +253,15 @@ python examples/dsa_demo/simple_test_1p.py --remote-shared-config /绝对路径/
 
 每层generation/status独立，generation每step在图外H2D；已捕获shape的buffer保留到关闭。
 PUT/PUT_DONE、REFRESH仍在图外，保留必要的Host同步。
-真实请求均预热、均为Q=4时允许向上匹配capture size，DP间真实B可以不同。
+连接完成一次真实decode预热、真实query均为Q=4时允许向上匹配capture size，DP间真实B可以不同。
 模型/MoE按原生dispatcher统一padding；LISSend、GATHER_ONLY、ScatterSFA、APPLIED
 只使用真实请求前缀，不创建远端PAD请求，也不修改PAD mirror或等待PAD completion。
-source full的SFA消费同一个真实前缀，输出补零至模型图尺寸；普通full的原生LI/SFA保持原路径。
-图缓存键为`(BatchDescriptor, active B)`，同一个padding尺寸的B=6和B=5不能共用远端图。
-稳定pool row重排仍由设备Tensor传入，不固化row编号；首次出现新的真实B仍先eager预热，
-之后延迟捕获。真实B已预热、但DP最大尺寸变化时，可能再捕获一个图变体。
-零请求DP使用`active=0`独立idle图：跳过LI选择/远端IO/attention，保留prolog及后续
-o_proj/MoE集合通信；Indexer写入跳过，KV prolog使用原生PAD slot=-1语义。
+所有图内Tensor保留容量尺寸，设备rows=-1表示PAD，不再按active B切片。
+source full的SFA也保留容量，沿用原生seq_lens/padding；普通full的原生LI/SFA保持原路径。
+图缓存键仅为`BatchDescriptor`，同容量B=6/5/3/0共用同一张图；真实row重排也是设备输入值。
+只有模型capture容量变化才可能产生新图，单纯缩批不再要求新的eager warmup。
+已建链零请求DP在同容量图中跳过远端数学/IO/索引更新，保留prolog和o_proj/MoE集合通信；
+从未建链的idle仍eager。Indexer/KV写入沿用原生PAD slot=-1语义，不冻结capture时token数。
 启动期profile/capture不会因此建链，idle也不占用Pool row。
 Q不足4、非SPARSE、新请求补入和row复用等原远端限制没有因此解除。
 图内地址变化会明确报错，不会静默使用旧metadata。
@@ -270,10 +270,12 @@ Q不足4、非SPARSE、新请求补入和row复用等原远端限制没有因此
 再扩大到DP4/TP2。`VLLM_LOGGING_LEVEL=DEBUG`下检查
 `DSA_SHARED_GRAPH_ROWS active=5 graph_rows=6 pad=1 remote_commands_per_layer=1`，
 以及各rank的`DSA_GRAPH_DISPATCH final_mode=FULL`、`DSA_SHARED_GRAPH_REPLAY active=...`。
-首次新B的`remote_decode_warmup`可以出现；预热后不应仅因为DP间B不同持续eager。
+首次连接的`remote_decode_warmup`可以出现；其后不应仅因为同容量下B变化重复warmup/capture。
 idle应为`active=0 ... remote_commands_per_layer=0`，且Pool没有该rank新增GET/APPLIED。
 开`validate`核对真实请求status，eager/graph分别检查相同逻辑KV及输出；性能轮关闭validate/debug。
-需要在设备上检查PAD slot、图variant的实际地址、流归属和completion代数，不能只看FULL日志。
+需要在设备上检查PAD slot、实际地址、流归属和completion代数，不能只看FULL日志。
+本版须同时部署算子仓extension、C8 OPP和普通AIV OPP（APPLIED/GATHER_ONLY），Pool不变；
+旧进程/图不可复用。详细设备合同及单算子动态B命令见算子仓`docs/dynamic_batch_graph.md`。
 
 `--remote-shared-config` JSON顶层可设置`"validate": true`恢复Host验收检查，默认False。
 默认不做逐层ticket/status的同步D2H，也不做prepare/select中的累计query、SPARSE模式及

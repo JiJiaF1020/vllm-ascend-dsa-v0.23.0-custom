@@ -57,7 +57,7 @@ def evaluate_remote_decode_graph(
     decision: DSARowModeGraphDecision, *, num_tokens: int,
     capture_sizes: list[int], warmed: bool,
 ) -> DSARowModeGraphDecision:
-    """模型允许向上padding；远端节点按真实B特化，不发送PAD请求。"""
+    """模型向上padding，设备过滤PAD；连接预热一次后同容量图允许改变真实B。"""
     if not decision.use_full_graph:
         return decision
     if not any(size >= num_tokens for size in capture_sizes):

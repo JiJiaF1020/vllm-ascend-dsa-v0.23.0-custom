@@ -118,7 +118,7 @@ class ACLGraphWrapper:
         self.aclgraph_options = cudagraph_options
         # the entries for different batch descriptors that we need to capture
         # aclgraphs for.
-        self.concrete_aclgraph_entries: dict[BatchDescriptor | tuple[BatchDescriptor, int], ACLGraphEntry] = {}
+        self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
         self.enable_enpu = enable_enpu
         self.use_eagle = use_eagle
         # 仅独立GLM MTP图启用：远端target跳过启动期capture，每个图key先
@@ -162,9 +162,8 @@ class ACLGraphWrapper:
                 )
             return self.runnable(*args, **kwargs)
 
-        # 相同模型padding尺寸下，真实B决定远端命令数及静态Tensor前缀。
-        # 不能用B=6捕获的URMA节点重放B=5；idle(B=0)也必须独立。
-        graph_key = batch_descriptor if remote is None else (batch_descriptor, remote.runtime.active_num_reqs)
+        # 远端算子在设备上读取rows=-1过滤PAD；active B不进入图key或Tensor shape。
+        graph_key = batch_descriptor
         if graph_key not in self.concrete_aclgraph_entries:
             # create a new entry for this batch descriptor
             self.concrete_aclgraph_entries[graph_key] = ACLGraphEntry(batch_descriptor=batch_descriptor)

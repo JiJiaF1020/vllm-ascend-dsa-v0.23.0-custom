@@ -1945,7 +1945,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             dsa_context is not None and dsa_context.runtime.remote_shared is not None
             and dsa_context.runtime.remote_shared.graph_enabled and attn_metadata.dsa_decode_forward
         )
-        remote_idle = remote_decode_prepared and dsa_context.runtime.active_num_reqs == 0
+        # 捕获后真实token数可变；与原生路径一致，让slot=-1过滤PAD写入。
+        cache_write_tokens = num_input_tokens if remote_decode_prepared else attn_metadata.num_actual_tokens
         if dsa_context is not None and not remote_decode_prepared:
             if kv_cache is None:
                 raise RuntimeError("DSA full-block dump requires a resident cache")
@@ -2147,8 +2148,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                     if self.enable_sparse_sfa_c8:
                         torch_npu.npu_scatter_nd_update_(
                             kv_cache[0].view(-1, fused_kv_no_split.shape[-1]),
-                            slot_mapping_sfa[: attn_metadata.num_actual_tokens].view(-1, 1),
-                            fused_kv_no_split[: attn_metadata.num_actual_tokens],
+                            slot_mapping_sfa[:cache_write_tokens].view(-1, 1),
+                            fused_kv_no_split[:cache_write_tokens],
                         )
                         k_pe = None
                         k_nope = None
@@ -2163,11 +2164,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                         k_nope = k_nope.view(k_nope.shape[0], 1, -1)
                         k_pe = k_pe.view(k_pe.shape[0], 1, -1)
                         DeviceOperator.reshape_and_cache(
-                            key=k_nope[: attn_metadata.num_actual_tokens],
-                            value=k_pe[: attn_metadata.num_actual_tokens],
+                            key=k_nope[:cache_write_tokens],
+                            value=k_pe[:cache_write_tokens],
                             key_cache=kv_cache[0],
                             value_cache=kv_cache[1],
-                            slot_mapping=slot_mapping_sfa[: attn_metadata.num_actual_tokens],
+                            slot_mapping=slot_mapping_sfa[:cache_write_tokens],
                         )
 
             # DCP's prefill path may all-gather only the blocks referenced by
@@ -2183,14 +2184,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         if kv_cache is not None and self.is_kv_producer:
             attn_metadata.reshape_cache_event = torch.npu.Event()
 
-        if kv_cache is not None and self.has_indexer and not remote_idle:
+        if kv_cache is not None and self.has_indexer:
             assert k_li is not None
             dsa_context = self.dsa_offload_context
             if dsa_context is not None:
                 indexer_slot_mapping = attn_metadata.dsa_indexer_slot_mapping
                 if indexer_slot_mapping is None:
                     raise RuntimeError("DSA Indexer cache write is missing its independent slot mapping")
-                num_actual_tokens = attn_metadata.num_actual_tokens
+                # 与原生PAD scatter相同，slot=-1不写cache；图中不能固化真实token数。
+                num_actual_tokens = k_li.shape[0] if remote_decode_prepared else attn_metadata.num_actual_tokens
                 if dsa_context.packed_c8:
                     if (
                         not isinstance(dsa_context.indexer_cache, tuple)

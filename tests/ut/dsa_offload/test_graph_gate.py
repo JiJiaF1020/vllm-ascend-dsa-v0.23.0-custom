@@ -168,7 +168,7 @@ def test_remote_mtp3_exact_batch_requires_real_warmup(batch) -> None:
 
 
 @pytest.mark.parametrize("tokens", [4, 12, 20, 24, 28, 32, 68, 124, 128])
-def test_remote_allows_padding_after_real_batch_warmup(tokens) -> None:
+def test_remote_allows_padding_after_connection_warmup(tokens) -> None:
     eligible = DSARowModeGraphDecision(True, "allow_row_mode_decode")
     assert evaluate_remote_decode_graph(eligible, num_tokens=tokens, capture_sizes=[32, 64, 128], warmed=True) is eligible
     result = evaluate_remote_decode_graph(eligible, num_tokens=tokens, capture_sizes=[32, 64, 128], warmed=False)

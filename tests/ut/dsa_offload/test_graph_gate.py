@@ -167,10 +167,18 @@ def test_remote_mtp3_exact_batch_requires_real_warmup(batch) -> None:
     assert evaluate_remote_decode_graph(decision, num_tokens=batch * 4, capture_sizes=sizes, warmed=True).use_full_graph
 
 
-def test_remote_does_not_pad_or_override_prefill_gate() -> None:
+@pytest.mark.parametrize("tokens", [4, 12, 20, 24, 28, 32, 68, 124, 128])
+def test_remote_allows_padding_after_real_batch_warmup(tokens) -> None:
     eligible = DSARowModeGraphDecision(True, "allow_row_mode_decode")
-    result = evaluate_remote_decode_graph(eligible, num_tokens=28, capture_sizes=[32, 64, 128], warmed=True)
-    assert result.reason == "remote_exact_shape_required" and result.is_expected_eager
+    assert evaluate_remote_decode_graph(eligible, num_tokens=tokens, capture_sizes=[32, 64, 128], warmed=True) is eligible
+    result = evaluate_remote_decode_graph(eligible, num_tokens=tokens, capture_sizes=[32, 64, 128], warmed=False)
+    assert result.reason == "remote_decode_warmup"
+
+
+def test_remote_padding_does_not_override_prefill_or_capacity_gate() -> None:
+    eligible = DSARowModeGraphDecision(True, "allow_row_mode_decode")
+    result = evaluate_remote_decode_graph(eligible, num_tokens=132, capture_sizes=[32, 64, 128], warmed=True)
+    assert result.reason == "capture_size_miss" and result.is_expected_eager
     prefill = DSARowModeGraphDecision(False, "non_decode_stage")
     assert evaluate_remote_decode_graph(prefill, num_tokens=128, capture_sizes=[128], warmed=True) is prefill
 

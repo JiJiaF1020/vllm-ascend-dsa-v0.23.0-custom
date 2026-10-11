@@ -118,7 +118,7 @@ class ACLGraphWrapper:
         self.aclgraph_options = cudagraph_options
         # the entries for different batch descriptors that we need to capture
         # aclgraphs for.
-        self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
+        self.concrete_aclgraph_entries: dict[BatchDescriptor | tuple[BatchDescriptor, int], ACLGraphEntry] = {}
         self.enable_enpu = enable_enpu
         self.use_eagle = use_eagle
         # 仅独立GLM MTP图启用：远端target跳过启动期capture，每个图key先
@@ -162,13 +162,16 @@ class ACLGraphWrapper:
                 )
             return self.runnable(*args, **kwargs)
 
-        if batch_descriptor not in self.concrete_aclgraph_entries:
+        # 相同模型padding尺寸下，真实B决定远端命令数及静态Tensor前缀。
+        # 不能用B=6捕获的URMA节点重放B=5；idle(B=0)也必须独立。
+        graph_key = batch_descriptor if remote is None else (batch_descriptor, remote.runtime.active_num_reqs)
+        if graph_key not in self.concrete_aclgraph_entries:
             # create a new entry for this batch descriptor
-            self.concrete_aclgraph_entries[batch_descriptor] = ACLGraphEntry(batch_descriptor=batch_descriptor)
+            self.concrete_aclgraph_entries[graph_key] = ACLGraphEntry(batch_descriptor=batch_descriptor)
 
-        entry = self.concrete_aclgraph_entries[batch_descriptor]
+        entry = self.concrete_aclgraph_entries[graph_key]
         if remote is not None:
-            remote.validate_graph_inputs(batch_descriptor, forward_context.attn_metadata, args, kwargs)
+            remote.validate_graph_inputs(graph_key, forward_context.attn_metadata, args, kwargs)
 
         if entry.aclgraph is None:
             if self.capture_at_runtime and not entry.warmed_up:
@@ -189,8 +192,8 @@ class ACLGraphWrapper:
             if remote is None and not self.capture_at_runtime:
                 validate_cudagraph_capturing_enabled()
             elif remote is not None:
-                logger.info("DSA_SHARED_GRAPH_CAPTURE_BEGIN %s epoch=%s batch=%s",
-                            remote.identity, remote.prepared_epoch, batch_descriptor)
+                logger.info("DSA_SHARED_GRAPH_CAPTURE_BEGIN %s epoch=%s active=%s batch=%s",
+                            remote.identity, remote.prepared_epoch, remote.runtime.active_num_reqs, batch_descriptor)
 
             input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
             entry.input_addresses = input_addresses
@@ -259,8 +262,8 @@ class ACLGraphWrapper:
                 forward_context.capturing = False
                 aclgraph.replay()
                 if remote is not None:
-                    logger.info("DSA_SHARED_GRAPH_CAPTURE_END %s epoch=%s first_replay=1 batch=%s",
-                                remote.identity, remote.prepared_epoch, batch_descriptor)
+                    logger.info("DSA_SHARED_GRAPH_CAPTURE_END %s epoch=%s first_replay=1 active=%s batch=%s",
+                                remote.identity, remote.prepared_epoch, remote.runtime.active_num_reqs, batch_descriptor)
                 else:
                     logger.info("[GLM MTP graph] Runtime capture complete: first_replay=1 batch=%s", batch_descriptor)
 
@@ -301,8 +304,8 @@ class ACLGraphWrapper:
               if remote is not None else nullcontext()):
             entry.aclgraph.replay()
         if remote is not None:
-            logger.debug("DSA_SHARED_GRAPH_REPLAY %s epoch=%s batch=%s",
-                         remote.identity, remote.prepared_epoch, batch_descriptor)
+            logger.debug("DSA_SHARED_GRAPH_REPLAY %s epoch=%s active=%s batch=%s",
+                         remote.identity, remote.prepared_epoch, remote.runtime.active_num_reqs, batch_descriptor)
         return entry.output
 
 

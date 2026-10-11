@@ -1028,11 +1028,7 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_across_dp = packed_tensor[0, :]
         max_tokens_across_dp = int(num_tokens_across_dp.max().item())
         synced_cudagraph_mode = CUDAGraphMode(_post_process_cudagraph_mode(packed_tensor))
-        if (not is_draft_model and self._remote_decode_graph_enabled()
-                and not bool((num_tokens_across_dp == num_tokens_across_dp[0]).all())):
-            # Remote协议尚无dummy row；DP缩批不一致时全体eager，不能伪造远端请求。
-            synced_cudagraph_mode = CUDAGraphMode.NONE
-            allow_dp_padding = False
+        # 远端路径也参与原生DP padding：图按active B特化，PAD不进入Pool。
 
         # DSA 的本地 gate 已体现在各 rank 上报的 graph mode 中。同步后的
         # mode 才是整个 DP group 的图结论：若任一 replica 需要 eager，
@@ -4244,6 +4240,8 @@ class NPUModelRunner(GPUModelRunner):
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
+        remote_idle = (self._remote_decode_graph_enabled() and uniform_decode
+                       and not is_profile and not profile_cpp and not force_attention and not is_graph_capturing)
         _cudagraph_mode, batch_desc, _, num_tokens_across_dp, _ = self._determine_batch_execution_and_padding(
             num_tokens=num_tokens_unpadded,
             num_reqs=num_reqs,
@@ -4252,7 +4250,7 @@ class NPUModelRunner(GPUModelRunner):
             use_cascade_attn=False,
             allow_microbatching=allow_microbatching,
             force_eager=(is_profile or (cudagraph_runtime_mode == CUDAGraphMode.NONE) or profile_cpp
-                         or self._remote_decode_graph_enabled()),
+                         or (self._remote_decode_graph_enabled() and not remote_idle)),
             # `force_uniform_decode` is used for cudagraph capture; because for
             # capturing mixed prefill-decode batches, we sometimes use
             # num_tokens == num_reqs which looks like a uniform decode batch to the
@@ -4493,9 +4491,18 @@ class NPUModelRunner(GPUModelRunner):
                 skip_compiled=self._remote_decode_graph_enabled(),
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
             ):
+                idle_remote = None
+                if remote_idle and dsa_graph_dummy_installed:
+                    idle_remote = self.dsa_offload_runtime.remote_shared
+                    remote_metadata = next(value for value in attn_metadata.values()
+                                           if getattr(value, "dsa_indexer_block_table", None) is not None)
+                    idle_remote.prepare_decode(remote_metadata)
+                    get_forward_context().dsa_remote_runtime = idle_remote
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
                 )
+                if idle_remote is not None:
+                    idle_remote.finish_decode()
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
             else:

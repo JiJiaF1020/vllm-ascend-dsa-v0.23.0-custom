@@ -253,9 +253,27 @@ python examples/dsa_demo/simple_test_1p.py --remote-shared-config /绝对路径/
 
 每层generation/status独立，generation每step在图外H2D；已捕获shape的buffer保留到关闭。
 PUT/PUT_DONE、REFRESH仍在图外，保留必要的Host同步。
-所有DP均预热、均为Q=4且token数一致时才FULL；缩批只能命中精确capture size，
-不一致时全体eager，不创建远端PAD请求。Q不足4、非SPARSE等原远端限制没有因此解除。
+真实请求均预热、均为Q=4时允许向上匹配capture size，DP间真实B可以不同。
+模型/MoE按原生dispatcher统一padding；LISSend、GATHER_ONLY、ScatterSFA、APPLIED
+只使用真实请求前缀，不创建远端PAD请求，也不修改PAD mirror或等待PAD completion。
+source full的SFA消费同一个真实前缀，输出补零至模型图尺寸；普通full的原生LI/SFA保持原路径。
+图缓存键为`(BatchDescriptor, active B)`，同一个padding尺寸的B=6和B=5不能共用远端图。
+稳定pool row重排仍由设备Tensor传入，不固化row编号；首次出现新的真实B仍先eager预热，
+之后延迟捕获。真实B已预热、但DP最大尺寸变化时，可能再捕获一个图变体。
+零请求DP使用`active=0`独立idle图：跳过LI选择/远端IO/attention，保留prolog及后续
+o_proj/MoE集合通信；Indexer写入跳过，KV prolog使用原生PAD slot=-1语义。
+启动期profile/capture不会因此建链，idle也不占用Pool row。
+Q不足4、非SPARSE、新请求补入和row复用等原远端限制没有因此解除。
 图内地址变化会明确报错，不会静默使用旧metadata。
+
+验证padding时建议先用DP2/TP1，保持Q=4并让两DP分别出现B=6/5、6/3以及6/0，
+再扩大到DP4/TP2。`VLLM_LOGGING_LEVEL=DEBUG`下检查
+`DSA_SHARED_GRAPH_ROWS active=5 graph_rows=6 pad=1 remote_commands_per_layer=1`，
+以及各rank的`DSA_GRAPH_DISPATCH final_mode=FULL`、`DSA_SHARED_GRAPH_REPLAY active=...`。
+首次新B的`remote_decode_warmup`可以出现；预热后不应仅因为DP间B不同持续eager。
+idle应为`active=0 ... remote_commands_per_layer=0`，且Pool没有该rank新增GET/APPLIED。
+开`validate`核对真实请求status，eager/graph分别检查相同逻辑KV及输出；性能轮关闭validate/debug。
+需要在设备上检查PAD slot、图variant的实际地址、流归属和completion代数，不能只看FULL日志。
 
 `--remote-shared-config` JSON顶层可设置`"validate": true`恢复Host验收检查，默认False。
 默认不做逐层ticket/status的同步D2H，也不做prepare/select中的累计query、SPARSE模式及
@@ -420,8 +438,8 @@ console handler 初始化；worker 只调用文件日志入口时也会配置 co
 
 例如本 rank `local_mode=FULL`、`dp_mode=NONE`、`final_mode=NONE`，应继续找其它
 DP rank 同轮的 gate/dispatch，而不是归因于“某个 rank 太慢”；协调规则按模式而非耗时降级。
-`reason=non_uniform_decode` 应核对 query_lengths；`remote_exact_shape_required` 核对
-capture sizes；`remote_decode_warmup` 是该 batch shape 尚未预热。
+`reason=non_uniform_decode` 应核对 query_lengths；`capture_size_miss` 核对
+capture sizes；`remote_decode_warmup` 是该真实 batch shape 尚未预热。
 `DSA_GRAPH_DISPATCH` 也可能来自 dummy 调度；真实 target 轮次还应有对应 GATE，
 epoch 是本 rank 的 forward 计数，不保证不同 rank 永远一一相等。
 

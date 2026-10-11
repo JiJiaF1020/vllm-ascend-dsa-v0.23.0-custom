@@ -3,7 +3,8 @@
 
 注册command/reply/completion只由算子runtime持有。这里的Tensor均为普通caller-owned
 输入输出；不把远端GVA变成Tensor。首次decode绑定一批真实MTP3请求，允许缩批/重排，
-不支持padding、新请求补入或row复用。结束请求的绑定保留到worker shutdown。
+模型允许padding，远端节点只处理真实请求前缀；不支持新请求补入或row复用。
+图按(模型BatchDescriptor, active B)特化；结束请求的绑定保留到worker shutdown。
 
 remote_shared配置中validate默认False；显式True或开启debug时恢复Host验收检查。
 关闭验收不取消设备completion/APPLIED、PUT_DONE/绑定和图地址生命周期检查。
@@ -202,17 +203,28 @@ class RemoteShared:
             self._prepare_decode(metadata)
 
     def _prepare_decode(self, metadata):
-        rows = metadata.dsa_resident_pool_indices
-        candidates = metadata.dsa_candidate_lens
-        b = rows.numel()
+        b = self.runtime.active_num_reqs
+        graph_b = metadata.dsa_resident_pool_indices.numel()
+        if not 0 <= b <= graph_b:
+            raise RuntimeError(f"remote active batch {b} exceeds metadata rows {graph_b}")
+        self.current = self.previous_out = self.previous_status = None
+        logger.debug("DSA_SHARED_GRAPH_ROWS %s epoch=%s active=%s graph_rows=%s pad=%s remote_commands_per_layer=%s",
+                     self.identity, self.runtime._forward_epoch, b, graph_b, graph_b-b, (b+15)//16)
+        if b == 0:
+            # serving idle图只维持模型/集合通信，不建链、不刷新、不发命令。
+            self.prepared_epoch = self.runtime._forward_epoch
+            self.step_data = (0, metadata)
+            return
+        rows = metadata.dsa_resident_pool_indices[:b]
+        candidates = metadata.dsa_candidate_lens[:b]
         with self.host_range("metadata_readback", b):
-            budgets = metadata.dsa_sparse_budget_tokens.cpu().tolist()
+            budgets = metadata.dsa_sparse_budget_tokens[:b].cpu().tolist()
             if self.validate:
-                if metadata.cum_query_lens.cpu().tolist() != [4*(i+1) for i in range(b)]:
+                if metadata.cum_query_lens[:b].cpu().tolist() != [4*(i+1) for i in range(b)]:
                     raise ValueError("remote shared decode requires four queries per request")
-                if metadata.dsa_row_modes.cpu().tolist() != [DSA_ROW_MODE_SPARSE]*b:
+                if metadata.dsa_row_modes[:b].cpu().tolist() != [DSA_ROW_MODE_SPARSE]*b:
                     raise ValueError("remote shared decode requires all rows SPARSE")
-                tail = metadata.seq_lens.cpu() - candidates.cpu()
+                tail = metadata.seq_lens[:b].cpu() - candidates.cpu()
                 if bool(((tail < 4) | (tail > 256)).any()):
                     raise ValueError("framework causal tail must fit 256 tokens including four queries")
         with self.host_range("dump_before_write", b):
@@ -243,6 +255,8 @@ class RemoteShared:
             if self.current is None or self.current["epoch"] != epoch:
                 return
             batch = self.current["rows"].numel()
+        if batch == 0:
+            return
         start = epoch * self.period + self.last_payload_layer * self.groups + 1
         self.native.lis_send_pool_begin_step(self.handle, epoch + 1, list(range(start, start + (batch + 15) // 16)))
         self.notified_epoch = epoch
@@ -256,6 +270,9 @@ class RemoteShared:
 
     def _finish_decode(self):
         b, _ = self.step_data
+        if b == 0:
+            self.step_data = None
+            return
         if self.validate:
             for context, _ in self.layers:
                 if context.full_cache is not None:
@@ -274,11 +291,15 @@ class RemoteShared:
         self.step_data = None
 
     def validate_graph_inputs(self, key, metadata, args, kwargs):
-        """仅授权已预热真实decode捕获，并拒绝replay偷偷更换输入地址。"""
-        if (not self.graph_enabled or self.step_data is None or self.handle is None
-                or self.prepared_epoch != self.runtime._forward_epoch
-                or self.step_data[0] not in self.warmed_batches):
-            raise RuntimeError("remote FULL graph requires prepared, warmed real decode; dummy capture is forbidden")
+        """授权已预热真实decode或无IO的idle图，拒绝replay更换输入地址。"""
+        if (not self.graph_enabled or self.step_data is None
+                or self.prepared_epoch != self.runtime._forward_epoch):
+            raise RuntimeError("remote FULL graph requires prepared decode/idle metadata; startup dummy is forbidden")
+        b = self.step_data[0]
+        if b != self.runtime.active_num_reqs or key[1] != b:
+            raise RuntimeError("remote graph specialization does not match active batch")
+        if b and (self.handle is None or b not in self.warmed_batches):
+            raise RuntimeError("remote active graph requires connected, warmed real decode")
         signature = []
 
         def record(name, value):
@@ -350,9 +371,14 @@ class RemoteShared:
             raise RuntimeError(f"{phase} submission failed: {ticket.tolist()}")
 
     def select(self, context, query, weights, scale, actual_q, rows, candidates, visible, row_modes, table, budgets):
-        b = rows.numel()
-        if query.shape != (4*b, 32, 128):
-            raise ValueError("remote shared decode currently requires real MTP3 Q=4 per request, no padding")
+        graph_b = rows.numel()
+        b = self.runtime.active_num_reqs if self.graph_enabled else graph_b
+        if not 0 < b <= graph_b or query.shape != (4*graph_b, 32, 128):
+            raise ValueError("remote shared decode requires MTP3 Q=4 and a nonempty real request prefix")
+        # 前缀view不搬运Tensor，不把PAD row或PAD mirror交给远端算子。
+        query, weights, scale = query[:4*b], weights[:4*b], scale[:4*b]
+        actual_q, rows, candidates = actual_q[:b], rows[:b], candidates[:b]
+        visible, row_modes, table, budgets = visible[:b], row_modes[:b], table[:b], budgets[:b]
         pool = self.runtime.resident_token_pool
         if self.graph_enabled:
             if self.prepared_epoch != self.runtime._forward_epoch:
@@ -398,11 +424,21 @@ class RemoteShared:
                         context.execution_plan.first_payload_layer, self.runtime._forward_epoch, self.calls)
         return DSAOffloadSelectionOutput(data["full"], data["tail_info"], visible)
 
+    def idle_selection(self, context, rows, visible):
+        """零active专用图：保留层plan关系，禁止调用任何通信或索引更新算子。"""
+        data = self._buffer(context, 0)
+        data.update(rows=rows[:0], context=context, epoch=self.runtime._forward_epoch)
+        self.current = data
+        self.runtime._selection_source_layer = context.layer_id
+        return DSAOffloadSelectionOutput(data["full"], data["tail_info"], visible[:0])
+
     def fetch(self, context):
         data = self.current
         if (data is None or data["epoch"] != self.runtime._forward_epoch or
                 data["context"].layer_id != context.selection_source_layer_id):
             raise RuntimeError("shared layer has no current source selection plan")
+        if data["rows"].numel() == 0:
+            return DSAOffloadSelectionOutput(data["prepared"], data["tail_info"])
         if context.layer_id != context.execution_plan.first_payload_layer:
             payload = self._payload(context, data["rows"].numel())
             if not self.graph_enabled:
@@ -416,18 +452,25 @@ class RemoteShared:
 
     def attention(self, context, query, packed, table, actual_q, scale):
         data = self.current
-        payload = self._payload(context, data["rows"].numel())
+        b = data["rows"].numel()
+        if b == 0:
+            return torch.zeros((*query.shape[:-1], 512), dtype=query.dtype, device=query.device)
+        payload = self._payload(context, b)
         out = torch.empty((*query.shape[:-1], 512), dtype=query.dtype, device=query.device)
+        active_out = out[:4*b]
+        # 只填PAD输出；真实前缀由ScatterSFA覆盖。下游o_proj/MoE仍执行完整padding尺寸。
+        if out.shape[0] > 4*b:
+            out[4*b:].zero_()
         torch.ops.nanovllm_dsa.copy_sfa_mtp_c8_out(
-            query.contiguous(), packed, data["prepared"], table.contiguous(), actual_q, data["rows"],
+            query[:4*b].contiguous(), packed, data["prepared"], table[:b].contiguous(), actual_q[:b], data["rows"],
             payload["generation"], data["ticket"],
             self.runtime.resident_token_pool.get_cache_slots(context.execution_plan.group),
-            scale, out, data["maximum"], data["total"], payload["status"],
+            scale, active_out, data["maximum"], data["total"], payload["status"],
             context.execution_plan.mirror_writer == "scatter_sfa")
-        self.previous_out = out
+        self.previous_out = active_out
         self.previous_status = payload["status"]
         if context.execution_plan.applied:
-            torch.ops.custom.remote_du_applied_out(out, data["rows"], payload["generation"],
+            torch.ops.custom.remote_du_applied_out(active_out, data["rows"], payload["generation"],
                                                   payload["status"], data["ticket"])
             if not self.graph_enabled:
                 self._check_ticket(payload, "APPLIED")

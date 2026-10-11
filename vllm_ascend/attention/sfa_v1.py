@@ -1945,6 +1945,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             dsa_context is not None and dsa_context.runtime.remote_shared is not None
             and dsa_context.runtime.remote_shared.graph_enabled and attn_metadata.dsa_decode_forward
         )
+        remote_idle = remote_decode_prepared and dsa_context.runtime.active_num_reqs == 0
         if dsa_context is not None and not remote_decode_prepared:
             if kv_cache is None:
                 raise RuntimeError("DSA full-block dump requires a resident cache")
@@ -2182,7 +2183,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if kv_cache is not None and self.is_kv_producer:
             attn_metadata.reshape_cache_event = torch.npu.Event()
 
-        if kv_cache is not None and self.has_indexer:
+        if kv_cache is not None and self.has_indexer and not remote_idle:
             assert k_li is not None
             dsa_context = self.dsa_offload_context
             if dsa_context is not None:

@@ -18,7 +18,7 @@ from contextlib import contextmanager
 import torch
 
 from vllm_ascend import envs
-from vllm_ascend.dsa_offload.contracts import DSA_ROW_MODE_PAD, DSA_ROW_MODE_SPARSE
+from vllm_ascend.dsa_offload.contracts import DSA_ROW_MODE_SPARSE
 from vllm_ascend.dsa_offload.ops import DSAOffloadSelectionOutput
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,8 @@ class RemoteShared:
         from kvcache_scatter_copy_custom_ops import custom_ops_lib
 
         self.native, self.config, self.runtime, self.plan = custom_ops_lib, config, runtime, plan
+        if getattr(self.native, "lis_send_fused_output_version", lambda: 0)() < 1:
+            raise RuntimeError("remote shared requires fused-output LISSend extension and matching C8 OPP; rebuild both")
         if graph_enabled and getattr(self.native, "lis_send_padding_version", lambda: 0)() < 1:
             raise RuntimeError("remote fixed-capacity graph requires PAD-aware extension and matching C8/ordinary OPP")
         self.identity = f"host={socket.gethostname()} dp={dp_rank} tp={tp_rank} physical={physical_device}"
@@ -166,8 +168,6 @@ class RemoteShared:
         self.period = ((self.runtime.num_layers * self.groups + 7) // 8) * 8
         if self.worker_parking:
             self.native.lis_send_pool_begin_step(self.handle, 0, [])
-        self.arange_tail = torch.arange(256, dtype=torch.int32, device=self.runtime.device)
-        self.causal_query = torch.arange(4, dtype=torch.int32, device=self.runtime.device)
         logger.info("DSA_SHARED_CONNECT_OK %s wire=5 backend=real_store groups=%s", self.identity, len(self.plan.groups))
 
     def _buffer(self, context, batch):
@@ -178,7 +178,6 @@ class RemoteShared:
             empty = lambda shape, dtype: torch.empty(shape, dtype=dtype, device=device)
             self.buffers[key] = dict(
                 prepared=empty((batch*4, 1, 2304), torch.int32),
-                logical=empty((batch*4, 1, 2048), torch.int32),
                 full=empty((batch*4, 1, 2304), torch.int32),
                 ticket=torch.zeros(((batch+15)//16, 2), dtype=torch.int64, device=device),
                 maximum=empty((1,), torch.float32), total=empty((1,), torch.float32),
@@ -400,10 +399,8 @@ class RemoteShared:
                 if bool(((tail_length < 4) | (tail_length > 256)).any()):
                     raise ValueError("framework causal tail must fit 256 tokens including four queries")
         data = self._buffer(context, b)
-        # 图内按设备row_modes生成固定地址的PAD哨兵；不读取Host active B，
-        # 不把本地padding_pool_index伪装成远端已绑定row。
-        data["rows"].copy_(torch.where(row_modes == DSA_ROW_MODE_PAD, -1, rows))
-        rows = data["rows"]
+        # LISSend直接读row_modes做通信门禁，并写出下游共用的固定地址PAD哨兵rows。
+        # 不读取Host active B，不把本地padding_pool_index当作远端请求。
         payload_context = self.contexts[context.execution_plan.first_payload_layer]
         payload = self._payload(payload_context, b)
         if not self.graph_enabled:
@@ -412,18 +409,15 @@ class RemoteShared:
         torch.ops.nanovllm_dsa.lis_send(
             query.contiguous(), key, weights.contiguous(), scale.contiguous(), key_scale.squeeze(-1),
             actual_q, rows, candidates, table.contiguous(), payload["generation"], data["ticket"],
-            pool.get_cache_slots(context.execution_plan.group), data["prepared"], None, data["logical"])
+            pool.get_cache_slots(context.execution_plan.group), data["prepared"],
+            final_seq_lengths_kv=visible, row_modes=row_modes,
+            full_attention_indices=data["full"], normalized_req_pool_entries=data["rows"])
+        rows = data["rows"]
         if not self.graph_enabled:
             self._check_ticket(payload, "LISSend")
         if self.debug is not None:
             self.debug.select(context, data, query, key, weights, scale, key_scale, actual_q,
                               rows, candidates, visible, table)
-        tokens = candidates[:, None, None] + self.arange_tail[None, None, :]
-        valid = tokens < (visible[:, None, None] - 3 + self.causal_query[None, :, None])
-        tail = torch.where(valid, tokens.expand(b, 4, 256), -1).reshape(4*b, 1, 256)
-        data["full"][:, :, :2048].copy_(data["logical"])
-        data["full"][:, :, 2048:].copy_(tail)
-        data["prepared"][:, :, 2048:].copy_(torch.where(tail >= 0, self.budget + (tail & 255), -1))
         data.update(actual_q=actual_q, context=context, epoch=self.runtime._forward_epoch)
         self.current = data
         self.runtime._selection_source_layer = context.layer_id

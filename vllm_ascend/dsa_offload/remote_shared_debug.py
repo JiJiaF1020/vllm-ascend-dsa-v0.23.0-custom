@@ -90,7 +90,8 @@ class RemoteSharedDebugSession:
             b = rows.numel()
             sample = dict(epoch=self.owner.runtime._forward_epoch, source_layer=context.layer_id,
                           rows=rows.cpu().tolist(), candidates=candidates.cpu().tolist(),
-                          visible=visible.cpu().tolist(), logical=data["logical"].detach().cpu().reshape(b, 4, 2048).clone())
+                          visible=visible.cpu().tolist(),
+                          logical=data["full"].detach().cpu()[:, :, :2048].reshape(b, 4, 2048).clone())
             data["debug"] = sample
             if self.config.compare_li:
                 from vllm_ascend.dsa_offload.ops import quant_lightning_indexer_topk

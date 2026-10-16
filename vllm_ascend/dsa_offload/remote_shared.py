@@ -33,6 +33,8 @@ class RemoteShared:
         self.native, self.config, self.runtime, self.plan = custom_ops_lib, config, runtime, plan
         if getattr(self.native, "lis_send_fused_output_version", lambda: 0)() < 1:
             raise RuntimeError("remote shared requires fused-output LISSend extension and matching C8 OPP; rebuild both")
+        if getattr(self.native, "lis_send_weight_stride_version", lambda: 0)() < 1:
+            raise RuntimeError("remote shared requires strided-weight LISSend extension and matching C8 OPP; rebuild both")
         if graph_enabled and getattr(self.native, "lis_send_padding_version", lambda: 0)() < 1:
             raise RuntimeError("remote fixed-capacity graph requires PAD-aware extension and matching C8/ordinary OPP")
         self.identity = f"host={socket.gethostname()} dp={dp_rank} tp={tp_rank} physical={physical_device}"
@@ -407,7 +409,7 @@ class RemoteShared:
             self._generation(payload, context.execution_plan.first_payload_layer)
         key, key_scale = context.indexer_cache
         torch.ops.nanovllm_dsa.lis_send(
-            query.contiguous(), key, weights.contiguous(), scale.contiguous(), key_scale.squeeze(-1),
+            query.contiguous(), key, weights, scale.contiguous(), key_scale.squeeze(-1),
             actual_q, rows, candidates, table.contiguous(), payload["generation"], data["ticket"],
             pool.get_cache_slots(context.execution_plan.group), data["prepared"],
             final_seq_lengths_kv=visible, row_modes=row_modes,

@@ -89,6 +89,7 @@ class DSAOffloadRuntime:
         self.max_model_len = int(max_model_len)
         self.block_size = int(block_size)
         self.device = torch.device(device)
+        self.pin_memory = bool(pin_memory)
         self.packed_c8 = bool(packed_c8)
         self.max_decode_query_len = int(max_decode_query_len)
         if self.max_decode_query_len <= 0:

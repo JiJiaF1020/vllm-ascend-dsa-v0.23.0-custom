@@ -209,3 +209,45 @@ READ_DONE，最后才等全层 PUT_DONE；Decode 首层提交全层 PUT，依赖
 当前本机仅通过 Host/语法检查，无 CANN/NPU/vLLM；设备编译、真实 READ、图地址/FX、
 源页覆盖保护和性能尚未验收。整网首次测试建议保留显式 validate，并透传 Pool 参数
 `--put-timing` 观察 READ/目录/绑定的实际暴露开销，不预先承诺 PUT 零开销。
+
+## 2026-10-19：内嵌Store与跨步激活（显式开启）
+
+新模式保持上述启动PAD/Prefill流程，默认 immediate 不变。要去掉满页本步的远端
+绑定等待、缩批Host REFRESH，在已有remote-shared JSON中加：
+
+```json
+{
+  "graph_capture": "startup_pad",
+  "put_transport": "urma_read",
+  "put_visibility": "next_step_local",
+  "reserve_budget_tokens": 12288
+}
+```
+
+这是合入已有device表的片段，budget仍须匹配本次真实档位。Pool必须使用算子仓
+wrapper的`--store-mode embedded`；每个DU child一个独立Store，Store端口列表与DU
+端口按下标配对。device表中每卡store_endpoint必须指向所属child，不能继续共用首端口。
+global requests采用ceil分配，不要求被DU数量整除；每child实际CREATE不能超独立配额，
+总KV字节预算仍不扩大。整arena启动时实际写预触并注册MR，请先用小预算检查pin容量。
+
+本步candidate D不推迟。新增历史页仍由LISSend从HBM tail直接生成slot，本步Pool DU
+不对它选slot/回传payload；原有远端历史不变。当前PUT只完成READ/Store，不发布DU
+目录。下一步首层PUT节点先发ACTIVATE，携带最新全row/层APPLIED；Pool等旧plan消费和
+PUT完成，追加后发布BIND/ACK，NPU再冻结整步快照。没有新job也必须激活旧pending。
+缩批/重排由同一消息确认退出row，不再同步设备或做CurrentDone/Host REFRESH。
+
+框架复用现有CPU cache-layout，不再稳态回读row/budget/candidate；长度直接传原
+batch-order I32/I64设备Tensor。plan/control/generation使用固定pinned owner，按step
+批量H2D；confirmed从启动捕获就绑定num_computed_tokens，不能在真实replay更换地址。
+显式validate/debug仍会同步回读，性能测量关闭它们；worker_parking保持默认false才
+没有额外Host StepBegin通知。async_scheduling=False、无新请求/row复用限制不变。
+
+设备部署须重编普通/C8 OPP与extension，以及Pool/wrapper，更新本框架并重启。
+先跑算子仓现有`test/test_lis_send.py --deferred-put --direct-put-store ...`，再跑裁层
+模型跨满页、全PAD/缩批、多DP/TP。详细参数和字节量见算子仓
+`docs/direct_put_startup_capture.md`。Host真实Store/DU、ASAN/UBSAN和语法检查通过；
+本机缺少vLLM/CANN/NPU，框架UT与设备编译/图/URMA验收尚未完成。
+
+源覆盖仍是安全边界：v6本步还从tail读取新页，异常调度撞同parity会报0x3508，而不是
+等READ_DONE后读被覆盖的数据。正常连续MTP3推进不应触发；下一步激活也可能暴露
+未完成的READ，不能把“改成异步提交”直接作为零开销结论。

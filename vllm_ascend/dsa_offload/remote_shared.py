@@ -16,6 +16,7 @@ import socket
 from contextlib import contextmanager
 
 import torch
+from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend import envs
 from vllm_ascend.dsa_offload.contracts import DSA_ROW_MODE_SPARSE
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 class RemoteShared:
     def __init__(self, config, runtime, plan, layers, *, dp_rank=0, tp_rank=0, physical_device=None,
                  graph_enabled=False, debug_config=None, validate=False, worker_parking=False,
-                 startup_pad=False, reserved=None, put_transport="tcp"):
+                 startup_pad=False, reserved=None, put_transport="tcp", put_visibility="immediate"):
         import kvcache_scatter_copy_custom_ops  # noqa: F401
         from kvcache_scatter_copy_custom_ops import custom_ops_lib
 
@@ -53,6 +54,8 @@ class RemoteShared:
         self.handle = reserved[3] if reserved else None
         self.startup_pad = startup_pad
         self.put_transport = put_transport
+        self.deferred_put = put_visibility == "next_step_local"
+        self.rows_changed = False
         self.real_bound = False
         if reserved:
             self.groups = (reserved[4] + 15) // 16
@@ -78,12 +81,14 @@ class RemoteShared:
         self.prepared_epoch = -1
         self.warmed_batches = set()
         self.layer_buffers = {}
+        self.generation_owner = None
+        self.generation_epoch = -1
         self.step_data = None
         self.graph_inputs = {}
         self.debug = None
         self.direct_put = None
         if put_transport == "urma_read":
-            if self.handle is None or getattr(self.native, "lis_send_direct_put_version", lambda: 0)() < 1:
+            if self.handle is None or getattr(self.native, "lis_send_direct_put_version", lambda: 0)() < 2:
                 raise RuntimeError("direct PUT requires reserved connection, updated Pool/Store/extension and ordinary/C8 OPP")
             from vllm_ascend.dsa_offload.remote_put import RemotePut
 
@@ -198,7 +203,8 @@ class RemoteShared:
         self.request_ids = {row: shadow.request_ids[row] for row in host_rows}
         if self.worker_parking:
             self.native.lis_send_pool_begin_step(self.handle, 0, [])
-        logger.info("DSA_SHARED_CONNECT_OK %s wire=5 backend=real_store groups=%s", self.identity, len(self.plan.groups))
+        logger.info("DSA_SHARED_CONNECT_OK %s wire=%s backend=real_store groups=%s", self.identity,
+                    6 if self.deferred_put else 5, len(self.plan.groups))
 
     def _buffer(self, context, batch):
         # 按图容量而非active B持有地址；同容量缩批只更新输入值。
@@ -218,23 +224,26 @@ class RemoteShared:
     def _payload(self, context, batch):
         key = (context.layer_id, batch)
         if key not in self.layer_buffers:
+            if self.generation_owner is None:
+                self.generation_owner = CpuGpuBuffer(self.runtime.num_layers, self.groups, dtype=torch.int64,
+                                                     device=self.runtime.device, pin_memory=self.runtime.pin_memory)
             group = self._buffer(context, batch)
             self.layer_buffers[key] = dict(
-                generation=torch.empty(((batch+15)//16,), dtype=torch.int64, device=self.runtime.device),
+                generation=self.generation_owner.gpu[context.layer_id, :(batch+15)//16],
                 status=torch.empty((batch, 4), dtype=torch.int64, device=self.runtime.device),
                 ticket=group["ticket"],
             )
         return self.layer_buffers[key]
 
-    def prepare_decode(self, metadata, *, confirmed_tokens=None, full_table_cpu=None):
+    def prepare_decode(self, metadata, *, confirmed_tokens=None, full_table_cpu=None, cache_layout=None):
         """图外准备plan/普通输入与generation；TCP回退仍在这里同步PUT/REFRESH。"""
         self.step_data = None
         if not metadata.dsa_decode_forward:
             return
         with self.host_range("prepare_decode", metadata.dsa_resident_pool_indices.numel()):
-            self._prepare_decode(metadata, confirmed_tokens=confirmed_tokens, full_table_cpu=full_table_cpu)
+            self._prepare_decode(metadata, confirmed_tokens=confirmed_tokens, full_table_cpu=full_table_cpu, cache_layout=cache_layout)
 
-    def _prepare_decode(self, metadata, *, confirmed_tokens=None, full_table_cpu=None):
+    def _prepare_decode(self, metadata, *, confirmed_tokens=None, full_table_cpu=None, cache_layout=None):
         b = self.runtime.active_num_reqs
         graph_b = metadata.dsa_resident_pool_indices.numel()
         if not 0 <= b <= graph_b:
@@ -243,6 +252,8 @@ class RemoteShared:
         logger.debug("DSA_SHARED_GRAPH_ROWS %s epoch=%s active=%s graph_rows=%s pad=%s remote_commands_per_layer=%s",
                      self.identity, self.runtime._forward_epoch, b, graph_b, graph_b-b, (b+15)//16)
         if b == 0:
+            self.rows_changed = bool(self.active_rows)
+            self.active_rows = []
             if self.direct_put is not None:
                 self.direct_put.prepare(metadata, None)
             # 已连接rank可在同容量图中replay全PAD；从未建链的idle仍仅走eager。
@@ -257,8 +268,12 @@ class RemoteShared:
             return
         rows = metadata.dsa_resident_pool_indices[:b]
         candidates = metadata.dsa_candidate_lens[:b]
-        with self.host_range("metadata_readback", b):
-            budgets = metadata.dsa_sparse_budget_tokens[:b].cpu().tolist()
+        with self.host_range("metadata_prepare", b):
+            if cache_layout is None:
+                raise RuntimeError("remote prepare_decode requires existing Host cache-layout columns")
+            host_rows = cache_layout.resident_pool_indices_cpu[:b].tolist()
+            budgets = cache_layout.sparse_budget_tokens_cpu[:b].tolist()
+            host_candidates = torch.from_numpy(cache_layout.candidate_lens_cpu[:b])
             if self.validate:
                 if metadata.cum_query_lens[:b].cpu().tolist() != [4*(i+1) for i in range(b)]:
                     raise ValueError("remote shared decode requires four queries per request")
@@ -270,7 +285,7 @@ class RemoteShared:
         with self.host_range("dump_before_write", b):
             self.dump_before_write(metadata)
         with self.host_range("prepare_binding", b):
-            self._prepare_binding(rows, candidates, budgets)
+            self._prepare_binding(rows, candidates, budgets, host_rows, host_candidates)
         if self.direct_put is not None:
             self.direct_put.prepare(metadata, confirmed_tokens, full_table_cpu)
         with self.host_range("generation_update", b):
@@ -356,6 +371,9 @@ class RemoteShared:
 
         record("args", args)
         record("kwargs", kwargs)
+        if self.direct_put is not None:
+            for field in ("plan", "count", "confirmed", "generation", "step_control"):
+                record(f"put.{field}", getattr(self.direct_put, field))
         for layer, meta in sorted(metadata.items()):
             for field in ("seq_lens", "cum_query_lens", "block_table", "slot_mapping", "cos", "sin",
                           "dsa_indexer_block_table", "dsa_indexer_slot_mapping", "dsa_row_modes",
@@ -365,17 +383,22 @@ class RemoteShared:
         if previous != signature:
             raise RuntimeError("remote FULL graph input address/shape changed; do not replay stale metadata")
 
-    def _prepare_binding(self, rows, candidates, budgets):
+    def _prepare_binding(self, rows, candidates, budgets, host_rows=None, host_candidates=None):
         if not self.real_bound:
             with self.host_range("connect", rows.numel()):
                 self._connect(rows, candidates, budgets)
-        host_rows = rows.cpu().tolist()
+        host_rows = rows.cpu().tolist() if host_rows is None else host_rows
         if (not 1 <= len(host_rows) <= len(self.rows) or len(set(host_rows)) != len(host_rows) or
                 any(row not in self.request_ids or row in self.retired for row in host_rows) or
                 budgets != [self.budget]*len(host_rows)):
             raise ValueError("remote shared requires live rows from the initial cohort and one unchanged HBM budget")
         changed = host_rows != self.active_rows
-        growth = self.direct_put is None and bool((candidates.cpu() > self.bound[host_rows, 2]).any())
+        self.rows_changed = changed
+        if self.deferred_put:
+            self.active_rows = host_rows
+            return  # 图内step控制携带新APPLIED；缩批/重排不再同步设备或发Host REFRESH。
+        host_candidates = candidates.cpu() if host_candidates is None else host_candidates
+        growth = self.direct_put is None and bool((host_candidates > self.bound[host_rows, 2]).any())
         if changed or growth:
             shadow = self.runtime.remote_store_shadow
             wm = shadow.watermarks
@@ -388,7 +411,7 @@ class RemoteShared:
 
                 wm.complete(torch.tensor(self.rows), PutDoneBatch(*snapshot))
             done = wm.done[self.rows].to(torch.int64) * 128
-            if bool((candidates.cpu() > done[host_rows]).any()):
+            if bool((host_candidates > done[host_rows]).any()):
                 raise RuntimeError("remote candidate D exceeds all-layer PUT_DONE")
             active_bound = torch.stack((shadow.handles[self.rows], wm.done_versions[self.rows], done), dim=1).contiguous()
             bound = self.bound.clone()
@@ -411,10 +434,15 @@ class RemoteShared:
             raise RuntimeError(f"ScatterSFA failed at layer {layer}: {status.tolist()}")
 
     def _generation(self, data, layer):
-        start = self.runtime._forward_epoch * self.period + layer * self.groups + 1
-        # 每层独立地址，数值在step边界H2D；不可在图内固化epoch或跨层复用地址。
-        data["generation"].copy_(torch.arange(start, start+data["generation"].numel(), dtype=torch.int64,
-                                            device=self.runtime.device))
+        if self.generation_epoch == self.runtime._forward_epoch:
+            return
+        # 固定owner中逐层互不重叠的view，整个模型每步一次H2D，不逐层启动arange/copy。
+        base = self.runtime._forward_epoch * self.period + 1
+        for index in range(self.runtime.num_layers):
+            for group in range(self.groups):
+                self.generation_owner.np[index, group] = base + index * self.groups + group
+        self.generation_owner.copy_to_gpu()
+        self.generation_epoch = self.runtime._forward_epoch
 
     def _check_ticket(self, data, phase):
         if not self.validate:

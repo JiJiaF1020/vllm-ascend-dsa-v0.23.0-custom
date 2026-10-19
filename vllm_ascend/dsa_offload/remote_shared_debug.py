@@ -154,7 +154,8 @@ class RemoteSharedDebugSession:
             size = min(16, len(rows)-begin)
             reply = self.owner.native.lis_send_pool_debug_read(self.owner.handle, generation, size)
             descriptors = reply["descriptors"].tolist()
-            expected = [[row, int(self.owner.bound[row, 0]), int(self.owner.bound[row, 1])]
+            binding = reply.get("bindings", self.owner.bound)  # v6比较本步冻结版本，不使用Host的旧冷BIND。
+            expected = [[row, int(binding[row, 0]), int(binding[row, 1])]
                         for row in rows[begin:begin+size]]
             if descriptors != expected or reply["layer"] != context.layer_id or reply["group"] != group:
                 raise ValueError("reply command identity does not match active layer/group/rows/binding")

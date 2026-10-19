@@ -834,6 +834,10 @@ class NPUModelRunner(GPUModelRunner):
 
         if getattr(custom_ops_lib, "lis_send_startup_capture_version", lambda: 0)() < 1:
             raise RuntimeError("startup PAD capture requires updated Pool, extension and OPP")
+        if config.put_transport == "urma_read" and getattr(custom_ops_lib, "lis_send_direct_put_version", lambda: 0)() < 2:
+            raise RuntimeError("direct PUT batch-order lengths require extension version 2 and matching ordinary OPP")
+        if config.put_visibility == "next_step_local" and getattr(custom_ops_lib, "lis_send_deferred_put_version", lambda: 0)() < 2:
+            raise RuntimeError("next_step_local requires selection v6/direct PUT v2 extension, OPP and embedded Pool")
         runtime = self.dsa_offload_runtime
         rows = self.dsa_resident_token_pool.max_num_reqs
         tiers = set(self.ascend_config.dsa_offload_config.resident_budget_tokens)
@@ -856,10 +860,11 @@ class NPUModelRunner(GPUModelRunner):
             host, int(port), device.device_eid, str(self.device), owners,
             runtime.max_logical_blocks * 128, rows, runtime.num_layers,
             [group.source_layer for group in self.dsa_execution_plan.groups], store.store_id, None,
-            False, device.eid_index, device.pool_eid, True, config.put_transport == "urma_read")
+            False, device.eid_index, device.pool_eid, True, config.put_transport == "urma_read",
+            **({"deferred_put": True} if config.put_visibility == "next_step_local" else {}))
         from vllm_ascend.dsa_offload.remote_put import RemotePut
 
-        controls = RemotePut.allocate(runtime) if config.put_transport == "urma_read" else None
+        controls = RemotePut.allocate(runtime, self.num_computed_tokens) if config.put_transport == "urma_read" else None
         self._dsa_remote_reserved = (physical, device, store, handle, rows, budget, controls)
         logger.info("DSA_SHARED_RESERVE_OK dp=%s tp=%s rows=%s kv_pages=0 handle=%s",
                     self.dp_rank, get_tp_group().rank_in_group, rows, handle)
@@ -2906,6 +2911,7 @@ class NPUModelRunner(GPUModelRunner):
                                            if getattr(value, "dsa_indexer_block_table", None) is not None)
                     self.dsa_offload_runtime.remote_shared.prepare_decode(
                         remote_metadata, confirmed_tokens=self.num_computed_tokens,
+                        cache_layout=self.input_batch.dsa_cache_layout,
                         full_table_cpu=self.input_batch.block_table[self.dsa_kv_cache_group_ids.indexer].get_numpy_array())
 
                 self._sanitize_placeholder_input_ids_for_forward(
@@ -5287,6 +5293,7 @@ class NPUModelRunner(GPUModelRunner):
                                                 startup_pad=self._remote_startup_graph_enabled(),
                                                 reserved=getattr(self, "_dsa_remote_reserved", None),
                                                 put_transport=shared_config.put_transport,
+                                                put_visibility=shared_config.put_visibility,
                                                 graph_enabled=self._remote_decode_graph_enabled())
         cache_layout.set_pool_release_callback(
             runtime.release_pool_index

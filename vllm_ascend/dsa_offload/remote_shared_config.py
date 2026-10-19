@@ -84,6 +84,11 @@ class DSARemoteSharedConfig:
     # 全局DP均分到各节点；devices只列本机卡，TP组不跨节点。
     node_count: int = 1
     worker_parking: bool = False
+    # startup_pad: 启动期预留连接并捕获全PAD图；runtime保留原真实decode延迟捕获。
+    graph_capture: str = "startup_pad"
+    put_transport: str = "urma_read"
+    # 旧流程首次BIND才确定budget；预留连接必须在profile前确定同一固定tier。
+    reserve_budget_tokens: int | None = None
 
     @classmethod
     def from_value(cls, value):
@@ -95,6 +100,17 @@ class DSARemoteSharedConfig:
         debug = RemoteSharedDebug.from_value(value.get("debug"))
         validate = value.get("validate", False)
         worker_parking = value.get("worker_parking", False)
+        graph_capture = value.get("graph_capture", "startup_pad")
+        put_transport = value.get("put_transport", "urma_read")
+        reserve_budget_tokens = value.get("reserve_budget_tokens")
+        if reserve_budget_tokens is not None and (
+            type(reserve_budget_tokens) is not int or reserve_budget_tokens < 2048 or reserve_budget_tokens % 128
+        ):
+            raise ValueError("remote_shared.reserve_budget_tokens must be a positive 128-aligned HBM budget >=2048")
+        if graph_capture not in ("startup_pad", "runtime"):
+            raise ValueError("remote_shared.graph_capture must be startup_pad or runtime")
+        if put_transport not in ("urma_read", "tcp"):
+            raise ValueError("remote_shared.put_transport must be urma_read or tcp")
         if type(worker_parking) is not bool:
             raise ValueError("remote_shared.worker_parking must be a boolean")
         if type(validate) is not bool:
@@ -102,13 +118,17 @@ class DSARemoteSharedConfig:
         node_count = value.get("node_count", 1)
         if type(node_count) is not int or node_count < 1:
             raise ValueError("remote_shared.node_count must be a positive integer")
+        control_fields = {"store_endpoint", "debug", "validate", "node_count", "worker_parking",
+                          "graph_capture", "put_transport", "reserve_budget_tokens"}
         if "devices" not in value:
             # 兼容已有DP1/TP1单EID文件，多rank不得静默复用它。
             single = RemoteSharedDevice.from_value({k: v for k, v in value.items()
-                                                   if k not in ("store_endpoint", "debug", "validate", "node_count", "worker_parking")})
+                                                   if k not in control_fields})
             return cls(value["store_endpoint"], single=single, debug=debug, validate=validate,
-                       node_count=node_count, worker_parking=worker_parking)
-        if set(value) - {"store_endpoint", "devices", "debug", "validate", "node_count", "worker_parking"} or not isinstance(value["devices"], Mapping):
+                       node_count=node_count, worker_parking=worker_parking,
+                       graph_capture=graph_capture, put_transport=put_transport,
+                       reserve_budget_tokens=reserve_budget_tokens)
+        if set(value) - control_fields - {"devices"} or not isinstance(value["devices"], Mapping):
             raise ValueError("remote_shared accepts store_endpoint and devices keyed by physical device ID")
         devices = []
         for key, item in value["devices"].items():
@@ -124,7 +144,9 @@ class DSARemoteSharedConfig:
         if any(device.eid_index < 0 or not device.pool_eid for _, device in devices):
             raise ValueError("device table requires exact eid_index and pool_eid from probe")
         return cls(value["store_endpoint"], tuple(sorted(devices)), debug=debug, validate=validate,
-                   node_count=node_count, worker_parking=worker_parking)
+                   node_count=node_count, worker_parking=worker_parking,
+                   graph_capture=graph_capture, put_transport=put_transport,
+                   reserve_budget_tokens=reserve_budget_tokens)
 
     def validate_topology(self, dp: int, tp: int) -> None:
         if self.debug and any(d >= dp or t >= tp for d, t in self.debug.ranks):

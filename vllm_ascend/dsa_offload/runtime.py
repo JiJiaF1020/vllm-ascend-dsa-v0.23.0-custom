@@ -1290,6 +1290,24 @@ class DSALayerOffloadContext:
             before_cache_write=before_cache_write,
         ):
             return
+        shadow = self.runtime.remote_store_shadow
+        if self.packed_c8 and shadow is not None and shadow.direct_put is not None:
+            # 远端直通直接读真实producer HBM，禁止再做一次本地DRAM dump。
+            n = self.runtime.dump_job_count
+            if not n:
+                return
+            source_blocks = self.runtime._dump_source_blocks[:n]
+            if self.full_cache is not None:
+                table = full_dump_table.cpu().numpy()
+                row_map = {row: batch for batch, row in enumerate(full_dump_rows.cpu().tolist())}
+                source_blocks = np.asarray([
+                    table[row_map[int(row)], int(page)] for row, page in zip(
+                        self.runtime._dump_pool_indices[:n], self.runtime._dump_logical_indices[:n], strict=True)
+                ], dtype=np.int32)
+            shadow.put_layer(self.layer_id, resident_cache[0], source_blocks,
+                             self.runtime._dump_pool_indices[:n], self.runtime._dump_logical_indices[:n],
+                             before_cache_write=before_cache_write)
+            return
         store = self.runtime.dram_store
         if store is None:
             raise RuntimeError("DSA layer has no bound DRAM store")

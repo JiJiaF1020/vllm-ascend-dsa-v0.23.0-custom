@@ -818,6 +818,52 @@ class NPUModelRunner(GPUModelRunner):
         return (self._dsa_row_mode_decode_graph_enabled()
                 and self.ascend_config.dsa_offload_config.remote_shared is not None)
 
+    def _remote_startup_graph_enabled(self) -> bool:
+        return (self._remote_decode_graph_enabled() and
+                self.ascend_config.dsa_offload_config.remote_shared.graph_capture == "startup_pad")
+
+    def _reserve_remote_resources(self) -> None:
+        """在profile记账结束前预留固定通信区；不CREATE/PUT真实请求或触页KV。"""
+        config = self.ascend_config.dsa_offload_config.remote_shared
+        if config is None or getattr(self, "_dsa_remote_reserved", None) is not None:
+            return
+        if not self._remote_startup_graph_enabled() and config.put_transport != "urma_read":
+            return
+        from kvcache_scatter_copy_custom_ops import custom_ops_lib
+        from vllm_ascend.dsa_offload.remote_store import RemoteKvStore
+
+        if getattr(custom_ops_lib, "lis_send_startup_capture_version", lambda: 0)() < 1:
+            raise RuntimeError("startup PAD capture requires updated Pool, extension and OPP")
+        runtime = self.dsa_offload_runtime
+        rows = self.dsa_resident_token_pool.max_num_reqs
+        tiers = set(self.ascend_config.dsa_offload_config.resident_budget_tokens)
+        budget = config.reserve_budget_tokens
+        if budget is None:
+            if len(tiers) != 1:
+                raise ValueError("startup reservation needs remote_shared.reserve_budget_tokens from the configured "
+                                 "resident_budget_tokens tiers; or configure one fixed tier")
+            budget = int(next(iter(tiers)))
+        if budget not in tiers:
+            raise ValueError("remote_shared.reserve_budget_tokens must match a configured resident budget tier")
+        if not 1 <= rows <= 32:
+            raise ValueError("remote reservation requires max_num_seqs=1..32 per DP")
+        physical, device = config.for_device(custom_ops_lib.aiv_urma_query_eids(str(self.device)))
+        store = RemoteKvStore(device.store_endpoint, payload_layers=runtime.num_layers,
+                              capacity=runtime.max_logical_blocks * 128)
+        owners = torch.full((len(self.dsa_execution_plan.groups), rows, budget), -1, dtype=torch.int32)
+        host, port = device.du_endpoint.rsplit(":", 1)
+        handle = custom_ops_lib.lis_send_pool_connect_selection(
+            host, int(port), device.device_eid, str(self.device), owners,
+            runtime.max_logical_blocks * 128, rows, runtime.num_layers,
+            [group.source_layer for group in self.dsa_execution_plan.groups], store.store_id, None,
+            False, device.eid_index, device.pool_eid, True, config.put_transport == "urma_read")
+        from vllm_ascend.dsa_offload.remote_put import RemotePut
+
+        controls = RemotePut.allocate(runtime) if config.put_transport == "urma_read" else None
+        self._dsa_remote_reserved = (physical, device, store, handle, rows, budget, controls)
+        logger.info("DSA_SHARED_RESERVE_OK dp=%s tp=%s rows=%s kv_pages=0 handle=%s",
+                    self.dp_rank, get_tp_group().rank_in_group, rows, handle)
+
     def _evaluate_dsa_row_mode_graph_gate(
         self,
         *,
@@ -848,7 +894,7 @@ class NPUModelRunner(GPUModelRunner):
             return evaluate_remote_decode_graph(
                 decision, num_tokens=total_num_scheduled_tokens,
                 capture_sizes=self.compilation_config.cudagraph_capture_sizes,
-                warmed=remote is not None and bool(remote.warmed_batches),
+                warmed=remote is not None and (remote.startup_pad or bool(remote.warmed_batches)),
             )
         return decision
 
@@ -2852,11 +2898,15 @@ class NPUModelRunner(GPUModelRunner):
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 )
 
-                if self._remote_decode_graph_enabled():
-                    # 真实prefill已经完成Store PUT；decode满块先在图外提交再REFRESH。
+                if (self._remote_decode_graph_enabled() or
+                    (self.dsa_offload_enabled and self.dsa_offload_runtime.remote_shared is not None and
+                     self.dsa_offload_runtime.remote_shared.put_transport == "urma_read")):
+                    # Prefill已完成PUT；直通decode在此只准备小型plan，图内首层提交并gate。
                     remote_metadata = next(value for value in attn_metadata.values()
                                            if getattr(value, "dsa_indexer_block_table", None) is not None)
-                    self.dsa_offload_runtime.remote_shared.prepare_decode(remote_metadata)
+                    self.dsa_offload_runtime.remote_shared.prepare_decode(
+                        remote_metadata, confirmed_tokens=self.num_computed_tokens,
+                        full_table_cpu=self.input_batch.block_table[self.dsa_kv_cache_group_ids.indexer].get_numpy_array())
 
                 self._sanitize_placeholder_input_ids_for_forward(
                     scheduler_output,
@@ -2946,7 +2996,9 @@ class NPUModelRunner(GPUModelRunner):
             remote = getattr(runtime, "remote_shared", None)
             if remote is not None:
                 remote.notify_step_submitted()
-        if self._remote_decode_graph_enabled():
+        if (self._remote_decode_graph_enabled() or
+            (self.dsa_offload_enabled and self.dsa_offload_runtime.remote_shared is not None and
+             self.dsa_offload_runtime.remote_shared.direct_put is not None)):
             self.dsa_offload_runtime.remote_shared.finish_decode()
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
@@ -4240,10 +4292,12 @@ class NPUModelRunner(GPUModelRunner):
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
+        startup_pad = self._remote_startup_graph_enabled()
         remote_idle = (self._remote_decode_graph_enabled() and uniform_decode
-                       and not is_profile and not profile_cpp and not force_attention and not is_graph_capturing)
+                       and not is_profile and not profile_cpp and
+                       (startup_pad or (not force_attention and not is_graph_capturing)))
         remote_idle_connected = (remote_idle and self.dsa_offload_runtime.remote_shared.handle is not None
-                                 and bool(self.dsa_offload_runtime.remote_shared.warmed_batches))
+                                 and (startup_pad or bool(self.dsa_offload_runtime.remote_shared.warmed_batches)))
         _cudagraph_mode, batch_desc, _, num_tokens_across_dp, _ = self._determine_batch_execution_and_padding(
             num_tokens=num_tokens_unpadded,
             num_reqs=num_reqs,
@@ -4283,9 +4337,8 @@ class NPUModelRunner(GPUModelRunner):
             )
         num_tokens_padded = batch_desc.num_tokens
         num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
-        # Warmup/capture must exercise SPARSE kernels; serving idle steps are PAD,
-        # even when another DP rank selects a larger FULL graph.
-        dsa_capture_dummy = is_graph_capturing or force_attention
+        # 本地warmup使用SPARSE；远端startup捕获同一套节点，但设备rows为全PAD，不提交IO。
+        dsa_capture_dummy = (is_graph_capturing or force_attention) and not startup_pad
         prepare_dsa_graph_dummy = (
             self._dsa_row_mode_decode_graph_enabled()
             and uniform_decode
@@ -4553,6 +4606,7 @@ class NPUModelRunner(GPUModelRunner):
         return output
 
     def profile_run(self) -> None:
+        self._reserve_remote_resources()
         self.eplb_warmup()
         mc2_tokens_capacity = get_mc2_tokens_capacity()
         if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
@@ -5206,7 +5260,8 @@ class NPUModelRunner(GPUModelRunner):
         if remote_config is not None or shared_config is not None:
             from vllm_ascend.dsa_offload.remote_store import RemoteKvStore, RemoteStoreShadow
 
-            remote_store = RemoteKvStore(
+            reserved = getattr(self, "_dsa_remote_reserved", None)
+            remote_store = reserved[2] if reserved else RemoteKvStore(
                 shared_device.store_endpoint if shared_config else remote_config.endpoint, payload_layers=runtime.num_layers,
                 capacity=runtime.max_logical_blocks * runtime.block_size,
             )
@@ -5229,6 +5284,9 @@ class NPUModelRunner(GPUModelRunner):
                                                 debug_config=shared_config.debug,
                                                 validate=shared_config.validate,
                                                 worker_parking=shared_config.worker_parking,
+                                                startup_pad=self._remote_startup_graph_enabled(),
+                                                reserved=getattr(self, "_dsa_remote_reserved", None),
+                                                put_transport=shared_config.put_transport,
                                                 graph_enabled=self._remote_decode_graph_enabled())
         cache_layout.set_pool_release_callback(
             runtime.release_pool_index
@@ -5275,6 +5333,7 @@ class NPUModelRunner(GPUModelRunner):
         self,
         numel: int,
         alignment: int,
+        registerable: bool = False,
     ) -> torch.Tensor:
         """Allocate an int8 raw cache tensor.
 
@@ -5283,6 +5342,12 @@ class NPUModelRunner(GPUModelRunner):
         """
         if numel <= 0:
             raise ValueError(f"Invalid cache tensor size: {numel}")
+
+        if registerable:
+            # 只为直通PUT源保留首尾对齐空间；producer直接写最终view，不额外复制KV。
+            page = 4096
+            raw = torch.zeros(self._align_up(numel, page) + 2*page, dtype=torch.int8, device=self.device)
+            return self._align_memory(raw, page)[:numel]
 
         if self.vllm_config.kv_transfer_config is None:
             return torch.zeros(numel, dtype=torch.int8, device=self.device)
@@ -5438,7 +5503,9 @@ class NPUModelRunner(GPUModelRunner):
                             )
                             if current_layer_spec.full_kv_token_bytes:
                                 tensor = (*tensor, self._allocate_int8_cache_tensor(
-                                    num_tokens * current_layer_spec.full_kv_token_bytes, alignment))
+                                    num_tokens * current_layer_spec.full_kv_token_bytes, alignment,
+                                    registerable=(self.ascend_config.dsa_offload_config.remote_shared is not None and
+                                        self.ascend_config.dsa_offload_config.remote_shared.put_transport == "urma_read")))
                         else:
                             tensor = self._allocate_int8_cache_tensor(
                                 kv_cache_tensor.size,
@@ -5587,6 +5654,8 @@ class NPUModelRunner(GPUModelRunner):
                     k_tensor = self._allocate_int8_cache_tensor(
                         k_tensor_size,
                         alignment,
+                        registerable=(current_sparse_sfa_c8 and self.ascend_config.dsa_offload_config.remote_shared is not None
+                                      and self.ascend_config.dsa_offload_config.remote_shared.put_transport == "urma_read"),
                     )
                     if v_tensor_size is not None:
                         v_tensor = self._allocate_int8_cache_tensor(
@@ -6684,7 +6753,7 @@ class NPUModelRunner(GPUModelRunner):
 
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
-        if self._remote_decode_graph_enabled():
+        if self._remote_decode_graph_enabled() and not self._remote_startup_graph_enabled():
             logger.info("DSA_SHARED_GRAPH_DEFERRED capture=first_real_decode_after_warmup "
                         "dummy_remote_commands=0; graph memory is allocated later, reserve HBM headroom")
             return 0

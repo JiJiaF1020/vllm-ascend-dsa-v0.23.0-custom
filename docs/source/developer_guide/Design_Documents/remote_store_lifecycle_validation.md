@@ -184,3 +184,28 @@ python -c 'import kvcache_scatter_copy_custom_ops as p; print(p.custom_ops_lib._
 - 只引入明确需要的 kernel 与依赖；历史 AICPU 路径、性能实验开关、临时测试不随包复制。
 
 vendor 本身留到动态长度与 selection-group ABI 稳定后执行；本轮没有复制算子源码到框架。
+
+## 2026-10-19：启动PAD捕获与直通PUT
+
+真实 `remote_shared` 新默认使用 `graph_capture=startup_pad` 和 `put_transport=urma_read`。
+前者在 profile 前预留固定通信区，KV 分配后注册最终 HBM 源，启动期全 PAD 捕获，首次
+真实 BIND 不重建地址；后者由 AIV 发送页描述符、Pool READ 直接写最终 Store backing。
+`store_shadow`、本地卸载和不卸载不改变。兼容旧行为可显式设置 `runtime` + `tcp`。
+
+多档 resident budget 必须在 remote-shared JSON 增加 `reserve_budget_tokens`，选择本次
+初始请求实际使用的档位。比如短输入 8192、长输入 12288；首次 BIND 会核对，不会替框架
+改预算。单一档位可省略。device/EID/Store 端口沿用现有表，不暴露额外通信 Tensor。
+
+必须同时更新算子仓普通 OPP（`PoolPutFullC8`）、C8 OPP（LISSend gate）、extension、
+Pool/Store，以及本框架 Python；重启进程与图。构建/包形状/真实设备单测详见算子仓
+`docs/direct_put_startup_capture.md`，代码清单见 `mempool-detail.md` §18。
+
+验收顺序：纯 Host Store/DU → 两层真实 PUT/全 PAD LIS capture/BIND/CopySFA 单测 →
+裁层真实模型启动图 → 跨 128-token 满页的连续 Decode → 多 DP。Prefill 每批只等
+READ_DONE，最后才等全层 PUT_DONE；Decode 首层提交全层 PUT，依赖新页的 LISSend
+前等待 PUT_BOUND_READY。普通增长不再图外逐层 PUT/REFRESH；缩批/重排仍是冷路径
+同步点，必须先结束上一图再读取当前版本。不能用短输出、未跨满块的运行替代后者验证。
+
+当前本机仅通过 Host/语法检查，无 CANN/NPU/vLLM；设备编译、真实 READ、图地址/FX、
+源页覆盖保护和性能尚未验收。整网首次测试建议保留显式 validate，并透传 Pool 参数
+`--put-timing` 观察 READ/目录/绑定的实际暴露开销，不预先承诺 PUT 零开销。

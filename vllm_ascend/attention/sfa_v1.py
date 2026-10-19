@@ -1901,6 +1901,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             return output.fill_(0)
 
         context = self.dsa_offload_context
+        if (context is not None and context.layer_id == 0 and attn_metadata.dsa_decode_forward
+                and context.runtime.remote_shared is not None
+                and context.runtime.remote_shared.direct_put is not None):
+            remote = context.runtime.remote_shared
+            remote.direct_put.submit(attn_metadata.dsa_resident_pool_indices.numel())
         if context is not None and context.full_cache is not None:
             kv_cache = (context.full_cache,)
             attn_metadata = replace(
@@ -1943,7 +1948,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         dsa_context = self.dsa_offload_context
         remote_decode_prepared = (
             dsa_context is not None and dsa_context.runtime.remote_shared is not None
-            and dsa_context.runtime.remote_shared.graph_enabled and attn_metadata.dsa_decode_forward
+            and (dsa_context.runtime.remote_shared.graph_enabled or
+                 dsa_context.runtime.remote_shared.direct_put is not None) and attn_metadata.dsa_decode_forward
         )
         # 捕获后真实token数可变；与原生路径一致，让slot=-1过滤PAD写入。
         cache_write_tokens = num_input_tokens if remote_decode_prepared else attn_metadata.num_actual_tokens

@@ -164,6 +164,7 @@ class RemoteStoreShadow:
         self.layer_pages = np.zeros((store.payload_layers, rows), dtype=np.int32)
         self.put_pages = 0
         self.closed_requests = 0
+        self.direct_put = None
         logger.info("DSA_STORE_OPEN inference=%s store_id=%s layers=%s capacity=%s",
                     inference, store.store_id, store.payload_layers, store.capacity)
 
@@ -182,6 +183,8 @@ class RemoteStoreShadow:
             self.request_ids[row] = request_id
             self.next_request += 1
             logger.info("DSA_STORE_CREATE row=%s request=%s handle=%s", row, request_id, int(handles[0]))
+        if self.direct_put is not None:
+            self.direct_put.bind_producers(self.handles)
 
     def plan_dump(self, pool_rows: np.ndarray, logical_pages: np.ndarray) -> None:
         if not pool_rows.size:
@@ -207,10 +210,13 @@ class RemoteStoreShadow:
                 raise RuntimeError(f"Store PUT prefix mismatch: layer={layer} row={row} next_page={start}")
         logger.info("DSA_STORE_PUT_BEGIN layer=%s pages=%s phase=%s", layer, pool_rows.size,
                     "prewrite" if before_cache_write else "post_attention")
-        self.store.dump_packed_pages(
-            layer, packed_hbm, torch.from_numpy(source_blocks), self.handles[rows],
-            torch.from_numpy(logical_pages.astype(np.int32, copy=False)),
-        )
+        if self.direct_put is not None:
+            self.direct_put.put_layer(layer, source_blocks, pool_rows, logical_pages)
+        else:
+            self.store.dump_packed_pages(
+                layer, packed_hbm, torch.from_numpy(source_blocks), self.handles[rows],
+                torch.from_numpy(logical_pages.astype(np.int32, copy=False)),
+            )
         np.maximum.at(self.layer_pages[layer], pool_rows, logical_pages + 1)
         self.put_pages += int(pool_rows.size)
         logger.info("DSA_STORE_PUT_END layer=%s pages=%s bytes=%s", layer, pool_rows.size,

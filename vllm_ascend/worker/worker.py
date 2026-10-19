@@ -726,7 +726,8 @@ class NPUWorker(WorkerBase):
                 if not any(x in compile_range for x in all_sizes):
                     warmup_sizes.append(compile_range.end)
 
-        if isinstance(self.model_runner, NPUModelRunner) and self.model_runner._remote_decode_graph_enabled():
+        if (isinstance(self.model_runner, NPUModelRunner) and self.model_runner._remote_decode_graph_enabled()
+                and not self.model_runner._remote_startup_graph_enabled()):
             # 无真实Store/connection时不能执行或捕获远端算子；真实decode负责一次预热。
             warmup_sizes = []
         for size in sorted(warmup_sizes, reverse=True):

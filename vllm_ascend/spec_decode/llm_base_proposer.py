@@ -557,7 +557,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 runtime_mode=CUDAGraphMode.FULL,
                 use_eagle=self.use_eagle,
                 enable_enpu=self.enable_enpu,
-                capture_at_runtime=self.use_glm_mtp_graph and self.runner._remote_decode_graph_enabled(),
+                capture_at_runtime=(self.use_glm_mtp_graph and self.runner._remote_decode_graph_enabled()
+                                    and not self.runner._remote_startup_graph_enabled()),
             )
 
     def _maybe_share_topk_indices(self, target_language_model: nn.Module) -> None:

@@ -188,7 +188,8 @@ class ACLGraphWrapper:
                 # piecewise mode.
                 logger.debug("Capturing a aclgraph on (%s,%s)", self.runtime_mode.name, entry.batch_descriptor)
             # validate that aclgraph capturing is legal at this point.
-            if remote is None and not self.capture_at_runtime:
+            startup_remote = remote is not None and remote.startup_pad and remote.runtime.active_num_reqs == 0
+            if (remote is None and not self.capture_at_runtime) or startup_remote:
                 validate_cudagraph_capturing_enabled()
             elif remote is not None:
                 logger.info("DSA_SHARED_GRAPH_CAPTURE_BEGIN %s epoch=%s active=%s batch=%s",
@@ -255,7 +256,7 @@ class ACLGraphWrapper:
 
             compilation_counter.num_cudagraph_captured += 1
 
-            if remote is not None or self.capture_at_runtime:
+            if (remote is not None and not startup_remote) or self.capture_at_runtime:
                 # 启动期capture不需要输出；真实decode必须执行一次刚捕获的图。
                 # CaptureBegin/End只记录任务，不能读取上轮status冒充本轮完成。
                 forward_context.capturing = False

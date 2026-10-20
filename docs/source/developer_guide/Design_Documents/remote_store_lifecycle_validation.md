@@ -210,10 +210,10 @@ READ_DONE，最后才等全层 PUT_DONE；Decode 首层提交全层 PUT，依赖
 源页覆盖保护和性能尚未验收。整网首次测试建议保留显式 validate，并透传 Pool 参数
 `--put-timing` 观察 READ/目录/绑定的实际暴露开销，不预先承诺 PUT 零开销。
 
-## 2026-10-19：内嵌Store与跨步激活（显式开启）
+## 内嵌Store与跨步激活（2026-10-20起默认）
 
-新模式保持上述启动PAD/Prefill流程，默认 immediate 不变。要去掉满页本步的远端
-绑定等待、缩批Host REFRESH，在已有remote-shared JSON中加：
+新模式保持上述启动PAD/Prefill流程。JSON默认去掉满页本步的远端绑定等待和缩批
+Host REFRESH；以下前三项可省略，已显式写入的旧策略仍尊重其值：
 
 ```json
 {
@@ -229,6 +229,16 @@ wrapper的`--store-mode embedded`；每个DU child一个独立Store，Store端�
 端口按下标配对。device表中每卡store_endpoint必须指向所属child，不能继续共用首端口。
 global requests采用ceil分配，不要求被DU数量整除；每child实际CREATE不能超独立配额，
 总KV字节预算仍不扩大。整arena启动时实际写预触并注册MR，请先用小预算检查pin容量。
+
+算子仓`tools/profile_pool_inference.py`默认选embedded，原命令可沿用。它将源JSON中的
+DU/EID配置保留，在`<output>/raw/remote-shared.json`生成本次配对的Store endpoint，
+模型读取该副本；原JSON不改。默认DU19090..19097对应Store19080..19087，非连续端口
+可用`--store-ports/--pool-b-store-ports`指定；先`--dry-run`核对映射和实际输入文件。
+不经过该工具而直接启动模型时，仍须手工保证每卡Store endpoint匹配所属DU child。
+
+回退时显式设置`"put_visibility":"immediate"`；如果还要TCP PUT，同时设置
+`"put_transport":"tcp"`。要使用旧parent Store，工具另加`--store-mode shared`。
+shared或tcp与next_step_local组合会拒绝启动，不静默降级。基线/本地卸载不受影响。
 
 本步candidate D不推迟。新增历史页仍由LISSend从HBM tail直接生成slot，本步Pool DU
 不对它选slot/回传payload；原有远端历史不变。当前PUT只完成READ/Store，不发布DU

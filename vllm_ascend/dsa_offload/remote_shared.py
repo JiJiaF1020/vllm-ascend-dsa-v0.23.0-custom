@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 class RemoteShared:
     def __init__(self, config, runtime, plan, layers, *, dp_rank=0, tp_rank=0, physical_device=None,
                  graph_enabled=False, debug_config=None, validate=False, worker_parking=False,
-                 startup_pad=False, reserved=None, put_transport="tcp", put_visibility="immediate"):
+                 startup_pad=False, reserved=None, put_transport="urma_read", put_visibility="next_step_local"):
         import kvcache_scatter_copy_custom_ops  # noqa: F401
         from kvcache_scatter_copy_custom_ops import custom_ops_lib
 

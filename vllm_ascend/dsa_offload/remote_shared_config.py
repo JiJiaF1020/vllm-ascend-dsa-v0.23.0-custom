@@ -87,7 +87,8 @@ class DSARemoteSharedConfig:
     # startup_pad: 启动期预留连接并捕获全PAD图；runtime保留原真实decode延迟捕获。
     graph_capture: str = "startup_pad"
     put_transport: str = "urma_read"
-    put_visibility: str = "immediate"
+    # 默认跨步激活要求内嵌Store及配套v6；immediate/tcp必须显式回退，不静默降级。
+    put_visibility: str = "next_step_local"
     # 旧流程首次BIND才确定budget；预留连接必须在profile前确定同一固定tier。
     reserve_budget_tokens: int | None = None
 
@@ -103,7 +104,7 @@ class DSARemoteSharedConfig:
         worker_parking = value.get("worker_parking", False)
         graph_capture = value.get("graph_capture", "startup_pad")
         put_transport = value.get("put_transport", "urma_read")
-        put_visibility = value.get("put_visibility", "immediate")
+        put_visibility = value.get("put_visibility", "next_step_local")
         if put_visibility not in ("immediate", "next_step_local"):
             raise ValueError("remote_shared.put_visibility must be immediate or next_step_local")
         if put_visibility == "next_step_local" and put_transport != "urma_read":

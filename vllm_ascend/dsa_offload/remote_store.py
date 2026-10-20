@@ -208,8 +208,6 @@ class RemoteStoreShadow:
             start = int(self.layer_pages[layer, row])
             if not np.array_equal(pages, np.arange(start, start + pages.size)):
                 raise RuntimeError(f"Store PUT prefix mismatch: layer={layer} row={row} next_page={start}")
-        logger.info("DSA_STORE_PUT_BEGIN layer=%s pages=%s phase=%s", layer, pool_rows.size,
-                    "prewrite" if before_cache_write else "post_attention")
         if self.direct_put is not None:
             self.direct_put.put_layer(layer, source_blocks, pool_rows, logical_pages)
         else:
@@ -219,8 +217,6 @@ class RemoteStoreShadow:
             )
         np.maximum.at(self.layer_pages[layer], pool_rows, logical_pages + 1)
         self.put_pages += int(pool_rows.size)
-        logger.info("DSA_STORE_PUT_END layer=%s pages=%s bytes=%s", layer, pool_rows.size,
-                    pool_rows.size * PAGE_TOKENS * TOKEN_BYTES)
         # Store 的 READY 前缀跨所有 payload 层取 min；第一层 PUT 后直接 WAIT 会死等后续层。
         prefix = self.layer_pages[:, unique_rows].min(axis=0)
         ready = prefix > self.watermarks.done.numpy()[unique_rows]

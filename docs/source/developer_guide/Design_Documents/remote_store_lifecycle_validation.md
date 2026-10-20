@@ -100,14 +100,16 @@ python examples/dsa_demo/simple_test_1p.py --store-endpoint <POOL_IP>:19080
 ```text
 DSA_STORE_SHADOW_TOPOLOGY ... selection_groups=... remote_selection_plan=0
 DSA_STORE_CREATE row=0 ... handle=1
-DSA_STORE_PUT_BEGIN layer=0 ... phase=post_attention
-DSA_STORE_PUT_END layer=0 ...
-... 所有 target 层 ...
+... 所有 target 层完成满块上传 ...
 DSA_STORE_PUT_DONE rows=[0] pages=[...] versions=[...] bound=0
-... 后续满块 phase=prewrite ...
+... 后续新增满块上传 ...
 DSA_STORE_CLOSE ... binding=none
 DSA_STORE_SHADOW_CLOSED ... inference=local_all remote_get=0
 ```
+
+逐层`DSA_STORE_PUT_BEGIN/END`已移除，避免Prefill中层数、chunk和worker叠加产生大量
+Host日志。PUT、校验、水位及完成等待不变，保留`DSA_STORE_PUT_DONE`和生命周期日志；
+不再看到逐层BEGIN/END不代表未发生上传。本项仅更新框架Python，重启推理后生效。
 
 服务端 `MEMPOOL_LIFECYCLE` 使用同一台机器的 monotonic `time_us`，含 `port/store/rpc`：
 

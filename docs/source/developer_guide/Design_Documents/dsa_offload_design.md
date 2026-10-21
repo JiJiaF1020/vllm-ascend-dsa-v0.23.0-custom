@@ -381,7 +381,11 @@ Indexer/MTP=589824 token；H=12288、双tail=256时 MLA Decode 上限为11请求
 原N=1024时 MLA上限是10，不是 Indexer/MTP 报告的12；`max_num_seqs=7`再将配置上限压为7。
 实际 N 仍取决于 profile 得到的可用预算、128块对齐、显式 override 与多 rank 最小值。
 
-本轮不改变4:1比例及 Prefill 完整上下文暂存/准入要求，不能承诺只靠去冗余达到BS16。
+上述r=4数字保留为去冗余前后的容量对照；当前单机/双机smoke入口默认r=3，与核心配置一致，
+可通过`VLLM_ASCEND_SMOKE_DSA_INDEXER_MLA_BLOCK_RATIO=4`显式回退。比例是两个plane的
+block容量比，不是full/shared层数比，也不按前三个full等层排列自动推导。固定HBM预算下，
+降低r会增加resident容量、减少完整历史容量；实际N和并发上限仍须核对启动容量报告。
+Prefill完整上下文暂存/准入要求不变，不能承诺只靠去冗余或改比例达到BS16。
 仅更新框架Python并重启推理、重新捕图；不修改算子、extension、Pool或wire。
 已补已有CPU回归；本机缺少vLLM/NPU，完整框架与设备Prefill/PUT/图重放验收仍待服务器执行。
 

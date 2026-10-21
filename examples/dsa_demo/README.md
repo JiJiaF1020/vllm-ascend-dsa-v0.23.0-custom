@@ -87,7 +87,7 @@ NPU capture/replay、精度及DP/TP并发须在服务器验收。无算子/wire�
 | `RESULT_DIR` | 单机 `./results/1p`，双机 `./results/2p` | JSON 结果目录；`none` 禁用保存；重复实验请更换输出目录 |
 | `GRAPH_CAPTURE_SIZES` | `1,2,4,8,16` + `MAX_NUM_SEQS` | 请求数档位；自动补入当前 BS、去重并过滤大于 BS 的值；MTP3 时自动乘 4 |
 | `PROCESS_TIMEOUT_SECONDS` | `3600` | DP 进程及前端同步等待超时，单位秒 |
-| `DSA_INDEXER_MLA_BLOCK_RATIO` | `4` | 卸载 Indexer / resident MLA block 比例 |
+| `DSA_INDEXER_MLA_BLOCK_RATIO` | `3` | Indexer/full KV/MTP 与 resident MLA 的 block 容量比，不是 full/shared 层数比 |
 | `DSA_MAX_ACTIVE_REQS` | `256` | 卸载活跃请求容量上限 |
 | `DSA_HOT_CPU_BLOCK_MULTIPLE` | `1.0` | 卸载 DRAM 热块容量倍率 |
 | `DSA_PROMPT_BUDGET_THRESHOLDS` | `32768,65536` | 卸载 prompt 分档阈值，逗号分隔 |
@@ -108,6 +108,12 @@ NPU capture/replay、精度及DP/TP并发须在服务器验收。无算子/wire�
 自动规划通常会将节省的预算重新用于扩池，因此总KV HBM不一定下降；比较base blocks、tokens及
 `Sparse decode MLA limit`，不要只看`Dense Indexer limit`推断并发上限。
 Prefill仍需完整上下文暂存，不能直接把shared物理池限制为`BS*(H+256)`。
+单机/双机入口默认容量比例改为3:1，`profile_pool_inference.py`启动这些入口时也沿用该默认值；
+若已有环境变量显式设置为4，需改为3或取消该覆盖。可用
+`VLLM_ASCEND_SMOKE_DSA_INDEXER_MLA_BLOCK_RATIO=4`回退对照，不需重编算子或Pool，
+但必须重启推理、重新分配cache并capture。比例不按full/shared层的数量或排列自动推导；
+固定HBM预算下，降低比例会增加resident容量、减少完整历史容量，须同时检查Prefill准入和
+MLA/Indexer/MTP并发上限，不能只看resident容量增加。
 
 真实`--remote-shared-config`链支持每DP BS1..32、TP1/TP2、MTP3 eager；
 decode FULL图适配已加入，DP4/BS32的NPU实机验收尚未完成。
@@ -132,7 +138,7 @@ VLLM_ASCEND_SMOKE_ENABLE_CHUNKED_PREFILL=1 \
 VLLM_ASCEND_SMOKE_MAX_TOKENS=256 \
 VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=1 \
 VLLM_ASCEND_SMOKE_ENABLE_MTP=1 \
-VLLM_ASCEND_SMOKE_DSA_INDEXER_MLA_BLOCK_RATIO=4 \
+VLLM_ASCEND_SMOKE_DSA_INDEXER_MLA_BLOCK_RATIO=3 \
 VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0 \
 VLLM_ASCEND_SMOKE_PROFILE_DIR=./vllm_profile/dp4tp2_64k_bs8_offload  \
 python examples/dsa_demo/simple_test_1p.py
@@ -160,7 +166,7 @@ VLLM_ASCEND_SMOKE_ENABLE_CHUNKED_PREFILL=1 \
 VLLM_ASCEND_SMOKE_MAX_TOKENS=256 \
 VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=1 \
 VLLM_ASCEND_SMOKE_ENABLE_MTP=1 \
-VLLM_ASCEND_SMOKE_DSA_INDEXER_MLA_BLOCK_RATIO=4 \
+VLLM_ASCEND_SMOKE_DSA_INDEXER_MLA_BLOCK_RATIO=3 \
 VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0 \
 VLLM_ASCEND_SMOKE_PROFILE_DIR=./vllm_profile/2p_dp16_64k_bs8_offload  \
 python examples/dsa_demo/simple_test_2p.py

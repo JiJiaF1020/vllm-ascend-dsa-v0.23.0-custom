@@ -48,7 +48,7 @@ class SmokeConfig:
     profile_dir: str = "./profiles"
     result_dir: str | None = "./results"  # 自动区分拓扑、卸载、图模式和 rank；None 不保存。
     process_timeout_seconds: int = 3600
-    dsa_indexer_mla_block_ratio: int = 4
+    dsa_indexer_mla_block_ratio: int = 3
     dsa_max_active_reqs: int = 256
     dsa_hot_cpu_block_multiple: float = 1.0
     dsa_prompt_budget_thresholds: tuple[int, ...] = (32768, 65536)

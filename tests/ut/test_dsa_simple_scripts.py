@@ -50,6 +50,9 @@ class TestSimpleScripts(unittest.TestCase):
         self.assertEqual((two.tensor_parallel_size, two.data_parallel_size), (1, 16))
         for config in (one, two):
             self.assertEqual(config.prompts, dataset.chinese_23k)
+            self.assertEqual(config.dsa_indexer_mla_block_ratio, 3)
+            dsa = self.smoke.build_llm_kwargs(config)["additional_config"]["dsa_sparse_config"]
+            self.assertEqual(dsa["indexer_mla_block_ratio"], 3)
             self.assertFalse(config.enable_profile)
             self.assertFalse(config.enable_chunked_prefill)
             self.assertTrue(config.mtp_graph_enabled)
@@ -226,6 +229,7 @@ class TestSimpleScripts(unittest.TestCase):
             "prompts": '["你好", "hello"]',
             "enable_chunked_prefill": "on",
             "max_num_batched_tokens": "16384",
+            "dsa_indexer_mla_block_ratio": "4",
         }
         with patch.dict(os.environ, {"VLLM_ASCEND_SMOKE_" + k.upper(): v for k, v in values.items()}, clear=True):
             self.assertEqual(self.smoke.read_smoke_environment(), values)
@@ -233,6 +237,7 @@ class TestSimpleScripts(unittest.TestCase):
         self.assertEqual(config.tensor_parallel_size, 1)
         self.assertEqual(config.data_parallel_size, 16)
         self.assertEqual(config.max_num_seqs, 8)
+        self.assertEqual(config.dsa_indexer_mla_block_ratio, 4)
         self.assertFalse(config.enable_offload)
         self.assertFalse(config.enable_mtp_graph)
         self.assertEqual(config.gpu_memory_utilization, 0.83)

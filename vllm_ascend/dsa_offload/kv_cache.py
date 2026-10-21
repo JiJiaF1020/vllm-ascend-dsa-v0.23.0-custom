@@ -13,6 +13,8 @@ DSA 的 Indexer dense plane 与 MLA resident plane 在这三层都必须显式�
 本模块只负责静态规格、分组、容量和最终 tensor 布局，不处理请求阶段转换，
 也不在对象上动态追加 ``dsa_num_blocks`` 一类旁路字段。每个 plane 的真实
 block 数统一由最终 ``KVCacheTensor.size / spec.page_size_bytes`` 推导。
+remote full 的 MLA identity 是唯一例外：它只绑定完整 KV 的前缀 view，
+保留 resident base-N 的逻辑 shape，不再独立计费或分配数据区。
 """
 
 from __future__ import annotations
@@ -322,10 +324,86 @@ def dsa_group_block_multiplier(group: KVCacheGroupSpec) -> int:
         or is_dsa_mtp_full_spec(group.kv_cache_spec)
     ):
         return _get_dsa_ratio()
-    raise TypeError(
-        "Unexpected KV-cache spec in DSA layout: "
-        f"{type(group.kv_cache_spec).__name__}"
-    )
+    raise TypeError(f"Unexpected KV-cache spec in DSA layout: {type(group.kv_cache_spec).__name__}")
+
+
+def get_dsa_full_kv_aliases(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> dict[str, str]:
+    """返回 remote full 的逻辑 MLA 层名 -> 拥有完整 KV 的 Indexer 层名。
+
+    只有 ``full_kv_token_bytes > 0`` 的 hbm_full_remote_shared plane 参与。
+    full 的 prolog/SFA/PUT 均使用完整 KV；保留原 MLA group/metadata identity，
+    但不为它再分配 resident storage。绑定时仅建立完整 KV 前缀的零分配 view。
+    shared、本地卸载及 MTP 不参与别名，也不能共享各层的真实 KV 数据。
+    """
+
+    full_groups = [
+        group
+        for group in kv_cache_groups
+        if is_dsa_indexer_spec(group.kv_cache_spec) and group.kv_cache_spec.full_kv_token_bytes > 0
+    ]
+    if not full_groups:
+        return {}
+
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    residents: dict[int, tuple[str, DSAResidentMLAAttentionSpec]] = {}
+    for group in kv_cache_groups:
+        if not is_dsa_resident_mla_spec(group.kv_cache_spec):
+            continue
+        for name in group.layer_names:
+            index = extract_layer_index(name)
+            if index in residents:
+                raise RuntimeError(f"DSA full KV alias has duplicate MLA layer index: {index}")
+            residents[index] = (name, group.kv_cache_spec)
+
+    aliases: dict[str, str] = {}
+    for group in full_groups:
+        spec = group.kv_cache_spec
+        for name in group.layer_names:
+            entry = residents.get(extract_layer_index(name))
+            if entry is None:
+                raise RuntimeError(f"DSA full KV alias has no matching MLA layer: {name}")
+            resident_name, resident = entry
+            if (
+                not spec.cache_sparse_li_c8
+                or not resident.cache_sparse_sfa_c8
+                or resident.cache_sparse_li_c8
+                or resident.sparse_head_dim != (spec.full_kv_token_bytes, 0, 0)
+                or resident.block_size != spec.block_size
+                or resident.num_kv_heads != spec.num_kv_heads
+            ):
+                raise RuntimeError(f"DSA full KV alias requires matching packed-C8 layouts: {name}/{resident_name}")
+            if resident_name in aliases:
+                raise RuntimeError(f"DSA full KV alias has duplicate Indexer source: {resident_name}")
+            aliases[resident_name] = name
+    return aliases
+
+
+def bind_dsa_full_kv_cache_views(
+    kv_cache_config: KVCacheConfig,
+    raw_tensors: dict[str, torch.Tensor | tuple[torch.Tensor, ...]],
+) -> None:
+    """为 remote full 补齐逻辑 MLA raw view；绝不分配/复制/清零源数据。
+
+    view 仅维持现有 resident backend/binding 的 shape 合同。真实 full 前向
+    仍必须切换到完整 KV 和 Indexer block table，不能用 resident block ID
+    寻址此 view，也不能按 resident 块生命周期清零它。
+    """
+
+    for name, source in get_dsa_full_kv_aliases(kv_cache_config.kv_cache_groups).items():
+        if name in raw_tensors:
+            raise RuntimeError(f"DSA full KV alias must not have independent resident storage: {name}")
+        owner = raw_tensors.get(source)
+        if not isinstance(owner, tuple) or len(owner) != 3:
+            raise RuntimeError(f"DSA full KV alias requires Indexer key/scale/full payload: {source}")
+        payload = owner[2]
+        group = next(group for group in kv_cache_config.kv_cache_groups if name in group.layer_names)
+        size = kv_cache_config.num_blocks * group.kv_cache_spec.page_size_bytes
+        if payload.dtype != torch.int8 or payload.ndim != 1 or not payload.is_contiguous() or payload.numel() < size:
+            raise RuntimeError(f"DSA full KV alias source does not cover its MLA view: {source}")
+        raw_tensors[name] = (payload.narrow(0, 0, size),)
 
 
 def dsa_pool_bytes_per_base_block(
@@ -333,10 +411,12 @@ def dsa_pool_bytes_per_base_block(
 ) -> int:
     """返回一个 MLA base block 对应的总物理字节数。"""
 
+    aliases = get_dsa_full_kv_aliases(kv_cache_groups)
     total = 0
     for group in kv_cache_groups:
         weight = dsa_group_block_multiplier(group)
-        total += group.kv_cache_spec.page_size_bytes * len(group.layer_names) * weight
+        physical_layers = sum(name not in aliases for name in group.layer_names)
+        total += group.kv_cache_spec.page_size_bytes * physical_layers * weight
     if total <= 0:
         raise ValueError("DSA KV-cache groups contain no physical layers")
     return total
@@ -363,16 +443,25 @@ def build_dsa_kv_cache_config(
             f"bytes_per_base_block={bytes_per_base_block}"
         )
 
+    aliases = get_dsa_full_kv_aliases(kv_cache_groups)
+    source_aliases = {source: name for name, source in aliases.items()}
     tensors: list[KVCacheTensor] = []
     for group in kv_cache_groups:
         group_num_blocks = (
             num_base_blocks * dsa_group_block_multiplier(group)
         )
         for layer_name in group.layer_names:
+            if layer_name in aliases:
+                continue
+            # 同一个 KVCacheTensor 声明 storage 所有者与零分配 MLA view，
+            # 而非在计费后仍由 worker 另行分配一份未计费 resident。
+            shared_by = [layer_name]
+            if layer_name in source_aliases:
+                shared_by.append(source_aliases[layer_name])
             tensors.append(
                 KVCacheTensor(
                     size=(group.kv_cache_spec.page_size_bytes * group_num_blocks),
-                    shared_by=[layer_name],
+                    shared_by=shared_by,
                 )
             )
 
@@ -426,11 +515,12 @@ def get_dsa_group_num_blocks(
     kv_cache_config: KVCacheConfig,
     group: KVCacheGroupSpec,
 ) -> int:
-    """从最终 tensor 大小反推 group 的真实物理 block 数。"""
+    """从最终 storage 推导 group 容量；remote full view 沿用 base-N shape。"""
 
     if not group.layer_names:
         return 0
     tensor_sizes = _layer_tensor_sizes(kv_cache_config)
+    aliases = get_dsa_full_kv_aliases(kv_cache_config.kv_cache_groups)
     page_size = int(group.kv_cache_spec.page_size_bytes)
     block_counts: set[int] = set()
     for layer_name in group.layer_names:
@@ -438,6 +528,15 @@ def get_dsa_group_num_blocks(
             tensor_size = tensor_sizes[layer_name]
         except KeyError as exc:
             raise RuntimeError(f"DSA KV-cache tensor is missing for layer {layer_name}") from exc
+        if layer_name in aliases:
+            source = aliases[layer_name]
+            owner = next(tensor for tensor in kv_cache_config.kv_cache_tensors if layer_name in tensor.shared_by)
+            if source not in owner.shared_by:
+                raise RuntimeError(f"DSA full KV alias must share its Indexer allocation: {layer_name}/{source}")
+            # full KV 的实际容量属于 Indexer group；这个 prefix view 保留
+            # resident base-N shape，但不产生另一份独立 KV storage。
+            block_counts.add(int(kv_cache_config.num_blocks))
+            continue
         if tensor_size % page_size != 0:
             raise RuntimeError(
                 "DSA KV-cache tensor is not page aligned: "
@@ -655,6 +754,19 @@ def report_dsa_kv_cache_config(
         dense_token_limits.append(mtp_tokens)
     total_bytes = sum(int(tensor.size) for tensor in kv_cache_config.kv_cache_tensors)
     layer_tensor_sizes = _layer_tensor_sizes(kv_cache_config)
+    full_kv_aliases = get_dsa_full_kv_aliases(kv_cache_config.kv_cache_groups)
+    physical_resident_layers = len(resident_group.layer_names) - len(full_kv_aliases)
+    resident_bytes = resident_blocks * resident_group.kv_cache_spec.page_size_bytes * physical_resident_layers
+    avoided_resident_bytes = resident_blocks * resident_group.kv_cache_spec.page_size_bytes * len(full_kv_aliases)
+    full_kv_bytes = sum(
+        indexer_blocks
+        * group.kv_cache_spec.block_size
+        * group.kv_cache_spec.num_kv_heads
+        * group.kv_cache_spec.full_kv_token_bytes
+        * len(group.layer_names)
+        for group in kv_cache_config.kv_cache_groups
+        if is_dsa_indexer_spec(group.kv_cache_spec)
+    )
     mtp_bytes = (
         sum(layer_tensor_sizes[layer_name] for layer_name in mtp_group.layer_names)
         if mtp_group is not None
@@ -688,7 +800,11 @@ def report_dsa_kv_cache_config(
         "================ DSA HBM CACHE CAPACITY REPORT ================\n"
         "  Split ratio             : indexer:mla = %d:1; base blocks = %s\n"
         "  Physical cache layers   : indexer=%s, resident=%s, mtp=%s\n"
+        "  Full MLA storage views  : %s aliases (no extra HBM; %s logical MLA layers)\n"
         "  Allocated HBM KV bytes  : %s bytes (%s GiB)\n"
+        "  Full packed KV bytes    : %s bytes (%s GiB; included above)\n"
+        "  Physical resident bytes : %s bytes (%s GiB; included above)\n"
+        "  Full resident avoided   : %s bytes (%s GiB at current base capacity)\n"
         "  MLA resident plane      : %s tokens (%s blocks x %s tokens)\n"
         "  Indexer dense plane     : %s tokens (%s blocks x %s tokens)\n"
         "  MTP full BF16 plane     : %s\n"
@@ -702,10 +818,18 @@ def report_dsa_kv_cache_config(
         _get_dsa_ratio(),
         f"{resident_blocks:,}",
         f"{len(indexer_group.layer_names):,}",
-        f"{len(resident_group.layer_names):,}",
+        f"{physical_resident_layers:,}",
         f"{actual_mtp_layer_count:,}",
+        f"{len(full_kv_aliases):,}",
+        f"{len(resident_group.layer_names):,}",
         f"{total_bytes:,}",
         format_gib(total_bytes),
+        f"{full_kv_bytes:,}",
+        format_gib(full_kv_bytes),
+        f"{resident_bytes:,}",
+        format_gib(resident_bytes),
+        f"{avoided_resident_bytes:,}",
+        format_gib(avoided_resident_bytes),
         f"{resident_tokens:,}",
         f"{resident_blocks:,}",
         f"{block_size:,}",

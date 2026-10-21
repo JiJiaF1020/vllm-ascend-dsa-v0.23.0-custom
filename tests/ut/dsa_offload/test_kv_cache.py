@@ -12,10 +12,12 @@ from vllm_ascend.dsa_offload import kv_cache as dsa_kv_cache
 from vllm_ascend.dsa_offload.kv_cache import (
     DSAIndexerKVSpec,
     DSAResidentMLAAttentionSpec,
+    bind_dsa_full_kv_cache_views,
     build_dsa_kv_cache_config,
     build_dsa_kv_cache_groups,
     dsa_max_memory_usage_bytes,
     dsa_pool_bytes_per_base_block,
+    get_dsa_full_kv_aliases,
     get_dsa_group_num_blocks,
     get_dsa_kv_cache_binding_order,
     get_dsa_kv_cache_group_ids,
@@ -81,6 +83,180 @@ def _make_mtp_spec() -> AscendMLAAttentionSpec:
         cache_sparse_sfa_c8=False,
         cache_sparse_li_c8=False,
     )
+
+
+def _make_remote_specs(
+    num_layers: int = 5,
+    full_layers: tuple[int, ...] = (0, 1, 2),
+) -> dict[str, DSAIndexerKVSpec | DSAResidentMLAAttentionSpec]:
+    specs = _make_specs(num_layers)
+    for layer in range(num_layers):
+        resident_name = f"model.layers.{layer}.self_attn.attn"
+        specs[resident_name] = replace(
+            specs[resident_name],
+            head_size=656,
+            sparse_head_dim=(656, 0, 0),
+            cache_sparse_sfa_c8=True,
+        )
+        indexer_name = f"model.layers.{layer}.self_attn.indexer.k_cache"
+        if layer in full_layers:
+            specs[indexer_name] = replace(specs[indexer_name], cache_sparse_li_c8=True, full_kv_token_bytes=656)
+        else:
+            del specs[indexer_name]
+    return specs
+
+
+@pytest.mark.parametrize("full_layers", [(0,), (0, 1, 2), tuple(range(5))])
+def test_remote_full_uses_only_indexer_owned_kv_storage(monkeypatch, full_layers) -> None:
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 4)
+    groups = build_dsa_kv_cache_groups(_make_remote_specs(full_layers=full_layers))
+    aliases = get_dsa_full_kv_aliases(groups)
+    assert aliases == {
+        f"model.layers.{layer}.self_attn.attn": f"model.layers.{layer}.self_attn.indexer.k_cache"
+        for layer in full_layers
+    }
+    physical_resident_layers = 5 - len(full_layers)
+    expected_cost = 128 * (physical_resident_layers * 656 + len(full_layers) * 4 * (128 + 4 + 656))
+    assert dsa_pool_bytes_per_base_block(groups) == expected_cost
+    config = build_dsa_kv_cache_config(_make_vllm_config(override=128), groups, available_memory=1)
+    assert len(config.kv_cache_tensors) == 5
+    assert sum(t.size for t in config.kv_cache_tensors) == 128 * expected_cost
+    assert get_dsa_group_num_blocks(config, groups[0]) == 512
+    assert get_dsa_group_num_blocks(config, groups[1]) == 128
+    for tensor in config.kv_cache_tensors:
+        if any(name in aliases for name in tensor.shared_by):
+            assert len(tensor.shared_by) == 2
+            indexer, resident = tensor.shared_by
+            assert aliases[resident] == indexer
+
+
+def test_remote_full_aliases_keep_mtp_native_and_cross_rank_capacity(monkeypatch) -> None:
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 4)
+    specs = _make_remote_specs()
+    specs["model.layers.5.self_attn.attn"] = _make_mtp_spec()
+    groups = build_dsa_kv_cache_groups(specs)
+    config = build_dsa_kv_cache_config(_make_vllm_config(override=256), groups, available_memory=1)
+    assert config.kv_cache_tensors[-1].shared_by == ["model.layers.5.self_attn.attn"]
+    assert get_dsa_group_num_blocks(config, groups[2]) == 1024
+    config.num_blocks = 128
+    for tensor in config.kv_cache_tensors:
+        tensor.size //= 2
+    validate_dsa_kv_cache_config(config)
+    assert get_dsa_group_num_blocks(config, groups[0]) == 512
+    assert get_dsa_group_num_blocks(config, groups[1]) == 128
+    assert get_dsa_group_num_blocks(config, groups[2]) == 512
+
+
+def test_remote_full_savings_match_78_layer_capacity_report(monkeypatch) -> None:
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 4)
+    specs = _make_remote_specs(num_layers=78, full_layers=tuple(range(21)))
+    specs["model.layers.78.self_attn.attn"] = _make_mtp_spec()
+    groups = build_dsa_kv_cache_groups(specs)
+    old_cost = 128 * (78 * 656 + 21 * 4 * 788 + 4 * 1408)
+    saved = 21 * 1024 * 128 * 656
+    assert saved == 1_805_647_872
+    assert 1024 * (old_cost - dsa_pool_bytes_per_base_block(groups)) == saved
+    config = build_dsa_kv_cache_config(_make_vllm_config(), groups, available_memory=1024 * old_cost)
+    assert config.num_blocks == 1152
+    assert get_dsa_group_num_blocks(config, groups[0]) * 128 == 589824
+    assert config.num_blocks * 128 // 12544 == 11
+    assert dsa_max_memory_usage_bytes(_make_vllm_config(max_model_len=131072), groups) == (
+        1024 * dsa_pool_bytes_per_base_block(groups)
+    )
+
+
+def test_remote_full_capacity_report_counts_only_physical_resident(monkeypatch) -> None:
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 4)
+    settings = SimpleNamespace(
+        max_resident_budget_tokens=12288, sparse_tail_block_count=2, mtp_enabled=True, mtp_cache_layer_count=1
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.ascend_config.get_ascend_config", lambda: SimpleNamespace(dsa_offload_config=settings)
+    )
+    logs = []
+    monkeypatch.setattr(dsa_kv_cache.logger, "info_once", lambda fmt, *args: logs.append(fmt % args))
+    specs = _make_remote_specs(num_layers=78, full_layers=tuple(range(21)))
+    specs["model.layers.78.self_attn.attn"] = _make_mtp_spec()
+    groups = build_dsa_kv_cache_groups(specs)
+    config = build_dsa_kv_cache_config(_make_vllm_config(override=1024), groups, available_memory=1)
+    vconfig = _make_vllm_config(max_model_len=40960)
+    vconfig.scheduler_config = SimpleNamespace(max_num_seqs=7)
+    dsa_kv_cache.report_dsa_kv_cache_config(vconfig, config)
+    assert "indexer=21, resident=57, mtp=1" in logs[0]
+    assert "21 aliases (no extra HBM; 78 logical MLA layers)" in logs[0]
+    assert "1,805,647,872 bytes" in logs[0]
+    assert "10 requests (12,544 resident slots/request)" in logs[0]
+    assert "7 requests (max_num_seqs=7)" in logs[0]
+
+
+def test_remote_full_raw_views_reuse_payload_without_copy_or_clear(monkeypatch) -> None:
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 4)
+    groups = build_dsa_kv_cache_groups(_make_remote_specs())
+    config = build_dsa_kv_cache_config(_make_vllm_config(override=1), groups, available_memory=1)
+    aliases = get_dsa_full_kv_aliases(groups)
+    raw = {
+        source: (
+            torch.empty(4 * 128 * 128, dtype=torch.int8),
+            torch.empty(4 * 128 * 4, dtype=torch.int8),
+            torch.full((4 * 128 * 656,), 42, dtype=torch.int8),
+        )
+        for source in aliases.values()
+    }
+    for layer in (3, 4):
+        raw[f"model.layers.{layer}.self_attn.attn"] = (torch.full((128 * 656,), 17, dtype=torch.int8),)
+    shared = raw["model.layers.3.self_attn.attn"][0]
+    bind_dsa_full_kv_cache_views(config, raw)
+    for name, source in aliases.items():
+        view = raw[name][0]
+        payload = raw[source][2]
+        assert view.numel() == 128 * 656
+        assert view.data_ptr() == payload.data_ptr()
+        assert view.untyped_storage().data_ptr() == payload.untyped_storage().data_ptr()
+        assert torch.all(view == 42)
+        view.fill_(9)
+        assert torch.all(payload[: view.numel()] == 9)
+        assert torch.all(payload[view.numel() :] == 42)
+    assert raw["model.layers.3.self_attn.attn"][0] is shared
+    assert torch.all(shared == 17)
+
+
+def test_remote_full_rejects_independent_resident_and_missing_payload(monkeypatch) -> None:
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 4)
+    groups = build_dsa_kv_cache_groups(_make_remote_specs())
+    config = build_dsa_kv_cache_config(_make_vllm_config(override=1), groups, available_memory=1)
+    name, source = next(iter(get_dsa_full_kv_aliases(groups).items()))
+    with pytest.raises(RuntimeError, match="independent resident storage"):
+        bind_dsa_full_kv_cache_views(config, {name: (torch.empty(1, dtype=torch.int8),)})
+    with pytest.raises(RuntimeError, match="key/scale/full payload"):
+        bind_dsa_full_kv_cache_views(config, {source: (torch.empty(1, dtype=torch.int8),)})
+    tensor = next(tensor for tensor in config.kv_cache_tensors if name in tensor.shared_by)
+    tensor.shared_by.remove(source)
+    with pytest.raises(RuntimeError, match="share its Indexer allocation"):
+        get_dsa_group_num_blocks(config, groups[1])
+
+
+def test_remote_full_rejects_incompatible_resident_layout() -> None:
+    groups = build_dsa_kv_cache_groups(_make_remote_specs())
+    groups[1] = replace(groups[1], kv_cache_spec=replace(groups[1].kv_cache_spec, sparse_head_dim=(512, 64, 0)))
+    with pytest.raises(RuntimeError, match="matching packed-C8 layouts"):
+        get_dsa_full_kv_aliases(groups)
+
+
+def test_local_full_keeps_independent_resident_storage(monkeypatch) -> None:
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 4)
+    specs = _make_remote_specs()
+    for name, spec in tuple(specs.items()):
+        if isinstance(spec, DSAIndexerKVSpec):
+            specs[name] = replace(spec, full_kv_token_bytes=0)
+    groups = build_dsa_kv_cache_groups(specs)
+    assert not get_dsa_full_kv_aliases(groups)
+    config = build_dsa_kv_cache_config(_make_vllm_config(override=128), groups, available_memory=1)
+    assert len(config.kv_cache_tensors) == 8
+    assert all(len(tensor.shared_by) == 1 for tensor in config.kv_cache_tensors)
+    assert dsa_pool_bytes_per_base_block(groups) == 128 * (5 * 656 + 3 * 4 * 132)
+    raw = {}
+    bind_dsa_full_kv_cache_views(config, raw)
+    assert raw == {}
 
 
 def test_indexer_spec_accounts_for_one_vector_per_token() -> None:

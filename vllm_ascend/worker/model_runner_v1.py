@@ -214,6 +214,8 @@ from vllm_ascend.dsa_offload.kv_cache import (
     DSAIndexerKVSpec,
     DSAKVCacheGroupIds,
     DSAResidentMLAAttentionSpec,
+    bind_dsa_full_kv_cache_views,
+    get_dsa_full_kv_aliases,
     get_dsa_group_num_blocks,
     get_dsa_kv_cache_binding_order,
     get_dsa_kv_cache_group_ids,
@@ -5202,6 +5204,18 @@ class NPUModelRunner(GPUModelRunner):
             # runtime_layer_id 作为其 top-K 选择来源。LIDU cache_slots 仅按
             # full 层分配紧凑 selection_state_id。
             layer_plan = self.dsa_execution_plan.layers[layer_index]
+            full_cache = self._dsa_full_caches.get(indexer_name)
+            if full_cache is not None and resident_cache[0].data_ptr() != full_cache.data_ptr():
+                raise RuntimeError(
+                    f"DSA remote full MLA view lost its full-KV storage identity: layer={resident_name}"
+                )
+            if full_cache is not None:
+                logger.info(
+                    "DSA_FULL_KV_STORAGE layer=%s full_shape=%s metadata_view_shape=%s "
+                    "data_ptr=%s resident_extra_bytes=0",
+                    resident_name, tuple(full_cache.shape), tuple(resident_cache[0].shape),
+                    hex(full_cache.data_ptr()),
+                )
             selection_state_id: int | None = None
             selection_source_layer_id: int | None = None
             if indexer_cache is not None:
@@ -5239,7 +5253,7 @@ class NPUModelRunner(GPUModelRunner):
                     selection_source_layer_id=selection_source_layer_id,
                     packed_c8=self.dsa_offload_packed_c8,
                     execution_plan=layer_plan,
-                    full_cache=self._dsa_full_caches.get(indexer_name),
+                    full_cache=full_cache,
                 )
             )
 
@@ -5448,6 +5462,7 @@ class NPUModelRunner(GPUModelRunner):
         # prefill disaggregation need the addr of cache tensor be aligned with 2M
         alignment = 2 * 1024 * 1024
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        full_kv_aliases = get_dsa_full_kv_aliases(kv_cache_config.kv_cache_groups)
         # If some tensors are shared by linear layers and attention layers,
         # the same tensor format must be maintained even if some layers
         # have only linear or attention layers, for example, the mtp layer.
@@ -5462,6 +5477,11 @@ class NPUModelRunner(GPUModelRunner):
             self.hybrid_with_attn_and_mamba = self.hybrid_with_attn_and_mamba or (use_mamba and use_attn)
             for idx in range(len(kv_cache_tensor.shared_by)):
                 layer_name = kv_cache_tensor.shared_by[idx]
+                if layer_name in full_kv_aliases:
+                    # remote full 已在 Indexer plane 中拥有完整 packed KV。
+                    # 全部真实 storage 分配后再绑定零分配 view，避免依赖
+                    # shared_by/group 的顺序，也不重复清零/注册完整源。
+                    continue
                 current_layer_spec = layer_kv_cache_spec[layer_name]
                 if isinstance(current_layer_spec, DSAIndexerKVSpec):
                     if layer_name not in kv_cache_raw_tensors:
@@ -5721,6 +5741,7 @@ class NPUModelRunner(GPUModelRunner):
                             else:
                                 # Dense attention: regular K/V only.
                                 kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor)
+        bind_dsa_full_kv_cache_views(kv_cache_config, kv_cache_raw_tensors)
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
             for layer_name in group.layer_names:
@@ -6806,11 +6827,14 @@ class NPUModelRunner(GPUModelRunner):
         Called from gpu_worker.py outside the CuMem pool context.
         """
         self._kv_block_zeroer = AscendKVBlockZeroer(self.device, self.pin_memory)
+        full_kv_aliases = get_dsa_full_kv_aliases(self.kv_cache_config.kv_cache_groups)
         self._kv_block_zeroer.init_meta(
             attn_groups_iter=self._kv_cache_spec_attn_group_iterator(),
             kernel_block_sizes=self.kernel_block_sizes,
             cache_dtype=self.cache_config.cache_dtype,
-            runner_only_attn_layers=self.runner_only_attn_layers,
+            # resident block ID 不对应 full 的 Indexer block ID；不能按
+            # resident 分配/释放去清零与完整历史数据共用的 prefix view。
+            runner_only_attn_layers=self.runner_only_attn_layers | set(full_kv_aliases),
             static_forward_context=(self.compilation_config.static_forward_context),
         )
 

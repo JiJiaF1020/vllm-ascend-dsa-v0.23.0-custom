@@ -1,6 +1,6 @@
 # DSA 稀疏卸载当前设计
 
-> - 最后更新：2026-08-20
+> - 最后更新：2026-10-21（补充远端 full KV 的物理分配）
 > - 目标基线：vLLM v0.23.0 + vLLM-Ascend v0.23.0
 > - 当前完成度：核心控制面、eager 和 FULL decode graph 已完成 910C 初验；
 >   chunked prefill 已完成分段 prefill/首 token 初验，完整 sparse decode
@@ -350,6 +350,40 @@ MTP full group 复用基线 allocation/reshape，得到恰好三项 BF16 tuple�
 
 它使用独立 block table 与 slot mapping；物理 block ID 无需等于 target
 Indexer，但 token coverage 必须相同。
+
+### 6.4 远端 shared 场景不再重复分配 full resident
+
+仅 `hbm_full_remote_shared`：full 的 `DSAIndexerKVSpec.full_kv_token_bytes=656`，
+完整 packed KV 与 Indexer 共用完整页生命周期，shared 继续使用各层独立 resident KV。
+full 前向/prolog/PUT 均使用完整 KV 与 Indexer block table，不再申请第二份 resident 数据区。
+本地 `local_all`、shared payload、MTP BF16 full-cache 的分配保持不变。
+
+为保持 scheduler group、metadata builder、绑定顺序和图参数不变，full 的逻辑 MLA
+identity 仍在原 group 中。其 `KVCacheTensor.shared_by` 指向同层 Indexer allocation，
+worker 只建立完整 packed KV 的 base-N 前缀 view；该 view 不申请/复制/清零数据。
+实际 full 计算不得用 resident block ID 寻址它，通用 resident 块清零也必须排除这些 view。
+PUT 仍只注册原完整 producer allocation，不注册这个缩短 view；allocation/export 覆盖图与在途 READ。
+
+设 `F` 为 full 数、`S` 为 shared 数、`r` 为比例、`M` 为 MTP full 层数。A5 当前布局下：
+
+```text
+bytes_per_base_block = 128 * (S*656 + r*F*(128+4+656) + r*M*1408)
+```
+
+与旧实现相比，固定 N 个 base blocks 少分配 `F*N*128*656` 字节。容量规划、最终 tensor
+和报告都采用该公式，不只跳过 worker 分配而仍按旧布局计费。
+报告 `Physical cache layers` 中 resident 仅计真实数据区，同时另列 full alias 数、
+full packed KV、真实 resident 及固定当前 N 避免的 resident 字节。
+
+78层、21 full、57 shared、1 MTP、r=4、N=1024 时，固定容量节省1,805,647,872B，约1.68GiB。
+若可用预算恰等于旧15.0137GiB分配，新自动容量为N=1152，resident=147456 token，
+Indexer/MTP=589824 token；H=12288、双tail=256时 MLA Decode 上限为11请求。
+原N=1024时 MLA上限是10，不是 Indexer/MTP 报告的12；`max_num_seqs=7`再将配置上限压为7。
+实际 N 仍取决于 profile 得到的可用预算、128块对齐、显式 override 与多 rank 最小值。
+
+本轮不改变4:1比例及 Prefill 完整上下文暂存/准入要求，不能承诺只靠去冗余达到BS16。
+仅更新框架Python并重启推理、重新捕图；不修改算子、extension、Pool或wire。
+已补已有CPU回归；本机缺少vLLM/NPU，完整框架与设备Prefill/PUT/图重放验收仍待服务器执行。
 
 ## 7. 请求 cache 布局账本
 

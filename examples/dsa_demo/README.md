@@ -99,6 +99,16 @@ NPU capture/replay、精度及DP/TP并发须在服务器验收。无算子/wire�
 
 ## 单机多卡运行：simple_test_1p.py 使用样例
 
+远端`hbm_full_remote_shared`的full层仅分配完整packed KV，不再额外分配resident数据区；
+本地卸载、shared各层resident和MTP full cache保持原样，无需新开关或JSON字段。
+更新框架Python后必须重启推理并重新capture；此次不需重编OPP、extension或Pool。
+检查启动的`DSA HBM CACHE CAPACITY REPORT`：78层/21 full时应为
+`Physical cache layers: indexer=21, resident=57, mtp=1`，另列`Full MLA storage views: 21 aliases`。
+逐full层`DSA_FULL_KV_STORAGE ... resident_extra_bytes=0`确认绑定地址与完整KV一致。
+自动规划通常会将节省的预算重新用于扩池，因此总KV HBM不一定下降；比较base blocks、tokens及
+`Sparse decode MLA limit`，不要只看`Dense Indexer limit`推断并发上限。
+Prefill仍需完整上下文暂存，不能直接把shared物理池限制为`BS*(H+256)`。
+
 真实`--remote-shared-config`链支持每DP BS1..32、TP1/TP2、MTP3 eager；
 decode FULL图适配已加入，DP4/BS32的NPU实机验收尚未完成。
 首次decode绑定一批请求，之后允许缩批/重排；请求结束保留row和连接，到worker退出统一释放。

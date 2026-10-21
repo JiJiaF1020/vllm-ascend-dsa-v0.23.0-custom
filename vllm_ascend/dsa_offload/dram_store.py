@@ -7,6 +7,10 @@
 * 每层 A3 NOPE/ROPE 或 A5 packed C8 payload 的 Ascend swapped-memory arena；
 * ``resident pool row -> logical full block -> DRAM block id`` 逻辑表。
 
+真实远端直通卸载使用 metadata-only 模式：只保留逻辑表、block-id 分配与
+durable 水位，不创建本地 payload arena。此时 block id 仅供既有 dump plan
+记账，不是远端页地址；真实 PUT/GET 仍由远端 Store/DU 管理。
+
 该 store 只保存 target transformer 层的 payload。方案二中的 MTP draft
 层使用独立原生 BF16 full cache，不注册 DRAM arena。MTP provisional token
 只会影响 target 的 HBM 双尾块；只有下一 outer step 看到 scheduler 已确认
@@ -104,6 +108,7 @@ class DSAHotDRAMStore:
         max_logical_blocks: int,
         device: torch.device,
         arena_factory: ArenaFactory | None = None,
+        metadata_only: bool = False,
     ) -> None:
         if usable_blocks <= 0:
             raise ValueError("DSA DRAM store requires positive usable blocks")
@@ -117,6 +122,7 @@ class DSAHotDRAMStore:
         self.storage_rows = int(storage_rows)
         self.max_logical_blocks = int(max_logical_blocks)
         self.device = torch.device(device)
+        self.metadata_only = bool(metadata_only)
         self._arena_factory = arena_factory or _allocate_swapped_arena
         self._layer_arenas: dict[int, DSALayerDRAMArenas] = {}
 
@@ -154,6 +160,8 @@ class DSAHotDRAMStore:
     ) -> None:
         """按 resident cache 的真实 block shape 建立该层 arena。"""
 
+        if self.metadata_only:
+            raise RuntimeError("DSA metadata-only store has no local payload arenas")
         layer_id = int(layer_id)
         if layer_id in self._layer_arenas:
             raise RuntimeError(f"DSA DRAM layer {layer_id} was initialized twice")
@@ -187,6 +195,8 @@ class DSAHotDRAMStore:
     ) -> None:
         """为 A5 packed C8 resident cache 建立 opaque-byte DRAM arena。"""
 
+        if self.metadata_only:
+            raise RuntimeError("DSA metadata-only store has no local payload arenas")
         layer_id = int(layer_id)
         if layer_id in self._layer_arenas:
             raise RuntimeError(f"DSA DRAM layer {layer_id} was initialized twice")
@@ -230,6 +240,8 @@ class DSAHotDRAMStore:
         try:
             return self._layer_arenas[int(layer_id)]
         except KeyError as exc:
+            if self.metadata_only:
+                raise RuntimeError("DSA metadata-only store has no local payload arenas") from exc
             raise RuntimeError(f"DSA DRAM arenas are not initialized for layer {layer_id}") from exc
 
     def reserve_blocks(

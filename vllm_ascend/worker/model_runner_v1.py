@@ -5082,6 +5082,7 @@ class NPUModelRunner(GPUModelRunner):
             kv_cache_config,
             indexer_group,
         )
+        shared_config = self.ascend_config.dsa_offload_config.remote_shared
         store = DSAHotDRAMStore(
             usable_blocks=calculate_dram_usable_blocks(
                 indexer_num_blocks,
@@ -5090,6 +5091,13 @@ class NPUModelRunner(GPUModelRunner):
             storage_rows=resident_pool.storage_rows,
             max_logical_blocks=runtime.max_logical_blocks,
             device=self.device,
+            # 只有真实远端直通链不再消费本地 MLA payload；local_all、
+            # store_shadow 和显式 TCP 回退仍保持原 swapped-memory arena。
+            metadata_only=(
+                self.dsa_offload_packed_c8
+                and shared_config is not None
+                and shared_config.put_transport == "urma_read"
+            ),
         )
 
         ordered_layer_indices = sorted(resident_names)
@@ -5233,17 +5241,18 @@ class NPUModelRunner(GPUModelRunner):
             if runtime.ready_shadow is not None:
                 runtime.ready_shadow.register_layer(runtime_layer_id, selection_state_id, selection_source_layer_id)
 
-            if self.dsa_offload_packed_c8:
-                store.add_packed_layer(
-                    layer_id=runtime_layer_id,
-                    resident_packed_cache=resident_cache[0],
-                )
-            else:
-                store.add_layer(
-                    layer_id=runtime_layer_id,
-                    resident_nope_cache=resident_cache[0],
-                    resident_rope_cache=resident_cache[1],
-                )
+            if not store.metadata_only:
+                if self.dsa_offload_packed_c8:
+                    store.add_packed_layer(
+                        layer_id=runtime_layer_id,
+                        resident_packed_cache=resident_cache[0],
+                    )
+                else:
+                    store.add_layer(
+                        layer_id=runtime_layer_id,
+                        resident_nope_cache=resident_cache[0],
+                        resident_rope_cache=resident_cache[1],
+                    )
             resident_impl.bind_dsa_offload_context(
                 DSALayerOffloadContext(
                     layer_id=runtime_layer_id,
@@ -5265,8 +5274,14 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         runtime.bind_dram_store(store)
+        logger.info(
+            "DSA_DRAM_STORE mode=%s local_payload_layers=%s usable_blocks=%s arena_capacity=%s",
+            "metadata_only" if store.metadata_only else "local_payload",
+            0 if store.metadata_only else len(ordered_layer_indices),
+            store.usable_blocks,
+            store.arena_capacity,
+        )
         remote_config = self.ascend_config.dsa_offload_config.remote_store
-        shared_config = self.ascend_config.dsa_offload_config.remote_shared
         if shared_config is not None:
             from kvcache_scatter_copy_custom_ops import custom_ops_lib
 

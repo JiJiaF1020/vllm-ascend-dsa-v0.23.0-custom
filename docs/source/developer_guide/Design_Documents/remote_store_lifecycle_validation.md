@@ -263,3 +263,25 @@ batch-order I32/I64设备Tensor。plan/control/generation使用固定pinned owne
 源覆盖仍是安全边界：v6本步还从tail读取新页，异常调度撞同parity会报0x3508，而不是
 等READ_DONE后读被覆盖的数据。正常连续MTP3推进不应触发；下一步激活也可能暴露
 未完成的READ，不能把“改成异步提交”直接作为零开销结论。
+
+## 2026-10-21：远端直通不再创建本地 MLA payload arena
+
+`hbm_full_remote_shared` 且 `put_transport=urma_read` 时，绑定阶段的
+`DSAHotDRAMStore` 改为 metadata-only：保留逻辑 block table、block-id 分配及 durable
+水位，供原 dump plan 与候选推进使用，但跳过所有 target 层的 swapped-memory
+payload arena。真实数据仍从 producer HBM 经 Pool READ 写入 Store，再由 Pool
+Gather/WRITE 回原 reply，由 ScatterSFA 消费与安装；不新增占位 Tensor 或本地副本。
+本地 block id 只是兼容计划的记账编号，不是远端页地址，也不表示 PUT_DONE。
+
+启动应看到 `DSA_DRAM_STORE mode=metadata_only local_payload_layers=0`。该模式下若误入
+本地 KSC/dump 取 arena，会明确报错，不静默分配或使用空数据。`local_all`、
+`store_shadow` 与显式 `put_transport=tcp` 回退仍分配原本地 arena，行为不变。
+
+本项只更新框架 Python 并重启推理进程，不需重编 Pool、OPP、extension 或 hcomm；
+不改变 producer HBM、注册地址/GVA、图参数、generation/ticket 或 PUT_DONE/APPLIED
+边界。减少的是 worker-local 主机 payload 内存及其映射/注册资源，不是 HBM KV 容量。
+metadata-only 仍沿用原元数据 block 配额，远端 Store backing 也仍需独立配置足够容量。
+
+已有 `test_dram_store.py` 补充真实 Host 元数据/拒绝本地 arena 的回归；开发机没有
+完整 vLLM/CANN/NPU，CPU 检查不能替代启动 PAD 图、真实 Prefill PUT、Decode 跨满页
+及多 DP/TP 回放验收。部署后仍须核对原 FX 隐藏资源、producer 地址与实际 IO 正确性。

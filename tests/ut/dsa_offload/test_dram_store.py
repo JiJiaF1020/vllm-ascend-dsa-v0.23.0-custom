@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import numpy as np
+import pytest
 import torch
 
 from vllm_ascend.dsa_offload.dram_store import (
@@ -23,13 +24,14 @@ def _cpu_arena(
     )
 
 
-def _make_store() -> DSAHotDRAMStore:
+def _make_store(*, metadata_only: bool = False) -> DSAHotDRAMStore:
     return DSAHotDRAMStore(
         usable_blocks=8,
         storage_rows=3,
         max_logical_blocks=6,
         device=torch.device("cpu"),
         arena_factory=_cpu_arena,
+        metadata_only=metadata_only,
     )
 
 
@@ -73,8 +75,30 @@ def test_packed_c8_layer_uses_an_opaque_byte_arena() -> None:
     assert torch.count_nonzero(arenas.packed[0]).item() == 0
 
 
-def test_reservation_is_idempotent_and_release_reclaims_whole_row() -> None:
-    store = _make_store()
+def test_metadata_only_store_forbids_local_payload_arenas() -> None:
+    # 不提供 arena_factory；远端元数据路径不应导入 torch_npu 或创建 payload。
+    store = DSAHotDRAMStore(
+        usable_blocks=8,
+        storage_rows=3,
+        max_logical_blocks=6,
+        device=torch.device("cpu"),
+        metadata_only=True,
+    )
+    assert store.metadata_only
+    packed = torch.empty(4, 128, 1, 656, dtype=torch.int8)
+    nope = torch.empty(4, 128, 1, 512)
+    rope = torch.empty(4, 128, 1, 64)
+    with pytest.raises(RuntimeError, match="metadata-only store has no local payload"):
+        store.add_packed_layer(layer_id=0, resident_packed_cache=packed)
+    with pytest.raises(RuntimeError, match="metadata-only store has no local payload"):
+        store.add_layer(layer_id=0, resident_nope_cache=nope, resident_rope_cache=rope)
+    with pytest.raises(RuntimeError, match="metadata-only store has no local payload"):
+        store.get_layer_arenas(0)
+
+
+@pytest.mark.parametrize("metadata_only", (False, True))
+def test_reservation_is_idempotent_and_release_reclaims_whole_row(metadata_only: bool) -> None:
+    store = _make_store(metadata_only=metadata_only)
     pool_rows = np.array([0, 0, 1], dtype=np.intp)
     logical_blocks = np.array([0, 2, 0], dtype=np.intp)
 

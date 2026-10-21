@@ -466,3 +466,25 @@ epoch 是本 rank 的 forward 计数，不保证不同 rank 永远一一相等�
 `num_tokens_across_dp` 的设备内容，仅打印 shape，避免 Tensor repr 隐式同步。
 DEBUG 本身会增加文件/console I/O，并启用原有 graph 输入地址检查，**只用于定位，
 不能拿这一轮的时延作为性能基线**。本机无法验证实际 NPU replay，请以远端日志和 MSTX 为准。
+
+## Full 一次触发全部 shared IO（2026-10-21）
+
+`hbm_full_remote_shared` 固定使用整组 Gather：Full 的 LISSend 只发送一次
+DU_AND_GATHER，Pool 根据启动拓扑自动聚合同组全部 shared 层，不再等待后继层发送
+GATHER_ONLY 或逐层消费确认。各 shared 直接执行自己的 CopySFA，仍等待本层的
+reply generation/completion，末层才更新 mirror、执行唯一 APPLIED。
+APPLIED 一次检查整组所有层的 status，不能仅凭末层成功确认整个计划。
+
+无需修改 remote-shared.json，也不增加回退配置。能力不足时直接报错，不静默恢复逐层
+Gather。必须部署配套 Pool、Torch extension、普通 OPP（APPLIED）和 C8 OPP（CopySFA），
+更新框架后重启 worker/Pool，重新捕获图。只更换框架 Python 或只重编 extension 不够。
+
+启动后核对 Pool/NPU 的 `group_gather=1`，`DSA_EXECUTION_PLAN` 后继不再包含
+`gather_only`；设备 timeline 只保留每组末端一次 APPLIED。eager IO 对拍中，后继层的
+操作标为 `AUTO_GATHER`，仍读取各层真实回包，不是 ready 旁路。原 KV 对拍入口不变。
+固定连接必须满足 `shared层数 × ceil(connection_batch/16) <= 8`，否则直接拒绝，防止
+同组未消费的回包槽被覆盖；GLM 三 shared、BS32 需要 6 槽。
+
+Pool 复用当前 context/worker 和分段发送流水；“一把触发”不表示只有一个 payload，
+也不保证所有层同时 Gather。完整行为和重新编译命令见算子仓
+`docs/full_triggered_group_gather.md`。本机 Host 回归不能替代 NPU/URMA、真实图与性能验收。

@@ -425,7 +425,7 @@ class NPUModelRunner(GPUModelRunner):
                 if not dsa_config.mtp_enabled:
                     raise ValueError("hbm_full_remote_shared currently requires MTP3 target decode")
                 capabilities = {"full_hbm_cache", "lis_send_durable_dual_output", "shared_fetch", "scatter_sfa",
-                                "group_applied", "grouped_transport", "pool_du"}
+                                "group_applied", "grouped_transport", "pool_du", "full_triggered_group_gather"}
             self.dsa_execution_plan.require_capabilities(capabilities)
         full_indexer_layers = (
             dsa_config.model_capabilities.full_indexer_layer_indices
@@ -836,6 +836,8 @@ class NPUModelRunner(GPUModelRunner):
 
         if getattr(custom_ops_lib, "lis_send_startup_capture_version", lambda: 0)() < 1:
             raise RuntimeError("startup PAD capture requires updated Pool, extension and OPP")
+        if getattr(custom_ops_lib, "lis_send_group_gather_version", lambda: 0)() < 1:
+            raise RuntimeError("remote shared group Gather requires updated Pool, extension and ordinary/C8 OPP")
         if config.put_transport == "urma_read" and getattr(custom_ops_lib, "lis_send_direct_put_version", lambda: 0)() < 2:
             raise RuntimeError("direct PUT batch-order lengths require extension version 2 and matching ordinary OPP")
         if config.put_visibility == "next_step_local" and getattr(custom_ops_lib, "lis_send_deferred_put_version", lambda: 0)() < 2:
@@ -863,6 +865,7 @@ class NPUModelRunner(GPUModelRunner):
             runtime.max_logical_blocks * 128, rows, runtime.num_layers,
             [group.source_layer for group in self.dsa_execution_plan.groups], store.store_id, None,
             False, device.eid_index, device.pool_eid, True, config.put_transport == "urma_read",
+            group_gather=True,
             **({"deferred_put": True} if config.put_visibility == "next_step_local" else {}))
         from vllm_ascend.dsa_offload.remote_put import RemotePut
 

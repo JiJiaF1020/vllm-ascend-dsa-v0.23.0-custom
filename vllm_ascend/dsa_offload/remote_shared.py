@@ -33,6 +33,9 @@ class RemoteShared:
         from kvcache_scatter_copy_custom_ops import custom_ops_lib
 
         self.native, self.config, self.runtime, self.plan = custom_ops_lib, config, runtime, plan
+        if getattr(self.native, "lis_send_group_gather_version", lambda: 0)() < 1:
+            raise RuntimeError("remote shared requires Full-triggered group Gather; "
+                               "rebuild Pool, extension and ordinary/C8 OPP")
         if getattr(self.native, "lis_send_fused_output_version", lambda: 0)() < 1:
             raise RuntimeError("remote shared requires fused-output LISSend extension and matching C8 OPP; rebuild both")
         if getattr(self.native, "lis_send_weight_stride_version", lambda: 0)() < 1:
@@ -68,8 +71,6 @@ class RemoteShared:
         self.bound = None
         self.buffers = {}
         self.current = None
-        self.previous_out = None
-        self.previous_status = None
         self.calls = self.fetches = self.sfas = 0
         self.graph_enabled = graph_enabled
         self.validate = validate or debug_config is not None
@@ -184,7 +185,7 @@ class RemoteShared:
                 host, int(port), self.config.device_eid, str(self.runtime.device), owners,
                 self.runtime.max_logical_blocks * 128, b, self.runtime.num_layers,
                 [group.source_layer for group in self.plan.groups], shadow.store.store_id, bound,
-                False, self.config.eid_index, self.config.pool_eid)
+                False, self.config.eid_index, self.config.pool_eid, group_gather=True)
             self.groups = (b + 15) // 16
             self.period = ((self.runtime.num_layers * self.groups + 7) // 8) * 8
         else:
@@ -203,7 +204,7 @@ class RemoteShared:
         self.request_ids = {row: shadow.request_ids[row] for row in host_rows}
         if self.worker_parking:
             self.native.lis_send_pool_begin_step(self.handle, 0, [])
-        logger.info("DSA_SHARED_CONNECT_OK %s wire=%s backend=real_store groups=%s", self.identity,
+        logger.info("DSA_SHARED_CONNECT_OK %s wire=%s backend=real_store group_gather=full groups=%s", self.identity,
                     6 if self.deferred_put else 5, len(self.plan.groups))
 
     def _buffer(self, context, batch):
@@ -212,12 +213,15 @@ class RemoteShared:
         if key not in self.buffers:
             device = self.runtime.device
             empty = lambda shape, dtype: torch.empty(shape, dtype=dtype, device=device)
+            payload_layers = len(self.plan.groups[context.execution_plan.group].remote_layers)
             self.buffers[key] = dict(
                 prepared=empty((batch*4, 1, 2304), torch.int32),
                 full=empty((batch*4, 1, 2304), torch.int32),
                 ticket=torch.zeros(((batch+15)//16, 2), dtype=torch.int64, device=device),
                 maximum=empty((1,), torch.float32), total=empty((1,), torch.float32),
                 rows=empty((batch,), torch.int32),
+                # 层优先固定连续区；逐层写view，组末APPLIED一次读取整组，图内无cat/copy。
+                statuses=empty((payload_layers*batch, 4), torch.int64),
                 tail_info=empty((batch, 2), torch.int32))
         return self.buffers[key]
 
@@ -228,9 +232,12 @@ class RemoteShared:
                 self.generation_owner = CpuGpuBuffer(self.runtime.num_layers, self.groups, dtype=torch.int64,
                                                      device=self.runtime.device, pin_memory=self.runtime.pin_memory)
             group = self._buffer(context, batch)
+            first = context.execution_plan.first_payload_layer
+            ordinal = context.layer_id - first
             self.layer_buffers[key] = dict(
                 generation=self.generation_owner.gpu[context.layer_id, :(batch+15)//16],
-                status=torch.empty((batch, 4), dtype=torch.int64, device=self.runtime.device),
+                ticket_generation=self.generation_owner.gpu[first, :(batch+15)//16],
+                status=group["statuses"][ordinal*batch:(ordinal+1)*batch],
                 ticket=group["ticket"],
             )
         return self.layer_buffers[key]
@@ -248,7 +255,7 @@ class RemoteShared:
         graph_b = metadata.dsa_resident_pool_indices.numel()
         if not 0 <= b <= graph_b:
             raise RuntimeError(f"remote active batch {b} exceeds metadata rows {graph_b}")
-        self.current = self.previous_out = self.previous_status = None
+        self.current = None
         logger.debug("DSA_SHARED_GRAPH_ROWS %s epoch=%s active=%s graph_rows=%s pad=%s remote_commands_per_layer=%s",
                      self.identity, self.runtime._forward_epoch, b, graph_b, graph_b-b, (b+15)//16)
         if b == 0:
@@ -340,7 +347,6 @@ class RemoteShared:
                     self._check_ticket(data, "APPLIED")
         self.warmed_batches.add(b)
         self.calls += sum(bool(g.remote_layers) for g in self.plan.groups) * ((b+15)//16)
-        self.fetches += sum(max(0, len(g.remote_layers)-1) for g in self.plan.groups) * ((b+15)//16)
         self.sfas += sum(len(g.remote_layers) for g in self.plan.groups)
         if self.validate:
             logger.info("DSA_SHARED_STEP_OK %s epoch=%s batch=%s checked=ScatterSFA,APPLIED",
@@ -449,7 +455,7 @@ class RemoteShared:
             return
         groups = (self.runtime.active_num_reqs + 15) // 16
         ticket = data["ticket"].cpu()[:groups]
-        if not torch.equal(ticket[:, 0], data["generation"].cpu()[:groups]) or bool(ticket[:, 1].any()):
+        if not torch.equal(ticket[:, 0], data["ticket_generation"].cpu()[:groups]) or bool(ticket[:, 1].any()):
             raise RuntimeError(f"{phase} submission failed: {ticket.tolist()}")
 
     def select(self, context, query, weights, scale, actual_q, rows, candidates, visible, row_modes, table, budgets):
@@ -518,15 +524,7 @@ class RemoteShared:
             raise RuntimeError("shared layer has no current source selection plan")
         if data["rows"].numel() == 0:
             return DSAOffloadSelectionOutput(data["prepared"], data["tail_info"])
-        if context.layer_id != context.execution_plan.first_payload_layer:
-            payload = self._payload(context, data["rows"].numel())
-            if not self.graph_enabled:
-                self._generation(payload, context.layer_id)
-            torch.ops.custom.pool_fetch_shared_out(self.previous_out, data["rows"], payload["generation"],
-                                                  self.previous_status, data["ticket"])
-            if not self.graph_enabled:
-                self._check_ticket(payload, "GATHER_ONLY")
-                self.fetches += payload["generation"].numel()
+        # Full已触发同组全部payload；这里只复用选择，不发GATHER_ONLY、不等待前层status。
         return DSAOffloadSelectionOutput(data["prepared"], data["tail_info"])
 
     def attention(self, context, query, packed, table, actual_q, scale):
@@ -535,6 +533,8 @@ class RemoteShared:
         if b == 0:
             return torch.zeros((*query.shape[:-1], 512), dtype=query.dtype, device=query.device)
         payload = self._payload(context, b)
+        if not self.graph_enabled:
+            self._generation(payload, context.layer_id)
         out = torch.empty((*query.shape[:-1], 512), dtype=query.dtype, device=query.device)
         torch.ops.nanovllm_dsa.copy_sfa_mtp_c8_out(
             query.contiguous(), packed, data["prepared"], table.contiguous(), actual_q, data["rows"],
@@ -542,11 +542,9 @@ class RemoteShared:
             self.runtime.resident_token_pool.get_cache_slots(context.execution_plan.group),
             scale, out, data["maximum"], data["total"], payload["status"],
             context.execution_plan.mirror_writer == "scatter_sfa")
-        self.previous_out = out
-        self.previous_status = payload["status"]
         if context.execution_plan.applied:
             torch.ops.custom.remote_du_applied_out(out, data["rows"], payload["generation"],
-                                                  payload["status"], data["ticket"])
+                                                  data["statuses"], data["ticket"])
             if not self.graph_enabled:
                 self._check_ticket(payload, "APPLIED")
         # 显式验收才逐层同步检查；设备侧status/APPLIED依赖始终保留。
@@ -564,8 +562,7 @@ class RemoteShared:
             return
         self.native.lis_send_pool_close(self.handle)
         self.handle = None
-        self.rows = self.active_rows = self.bound = self.current = self.previous_out = None
-        self.previous_status = None
+        self.rows = self.active_rows = self.bound = self.current = None
         self.buffers.clear()
         self.layer_buffers.clear()
         logger.info("DSA_SHARED_DRAIN_OK %s select=%s gather_only=%s scatter_sfa=%s real_store=1",

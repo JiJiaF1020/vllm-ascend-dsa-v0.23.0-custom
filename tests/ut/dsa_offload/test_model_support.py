@@ -17,14 +17,16 @@ def test_hbm_full_remote_shared_execution_plan():
                                 DsaKvPlacement.HBM_FULL_REMOTE_SHARED)
     assert [layer.ops for layer in plan.layers] == [
         ("li", "sfa_native"), ("li", "sfa_native"), ("lis_send", "sfa_native"),
-        ("scatter_sfa",), ("gather_only", "scatter_sfa", "applied"),
+        ("scatter_sfa",), ("scatter_sfa", "applied"),
     ]
     assert [(c.submit_layer, c.payload_layer, c.action, c.plan_command) for c in plan.commands] == [
-        (2, 3, "DU_AND_GATHER", 0), (4, 4, "GATHER_ONLY", 0),
+        (2, 3, "DU_AND_GATHER", 0), (2, 4, "AUTO_GATHER", 0),
     ]
     assert [layer.mirror_writer for layer in plan.layers] == ["none"] * 4 + ["scatter_sfa"]
     assert plan.groups[2].mirror_commit_layer == 4
     assert plan.layers[3].send_command is None  # 首层 payload 已由 full 提前请求。
+    assert plan.layers[4].send_command is None  # 后续payload也由Full触发，不再逐层发请求。
+    assert "full_triggered_group_gather" in plan.required_capabilities
     assert [layer.path for layer in plan.layers] == [
         LayerExecutionPath.NATIVE_FULL, LayerExecutionPath.NATIVE_FULL,
         LayerExecutionPath.LIS_SEND_FULL, LayerExecutionPath.REMOTE_SHARED,

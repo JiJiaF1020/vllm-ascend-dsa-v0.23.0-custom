@@ -159,7 +159,8 @@ class RemoteSharedDebugSession:
                         for row in rows[begin:begin+size]]
             if descriptors != expected or reply["layer"] != context.layer_id or reply["group"] != group:
                 raise ValueError("reply command identity does not match active layer/group/rows/binding")
-            wanted_op = "DU_AND_GATHER" if context.layer_id == context.execution_plan.first_payload_layer else "GATHER_ONLY"
+            wanted_op = ("DU_AND_GATHER" if context.layer_id == context.execution_plan.first_payload_layer
+                         else "AUTO_GATHER")
             if reply["operation"] != wanted_op or reply["selection_group"] != context.execution_plan.group:
                 raise ValueError("reply operation/selection group mismatch")
             plans = sample.setdefault("plan_generations", {})

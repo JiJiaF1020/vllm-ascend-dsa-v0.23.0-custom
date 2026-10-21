@@ -53,6 +53,7 @@ class LayerExecutionPlan:
 
 @dataclass(frozen=True)
 class CommandPlan:
+    """逻辑传输编号；AUTO_GATHER仅是Pool内部后继，不对应设备发送算子。"""
     index: int
     submit_layer: int
     payload_layer: int
@@ -102,7 +103,7 @@ class DsaExecutionPlan:
             )
 
     def generation(self, step: int, command: int, network_group: int, network_groups: int) -> int:
-        """每次通信独立代次；共享 plan 始终引用其源 command 的同轮代次。"""
+        """每个payload独立代次；AUTO_GATHER不发送新命令，仍保留独立回复编号。"""
         if step < 0 or network_groups <= 0 or not 0 <= network_group < network_groups:
             raise ValueError("invalid step/network group")
         if not 0 <= command < len(self.commands):
@@ -157,14 +158,17 @@ def build_execution_plan(
         plan_command = len(commands) if remote else None
         transfer_commands: dict[int, int] = {}
         for ordinal, payload in enumerate(remote):
-            action = ("DU_AND_GATHER" if hbm_full else "MISS_PLAN_AND_GATHER") if ordinal == 0 else "GATHER_ONLY"
+            action = (("DU_AND_GATHER" if hbm_full else "MISS_PLAN_AND_GATHER") if ordinal == 0
+                      else ("AUTO_GATHER" if hbm_full else "GATHER_ONLY"))
             index = len(commands)
-            commands.append(CommandPlan(index, source if ordinal == 0 else payload,
+            commands.append(CommandPlan(index, source if hbm_full or ordinal == 0 else payload,
                                         payload, group, plan_command, action))
             transfer_commands[payload] = index
         if remote:
             capabilities.update(("shared_fetch", "scatter_sfa", "group_applied", "grouped_transport"))
             capabilities.add("pool_du" if hbm_full else "external_miss_plan")
+            if hbm_full:
+                capabilities.add("full_triggered_group_gather")
         if hbm_full:
             capabilities.add("full_hbm_cache")
             if remote:
@@ -188,7 +192,7 @@ def build_execution_plan(
             else:
                 backend = "remote_pool"
                 path = LayerExecutionPath.REMOTE_SHARED
-                ops = ("scatter_sfa",) if layer == first_payload else ("gather_only", "scatter_sfa")
+                ops = ("scatter_sfa",) if hbm_full or layer == first_payload else ("gather_only", "scatter_sfa")
             domain = (
                 SelectionDomain.SOURCE_PLAN if not is_full else
                 SelectionDomain.VISIBLE_CAUSAL if path == LayerExecutionPath.NATIVE_FULL else
@@ -199,7 +203,8 @@ def build_execution_plan(
                 ops += ("applied",)
             mirror = "lidu" if owner == "npu" and is_full else (
                 "scatter_sfa" if owner == "pool" and last else "none")
-            send = plan_command if is_full else (transfer_commands.get(layer) if layer != first_payload else None)
+            send = plan_command if is_full else (
+                transfer_commands.get(layer) if not hbm_full and layer != first_payload else None)
             layers.append(LayerExecutionPlan(
                 layer, group, source, roles[layer], backend, owner, ops, first_payload,
                 plan_command, transfer_commands.get(layer), send, mirror, applied, path, domain,

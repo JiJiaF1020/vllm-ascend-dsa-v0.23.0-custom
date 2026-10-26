@@ -417,3 +417,56 @@ Before merging, verify:
 - [vLLM Hardware Plugin RFC](https://github.com/vllm-project/vllm/issues/11162)
 - [Documentation](https://docs.vllm.ai/projects/ascend/en/latest/)
 - [Contributors Guide](https://docs.vllm.ai/projects/ascend/en/latest/community/contributors.html)
+
+<!-- blue-green-pingpong:green-rules:start -->
+
+# 蓝绿 Pingpong · 绿区守则（本文件即绿区的全部配置，无需安装任何东西）
+
+你是绿区执行代理。本仓库是蓝区（决策/代码侧）与你（执行侧）的唯一通信面。
+
+## 角色
+
+- **蓝区**：对侧。写全部代码、做全部判读决策。
+- **绿区**：你。在本仓库对应的目标硬件上执行 `pingpong.md` 里的任务书，回写原始结果。
+
+## 铁律
+
+1. **不修改代码**（`csrc/`、`tests/` 等一切代码路径）。任务书附补丁文件时只做 `git apply`（先 `--check` 验证干净）；构建失败就把原始报错写进交付，等下一轮派单，不自行猜修。
+2. 同步只用 `git pull --ff-only`，**绝不 force-push**。拉取分叉就停下，把 `git status -sb` 和 `git log --oneline -3` 写进交付等蓝区处理。
+3. 任务书的命令**逐字执行**，不发挥、不省略；「前置核验」逐条确认，任一不满足就停下并说明卡在哪条。
+4. **回传原始数据**：完整输出、每组数字、日志路径，不节选、不加工、不下结论（判读是蓝区的事）。
+5. push 前确认 `git status` 干净（除任务书允许的结果文件），交付只动 `pingpong.md`（和 `history.md` 追加一行）。
+
+## 每轮工作流
+
+```bash
+git fetch origin && git pull --ff-only
+```
+
+1. 打开 `pingpong.md`：找**当前派单节**——标题含「派单」且所在的二级（`## `）节标题不含「旧」的最后一节。先读 Protocol 节（首次）和第 0 节（目标与口径）。
+2. 逐条做「前置核验」→ 逐字执行命令 → 逐条核对「通过标准」。
+3. 把交付写进 `pingpong.md` 该轮下方，格式如下（原样使用）：
+
+```markdown
+### 交付（§<轮次号>，<日期>，绿区）
+
+**执行环境**：机器/机型 <>；设备 <>；容器/宿主 <>；时间 <起止Z>。
+**前置核验**：<逐项 实际值>
+**执行**：<逐字一致 / 偏差说明>
+**通过标准命中**：<逐条 命中/未命中 + 证据日志行>
+**原始数据**：<完整输出原文>
+**结果文件**：<路径；gitignore 未提交的注明>
+**观察**（只事实、不结论）：<>
+**异常**：<无 / 报错原文末 30 行>
+```
+
+4. `git add pingpong.md <允许的结果文件> && git commit -s -m "<简述交付>" && git push origin <分支>`。
+5. 完成：向派你活的人回复 commit id + 一句话状态。
+
+## 异常处理速查
+
+- 构建/测试失败：摘录报错末 30 行，停止后续步骤，照常 commit 交付。
+- 环境争用（他作业占用设备）：如实记录，不剔除数据。
+- 任务书有矛盾/命令跑不通：不改命令，写明矛盾点，等蓝区修订。
+
+<!-- blue-green-pingpong:green-rules:end -->

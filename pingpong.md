@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: R2 派单已发出（DP4/TP2·EP8 整网首发，复用 R1 Pool），等绿区回传。R1 已判读：链路部分阳性，E3 阻塞为模型规模 vs TP1 拓扑的物理冲突（非代码/链路 bug）。
+- Current owner: **绿区**。Status: R3 派单已发出（EI0006 定位与越过：offload-off 对照 + HCCL_CONNECT_TIMEOUT=1800），等绿区回传。R2 已判读：阴性，EP8 权重装载实测成功（61.3GB/卡），EI0006 归框架/配置层。
 
 ## 0. 目标与口径
 
@@ -203,7 +203,138 @@ python examples/dsa_demo/simple_test_1p.py \
 
 （新轮次从这里往下追加：蓝区写「派单」节，绿区写「交付」节，蓝区写「判读」节。最新一轮在最上面，旧轮次标题加「-旧」标记。）
 
-## §R2 派单：DP4/TP2（EP8）整网首发（蓝区，2026-10-27）
+## §R3 派单：EI0006 定位与越过（蓝区，2026-10-27）
+
+### 目标
+
+R2 卡点：DP4/TP2（EP8）实跑在 profile_run 首次 HcclAllGather 建链超时（EI0006），而裸 8 卡 HCCL 探针 8/8 通过。本轮用两步对照定位并尝试越过：先证分支 EP8 基线（offload 关），再加 HCCL 建链超时放宽重试全配置。
+
+### 前置核验
+
+1. Pool 存活：`ps aux | grep urma_pool_server | grep -v grep`（R2 重启后的实例，backing=kv-remote-r2b，sibling=5；pid 以实际为准）。活着 → 跳过 R3-0；死了 → 执行 R3-0。
+2. `npu-smi info | head -30`：8 卡空闲、无残留进程。
+3. 清场只杀框架，**不杀 Pool**：`ps aux | grep -E 'python|vllm' | grep -v grep | awk '{print $2}' | xargs -r kill -9; sleep 5`
+
+### 执行命令
+
+**R3-0 ·（仅 Pool 死亡时）重启 Pool** —— backing 换新路径 kv-remote-r3，sibling 用 5（R2 已确认的正确值）：
+
+```bash
+cd /home/fjj/a5-remote-offload-ops
+nohup tmp/mempool-build/urma_pool_server \
+  --store-mode embedded \
+  --backing /dev/shm/kv-remote-r3 --store-bytes 4294967296 \
+  --payload-layers 78 --requests 8 --source-capacity 25600 \
+  --store-ports 19080,19081,19082,19083,19084,19085,19086,19087 \
+  --du-ports 20000,20001,20002,20003,20004,20005,20006,20007 \
+  --du-devices udmac1d1e2,udmac1d1e2,udmac1d1e2,udmac1d1e2,udmac0d1e3,udmac0d1e3,udmac0d1e3,udmac0d1e3 \
+  --du-eid-indices 0,0,0,0,0,0,0,0 \
+  --trace-lifecycle \
+  --pool-binary $PWD/test/urma_mock_pool/urma_mock_pool -- \
+  --jetty-count 1 --blocks 8 --poll-cpus 2 \
+  --gather-threads 1 --gather-cpus 4 --du-sibling-cpus 5 \
+  --du-workers 1 --du-concurrency 1 --pipeline-mib 0 \
+  > /home/fjj/pp_r3_pool.log 2>&1 &
+sleep 15
+grep -c "URMA_JETTY_READY" /home/fjj/pp_r3_pool.log   # 回报这个数字
+```
+
+**R3-A · 对照实验：offload 关闭，其余全同**（验证本分支 EP8 基线，不带 remote-shared-config）
+
+```bash
+cd /home/fjj/vllm-ascend-remote-offload
+export VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731
+export VLLM_ASCEND_SMOKE_TENSOR_PARALLEL_SIZE=2
+export VLLM_ASCEND_SMOKE_DATA_PARALLEL_SIZE=4
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=1
+export VLLM_ASCEND_SMOKE_RUN_MODE=eager
+export VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=0
+export VLLM_ASCEND_SMOKE_ENABLE_MTP=1
+export VLLM_ASCEND_SMOKE_ENABLE_MTP_GRAPH=0
+export VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0
+export VLLM_ASCEND_SMOKE_MAX_TOKENS=16
+export VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=25600
+export VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS=25600
+export VLLM_ASCEND_SMOKE_DATASET=chinese_23k
+python examples/dsa_demo/simple_test_1p.py 2>&1 | tee /home/fjj/pp_r3a_run.log
+echo "RC=$?"   # 回报
+```
+
+**R3-B ·（仅当 R3-A 通过）全配置 + HCCL 建链超时放宽**
+
+```bash
+export VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=1
+export HCCL_CONNECT_TIMEOUT=1800
+python examples/dsa_demo/simple_test_1p.py \
+  --remote-shared-config /home/fjj/a5-remote-offload-ops/tmp/eid-probe-r1/remote-shared.json \
+  2>&1 | tee /home/fjj/pp_r3b_run.log
+echo "RC=$?"   # 回报
+```
+
+**R3-C ·（仅当 R3-B 仍 EI0006）精确栈采集**
+
+```bash
+export ASCEND_LAUNCH_BLOCKING=1
+export HCCL_ENTRY_LOG_ENABLE=1
+python examples/dsa_demo/simple_test_1p.py \
+  --remote-shared-config /home/fjj/a5-remote-offload-ops/tmp/eid-probe-r1/remote-shared.json \
+  2>&1 | tee /home/fjj/pp_r3c_run.log
+echo "RC=$?"
+tar czf /home/fjj/pp_r3c_hccl_log.tgz -C ~ ascend/log 2>/dev/null; ls -l /home/fjj/pp_r3c_hccl_log.tgz
+```
+
+### 通过标准
+
+- **R3-A 通过**：进程退出码 0，输出有生成文本（证明本分支 DP4/TP2/EP8 基线在 remote-shared 之外可用）。
+- **R3-B 通过**（需同时满足）：RC=0 有生成文本；日志依次 `DSA_EXECUTION_PLAN` → `DSA_STORE_PUT_DONE` → `DSA_SHARED_CONNECT_BEGIN` → `DSA_SHARED_CONNECT_OK ... backend=real_store` → ≥2 轮 `DSA_SHARED_CONSUMED` → `DSA_SHARED_DRAIN_OK`（select/gather/scatter_sfa 计数非零）；CONNECT `rows=` 与绑定请求数一致（DP4 应为 4）；`DSA HBM CACHE CAPACITY REPORT` 出现并原文记录整行。
+- **R3-C 不要求通过**：报错栈 + HCCL entry log 落盘回传即可。
+
+### 已知边界（同前）
+
+- 保持 eager + BS1，不开 graph；不改代码、不改分组名、不动存活 Pool。
+- 复现"零 miss 第二轮全 hit 卡住"→ 保留 generation/status/Pool 三方日志原样回传，即算完成本轮义务。
+
+### 回传格式
+
+同前：R3-A/B/C 各自 RC + 通过标准逐条命中 + 首个报错点前后 50 行 + pp_r3*.log 路径；附框架仓 `git log --oneline -2` 与执行起止时间。
+
+### 判读预案（派单时写死）
+
+- **R3-A 失败** ⇒ 分支级 EP8 回退（与 remote-shared 无关），阴性；蓝区对比本地卸载分支 diff 定位。
+- **R3-A 过 + R3-B 过** ⇒ 根因=HCCL 建链超时（worker 启动偏斜），HCCL_CONNECT_TIMEOUT=1800 入库为本分支标配；R3-B 通过标准全中即**阳性落袋**，下一轮 graph 模式 + 带宽/TPOT 性能口径（另写派单）。
+- **R3-A 过 + R3-B 仍 EI0006** ⇒ 阴性；R3-C 精确栈 + HCCL 日志回传，蓝区出代码修复。
+- **出现 `DSA A5 MTP LIM requires 1..4 query rows per request` / 零 miss 卡住** ⇒ 按 R2 预案同条款处理（阴性，保留日志回传）。
+
+## §R2 判读（蓝区，2026-10-27）
+
+### 总结论
+
+**阴性（新卡点 EI0006），但拿到三个关键增量**：
+
+1. **EP8 权重装载全部成功**（每卡 61.3GB，分片正确）——蓝区 R1 判读中"DP4/TP2→EP8 可装下 391GB 模型"的反推**被实测证实**；绿区 R1 交付中"F（DP4/TP2）必然 OOM"的结论正式作废。
+2. 修掉两个真实缺陷（store_endpoint、sibling CPU，见下），链路配置可信度上升。
+3. 卡点收敛到唯一一处：profile_run 首次 EP8 HcclAllGather 建链超时。remote-shared 推理路径（CONNECT/CONSUMED/DRAIN）本轮仍未触达。
+
+### 逐条裁决
+
+- **通过标准 1（dry-run RC=0）：命中**。
+- **标准 2-5：未命中**——崩溃在 profile_run dummy run，早于一切 offload 活动；Pool 侧只有 OPEN 无 CREATE/PUT，与框架侧证据互洽。
+- **EI0006 归属判定：框架/配置层，非机器拓扑**。证据链：
+  1. 绿区裸 8 卡 HCCL 探针 8/8 PASS（实测，hccl_probe_8npu.sh）；
+  2. 本机本地卸载分支（vllm-ascend-dsa-v0.23.0-custom）此前 DP4/TP2/EP8 整网曾跑通到 decode（Worker_DP3_TP1_EP7 日志，实测历史）——EP8 跨 4 个 EngineCore 建链在本机可行；
+  3. 8 worker 的 AIV_URMA_LOCAL_EID 各绑一张物理卡（phy 0-7 全不同），设备映射正确。
+  最可疑机制（**估计**，待 R3 验证）：4 个 EngineCore 进程树各自独立推进到 profile_run，remote-offload 分支 worker 初始化多出 URMA/EID/Pool 客户端步骤，进程间偏斜超过 HCCL 建链超时（默认 120s 量级）→ 全体同时超时（8 worker 报错窗口仅 38ms 与此吻合）。
+- **per-device store_endpoint 修复：接受**。与仓内 remote_store_lifecycle_validation.md 2026-10-20 节一致；修复后 Pool 日志 8 个独立 store id 的 `REMOTE_DU_SOURCE` 实测验证。后续轮次沿用修复后的 remote-shared.json。蓝区备忘：probe 工具应直接产出 per-device store_endpoint，后续评估补工具补丁。
+- **sibling CPU 6→5：接受**。R1 派单命令 `--du-sibling-cpus 6` 是蓝区缺陷（本机 CPU4 的 thread_siblings 是 4-5）。后续 Pool 命令一律用 5（已写入 R3-0）。
+- **worker.py 版本门控（0.23.0 跳过 DP local_rank 偏移）：绿区结论接受**——EID 实测证明 8 卡分配正确，该块是否生效不影响本轮结论。
+
+### 环境事实入库（后续轮次直接引用）
+
+- Pool 当前实例：backing=/dev/shm/kv-remote-r2b，`--du-sibling-cpus 5`，8 DU ready，复用不重启。
+- remote-shared.json 当前版含 per-device store_endpoint（19080+N 与 du 20000+N 配对）；修复前备份 .bak-r2/.bak-r2b。
+- HCCL 探针 `/home/fjj/hccl_probe_8npu.sh` 留存，可作回归基线复用。
+
+## §R2 派单-旧：DP4/TP2（EP8）整网首发（蓝区，2026-10-27）
 
 ### 目标
 

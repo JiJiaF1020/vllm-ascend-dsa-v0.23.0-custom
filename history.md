@@ -30,3 +30,14 @@
 **派单**（commit 见本节首次提交）：复用 R1 Pool（pid 2167590），eager BS1，DP4/TP2（EP8）跑 chinese_23k。通过标准写死于 pingpong.md §R2：dry-run RC=0；实跑 RC=0 有生成文本；日志序列 EXECUTION_PLAN→STORE_PUT_DONE→CONNECT_BEGIN→CONNECT_OK(real_store)→≥2 轮 CONSUMED→DRAIN_OK 非零；CONNECT rows=4；capacity report 原文记录（数值偏差蓝区判）。
 **交付**：待绿区回传。
 **判读**（蓝区）：待定。
+
+## §R2 EI0006 卡点（2026-10-27）
+
+**交付**（commit 1fd0d9471）：dry-run 通过；实跑在 profile_run 首次 HcclAllGather 处 EI0006 建链超时，remote-shared 路径未触达（Pool 侧仅 OPEN 无 PUT）。EP8 权重装载成功（每卡 61.3GB）。绿区修两缺陷：per-device store_endpoint（配置补全，符合 remote_store_lifecycle_validation.md 2026-10-20 节）+ DU sibling CPU 6→5（R1 派单命令缺陷）。裸 8 卡 HCCL 探针 8/8 PASS。数据出处：pingpong.md §R2 交付 + 绿区 /home/fjj/pp_r2b_*.log。
+**判读**（蓝区）：阴性。增量：蓝区"DP4/TP2→EP8 可装 391G 模型"反推被实测证实（61.3GB/卡）；两修复均接受并入库（sibling 后续一律用 5；JSON 沿用 per-device store_endpoint 版）。EI0006 归框架/配置层（裸探针过 + 本机本地卸载分支同拓扑曾跑通至 decode，均实测）；最可疑机制为 4 EngineCore 进程树启动偏斜超 HCCL 建链超时（估计）。下一步：R3 对照实验。
+
+## §R3 EI0006 定位与越过（2026-10-27）
+
+**派单**（commit 见本节首次提交）：R3-A offload 关闭对照（同 DP4/TP2 eager BS1）→ R3-B offload 开 + HCCL_CONNECT_TIMEOUT=1800 → 仍 EI0006 则 R3-C（ASCEND_LAUNCH_BLOCKING=1 + HCCL_ENTRY_LOG_ENABLE=1）抓精确栈。通过标准写死于 pingpong.md §R3（R3-B 沿用 R2 的日志序列/rows=4/capacity report 标准）。
+**交付**：待绿区回传。
+**判读**（蓝区）：待定。

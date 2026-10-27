@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: 第 1 轮派单已发出（remote-offload 单机整网首发），等绿区回传。
+- Current owner: **绿区**。Status: R2 派单已发出（DP4/TP2·EP8 整网首发，复用 R1 Pool），等绿区回传。R1 已判读：链路部分阳性，E3 阻塞为模型规模 vs TP1 拓扑的物理冲突（非代码/链路 bug）。
 
 ## 0. 目标与口径
 
@@ -28,7 +28,7 @@
 
 ---
 
-## §R1 派单：remote-offload 单机整网首发（蓝区，2026-10-26）
+## §R1 派单-旧：remote-offload 单机整网首发（蓝区，2026-10-26）
 
 ### 目标
 
@@ -202,6 +202,124 @@ python examples/dsa_demo/simple_test_1p.py \
 ---
 
 （新轮次从这里往下追加：蓝区写「派单」节，绿区写「交付」节，蓝区写「判读」节。最新一轮在最上面，旧轮次标题加「-旧」标记。）
+
+## §R2 派单：DP4/TP2（EP8）整网首发（蓝区，2026-10-27）
+
+### 目标
+
+复用 R1 已验证的安装/构建/Pool/EID 资产，直接以 DP4/TP2（EP8，八卡）eager BS1 跑 `hbm_full_remote_shared` 真实推理，拿到 remote-shared 链路生效证据。本轮仍只判通/不通，不做性能结论。
+
+### 前置核验
+
+1. Pool 存活：`ps -p 2167590 -o pid,cmd`。活着 → 跳过 R2-0；死了（或机器重启过）→ 执行 R2-0 重启 Pool。
+2. `npu-smi info | head -30`：8 卡空闲、无残留进程。
+3. 清场只杀框架，**不杀 Pool**：`ps aux | grep -E 'python|vllm' | grep -v grep | awk '{print $2}' | xargs -r kill -9; sleep 5`
+
+### 执行命令
+
+**R2-0 ·（仅 Pool 死亡时）重启 Pool** —— backing 必须换全新路径 kv-remote-r2；分组沿用 R1 确认的 udmac1d1e2（卡 0-3）/ udmac0d1e3（卡 4-7）：
+
+```bash
+cd /home/fjj/a5-remote-offload-ops
+nohup tmp/mempool-build/urma_pool_server \
+  --store-mode embedded \
+  --backing /dev/shm/kv-remote-r2 --store-bytes 4294967296 \
+  --payload-layers 78 --requests 8 --source-capacity 25600 \
+  --store-ports 19080,19081,19082,19083,19084,19085,19086,19087 \
+  --du-ports 20000,20001,20002,20003,20004,20005,20006,20007 \
+  --du-devices udmac1d1e2,udmac1d1e2,udmac1d1e2,udmac1d1e2,udmac0d1e3,udmac0d1e3,udmac0d1e3,udmac0d1e3 \
+  --du-eid-indices 0,0,0,0,0,0,0,0 \
+  --trace-lifecycle \
+  --pool-binary $PWD/test/urma_mock_pool/urma_mock_pool -- \
+  --jetty-count 1 --blocks 8 --poll-cpus 2 \
+  --gather-threads 1 --gather-cpus 4 --du-sibling-cpus 6 \
+  --du-workers 1 --du-concurrency 1 --pipeline-mib 0 \
+  > /home/fjj/pp_r2_pool.log 2>&1 &
+sleep 15
+grep -c "URMA_JETTY_READY" /home/fjj/pp_r2_pool.log   # 回报这个数字
+```
+
+**R2-1 · dry-run + 实跑**（env 与 R1 E 相同，仅 TP=2、DP=4）
+
+```bash
+cd /home/fjj/vllm-ascend-remote-offload
+export VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731
+export VLLM_ASCEND_SMOKE_TENSOR_PARALLEL_SIZE=2
+export VLLM_ASCEND_SMOKE_DATA_PARALLEL_SIZE=4
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=1
+export VLLM_ASCEND_SMOKE_RUN_MODE=eager
+export VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=1
+export VLLM_ASCEND_SMOKE_ENABLE_MTP=1
+export VLLM_ASCEND_SMOKE_ENABLE_MTP_GRAPH=0
+export VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0
+export VLLM_ASCEND_SMOKE_MAX_TOKENS=16
+export VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=25600
+export VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS=25600
+export VLLM_ASCEND_SMOKE_DATASET=chinese_23k
+
+python examples/dsa_demo/simple_test_1p.py \
+  --remote-shared-config /home/fjj/a5-remote-offload-ops/tmp/eid-probe-r1/remote-shared.json --dry-run \
+  2>&1 | tee /home/fjj/pp_r2_dryrun.log
+
+python examples/dsa_demo/simple_test_1p.py \
+  --remote-shared-config /home/fjj/a5-remote-offload-ops/tmp/eid-probe-r1/remote-shared.json \
+  2>&1 | tee /home/fjj/pp_r2_run.log
+```
+
+### 通过标准（需同时满足）
+
+1. dry-run 退出码 0；
+2. 实跑进程退出码 0，输出里有生成文本；
+3. 日志依次出现 `DSA_EXECUTION_PLAN` → `DSA_STORE_PUT_DONE` → `DSA_SHARED_CONNECT_BEGIN` → `DSA_SHARED_CONNECT_OK ... backend=real_store` → 至少两轮 `DSA_SHARED_CONSUMED` → 退出时 `DSA_SHARED_DRAIN_OK`（select/gather/scatter_sfa 计数非零）；
+4. `DSA_SHARED_CONNECT_BEGIN` 的 `rows=` 与实际绑定请求数一致（DP4 应为 4）；
+5. `DSA HBM CACHE CAPACITY REPORT` 出现并**原文记录整行**（R1 参考值 `indexer=21, resident=57, mtp=1`；拓扑变为 DP4/TP2 后允许数值偏差，由蓝区判，不算硬门禁）。
+
+### 已知边界（遇到不算新发现，按判读预案处理）
+
+- 保持 eager + BS1：LIM `1..4 query rows` 校验在本分支未修，**不要**开 graph（RUN_MODE 保持 eager，MTP_GRAPH=0）。
+- 若复现"零 miss 第二轮全 hit 卡住"：保留 generation/status/Pool 三方日志原样回传，即算完成本轮义务。
+- 不要改任何代码、不要改分组名、不要重启仍在运行的 Pool（除 R2-0 触发条件外）。
+
+### 回传格式
+
+在 pingpong.md 追加「§R2 交付」节，格式同 R1：逐条通过标准命中/未命中 + 日志原文行；失败给首个报错点前后 50 行 + pp_r2_*.log 路径；附框架仓 `git log --oneline -2` 与执行起止时间。
+
+### 判读预案（派单时写死）
+
+- **DP4/TP2 仍 OOM** ⇒ 蓝区量化模型修正；回传报错点每卡 allocated/total 原文，蓝区重算后决定换拓扑还是换模型。
+- **出现 `DSA A5 MTP LIM requires 1..4 query rows per request`** ⇒ 已知 bug 变体命中，阴性；蓝区核对形状后出修复或配置绕行。
+- **第二轮全 hit 卡住** ⇒ 命中作者未关闭的"零 miss"问题，阴性（非本轮回退）；三方日志回传即完成义务。
+- **CONNECT rows≠4 或 backend≠real_store** ⇒ 阴性（绑定逻辑问题）；日志回传，蓝区定位。
+- **全中** ⇒ 阳性落袋；下一轮：graph 模式（核对 capture 档后启用）+ 带宽/TPOT 性能口径（另写派单）。
+
+## §R1 判读（蓝区，2026-10-27）
+
+### 总结论
+
+**链路部分阳性，整网首发未完成。** B/C/D/E1/E2 全部实测通过（框架安装、算子构建、8 卡 EID 探测、Pool 启动、dry-run）；E3 阻塞为模型权重规模与 TP1/DP1 拓扑的物理冲突，**不是链路/驱动/代码 bug**。注意：框架在权重装载阶段即 OOM，remote-shared 真实推理路径（CONNECT→CONSUMED→DRAIN）本轮**尚未触达**，"链路通"结论要 R2 拿到日志序列后才落袋。
+
+### 逐条裁决
+
+- **B 通过**。catlass 走本机拷贝（预案第一优先路径），双嵌套 gitlink 提升一级的处置存档备查。
+- **C 通过**。算子仓 tip 6e85590 与锚点一致；Pool 二进制、mock_pool、torch extension .so 三类产物齐全。
+- **D 通过，偏差接受**。UB_A/UB_B 是派单占位符未填真实设备名，**蓝区派单缺陷**；绿区按仓内 docs/mempool_validation.md 替换为 udmac1d1e2（卡 0-3）/ udmac0d1e3（卡 4-7）后 8/8 通过。分组**确认接受**：remote-shared.json 两组 pool_eid 与两 UB 平面一致，MEMPOOL_WRAPPER_ARGS 自洽。置信度：实测（probe 8/8 pass）。后续轮次沿用此分组，不再变更。
+- **E1/E2 通过**。Pool 8 个 jetty 就绪，dry-run 配置打印完整。
+- **E3 未通过，定性：规模性阻塞**。权重量化采信：MoE 377GB（78 层 × 256 专家 × 18.9MB）+ dense ≈14GB ≈ 磁盘 391G；TP1 单卡 96GB 物理放不下，TP2/DP1（EP=2）每卡仍需 ~188GB，同样必然 OOM——绿区两组实测与量化一致。
+- **绿区"F（DP4/TP2）同样必然 OOM"的结论不采纳**。代码事实：`simple_test.py:40` enable_expert_parallel 默认 True、`:549` ep_size=tp×dp、`:234-235` DP>1 强制 EP。DP4/TP2 → **EP8**，每卡 MoE ≈ 377/8 ≈ 47GB + dense ≈ 7GB ≈ 54GB < 96GB，权重可装载。绿区 TP2 实测是 DP1（EP2），不代表 F 配置。置信度：反推（代码 + 量化算术），R2 实测验证。
+- **TP8 硬拒确认**：`remote_shared_config.py:161` `tp not in (1, 2)` 是本分支硬约束，绿区 TP8 测试与代码一致，非环境问题。
+- **F 未执行**：符合协议（E 未全中跳过 F）。
+
+### 环境事实入库（后续轮次直接引用）
+
+- 容器内 git 访问 github 需 `-c http.proxy=http://90.255.12.179:3128`。
+- catlass 修复法：从 `/home/fjj/vllm-ascend-dsa-v0.23.0-custom/csrc/third_party` 拷贝，双嵌套 gitlink 提升一级。
+- Pool 仍在运行（pid 2167590，backing=/dev/shm/kv-remote-r1）；E3 在权重装载期崩溃，未发生任何 PUT/CONNECT，Pool 无残留绑定，**R2 直接复用，不重启**。
+- 本机无可替代的小模型（DeepSeek-V4.1-Flash 728-801GB 更大），换模型路线排除。
+
+### 下一步
+
+见上方 §R2 派单：直接 DP4/TP2（EP8）首发，跳过物理不可能的 TP1。
+
 ## §R1 交付
 
 ### 执行环境

@@ -431,3 +431,97 @@ w4a4_mxfp4.py:142        param_dict["w13_weight"] = torch.empty(
 2. **D 阶段派单命令修正确认**：pool-group 占位符 UB_A/UB_B → 真实设备名 udmac1d1e2/udmac0d1e3（8/8 通过）
 3. **F 阶段未执行**：E3 未全中，按协议跳过
 4. 当前状态：Pool 仍在运行（pid 2167590），8 卡 NPU 空闲，无残留 python 进程，环境就绪可接续
+## §R2 交付（绿区，2026-10-27）
+
+### 执行环境
+
+- 机器 IP：90.96.17.111（aarch64，16× Ascend 950DT 96GB/卡，鲲鹏 950，1505GB RAM）
+- 容器：dsa-full（host 网络/pid，挂 /home /etc /data /usr/local/Ascend/driver）
+- 框架仓：/home/fjj/vllm-ascend-remote-offload（分支 vllm-ascend-v0.23.0-custom-remote-offload，HEAD=7031076）
+- 算子仓：/home/fjj/a5-remote-offload-ops（main，6e85590db）
+- 模型：/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731（391G）
+- 配置：/home/fjj/a5-remote-offload-ops/tmp/eid-probe-r1/remote-shared.json（**已按 2026-10-20 文档补 per-device store_endpoint**，见下）
+- Pool：backing /dev/shm/kv-remote-r2b（**R2-0 重启**，sibling 修正为 5），8 DU ready
+- 执行时间：2026-10-27 22:47–22:59（机器本地时间）
+- 日志：/home/fjj/pp_r2b_dryrun.log / pp_r2b_run.log / pp_r2b_pool.log / pp_r2_dryrun.log / pp_r2_run.log / pp_r2_pool.log
+
+### 通过标准逐条裁决
+
+**1. dry-run 退出码 0 — 通过**。pp_r2b_dryrun.log 完整打印配置（rank_map、required_local_npus=8、total_requests=4、run_name=dp4_tp2_offload_eager_mtp_eager_hbm_full_remote_shared），RC=0。
+
+**2. 实跑进程退出码 0 + 生成文本 — 未命中**。实跑在 profile_run 阶段崩溃（EI0006），未到 generate。
+
+**3. DSA_EXECUTION_PLAN → DSA_STORE_PUT_DONE → DSA_SHARED_CONNECT_* → DSA_SHARED_CONSUMED ×2 → DSA_SHARED_DRAIN_OK — 未命中**。remote-shared 链路（CONNECT/CONSUMED/DRAIN）本轮**未触达**：崩溃发生在 profile_run 的 dummy run，早于任何 decode/PUT/CONNECT。Pool 侧有 OPEN（8 个 `REMOTE_DU_SOURCE kind=shared_store request_protocol=6 group_gather=1`，各 DU 独立 store id），无 CREATE/PUT。
+
+**4. CONNECT rows=4 — 未触达**（同 3）。
+
+**5. DSA HBM CACHE CAPACITY REPORT — 未触达**（同 3）。
+
+### 崩溃点（首个报错）
+
+```
+(Worker_DP1_TP0_EP2 pid=2368541) ERROR 10-27 22:52:34 [multiproc_executor.py:987]
+  File "/home/fjj/vllm-ascend-remote-offload/vllm_ascend/worker/worker.py", line 564, in determine_available_memory
+    self.model_runner.profile_run()
+  File "/home/fjj/vllm-ascend-remote-offload/vllm_ascend/worker/model_runner_v1.py", line 4632, in profile_run
+    super().profile_run()
+  File "/vllm-workspace/vllm/vllm/v1/worker/gpu_model_runner.py", line 6228, in profile_run
+    hidden_states, last_hidden_states = self._dummy_run(...)
+  File ".../model_runner_v1.py", line 4567, in _dummy_run
+    outputs = self._model_forward(...)
+  ...
+  File "/vllm-workspace/vllm/vllm/model_executor/models/deepseek_v2.py", line 377, in forward
+    router_logits, _ = self.gate(hidden_states)
+  File "/home/fjj/vllm-ascend-remote-offload/vllm_ascend/ops/fused_moe/gate_linear.py", line 59, in forward
+    x = x.to(torch.float32)
+RuntimeError: The Inner error is reported as above. The process exits for this inner error, and the current working operator name is HcclAllGather.
+[ERROR] ... Communication_Error_Get_Socket(EI0006): Getting socket times out. Reason: Connection fault detection has been disabled.
+1. The remote end does not initiate a connection request. some NPUs in the cluster are abnormal.
+2. The remote end does not initiate a connection request because the collective communication operator is started too late or is not started by some NPUs in the cluster.
+3. The communication link is disconnected. ...
+```
+
+- 时间：22:52:34，8 worker 全部同时（窗口 38ms：22:52:34.534–.572）
+- 阶段：profile_run → _dummy_run → deepseek_v2.forward → gate（MoE router 前的 HcclAllGather，异步算子延迟报出，gate_linear.py:59 的 `.to()` 是栈顶不是真凶）
+
+### 关键前置证据（R2 相对 R1 的新增修复）
+
+**A. per-device store_endpoint 修复（Store instance changed 根因）**
+
+- 现象：R2 首轮（pp_r2_run.log + pp_r2_pool.log）8 个 DU 中 device 1-7 报 `REMOTE_DU init failed: Store instance changed`（remote_store_control.cpp:125 `expected != id_`）。
+- 根因：remote-shared.json 只有全局 store_endpoint=127.0.0.1:19080，device 表无 per-device store_endpoint → 客户端 `RemoteKvStore(device.store_endpoint or global)` 全用 19080 的 store_id 发给各 DU child，而 embedded 模式下每 DU child 是独立 store（19080-19087，id 各异），device≠0 的 child 校验 id 不符。
+- 修复：按 remote_store_lifecycle_validation.md 2026-10-20 节（"device表中每卡store_endpoint必须指向所属child"）给 device 表补 per-device `store_endpoint: 127.0.0.1:19080+N`（与 du_endpoint 20000+N 配对）。**纯配置补全，未改代码**。
+- 验证：修复后 Pool 日志出现 8 个 `REMOTE_DU_SOURCE kind=shared_store request_protocol=6 group_gather=1`，各 DU 独立 store id；`Store instance changed` 不再出现。
+
+**B. DU sibling CPU 修复（`DU helper must be a distinct hardware sibling` 根因）**
+
+- 现象：R2 首轮 device 0 报 `REMOTE_DU init failed: DU helper must be a distinct hardware sibling of its primary CPU`（cpu_placement.h:59 CheckSiblingCpus）。
+- 根因：派单命令 `--gather-cpus 4 --du-sibling-cpus 6`。实测本机 CPU4 thread_siblings=4-5、CPU6=6-7，4 的硬件兄弟是 5 不是 6，8 个 DU 只要走到 Session 构造必失败。
+- 修复：R2-0 重启 Pool，`--du-sibling-cpus 5`，backing 换 /dev/shm/kv-remote-r2b。8 个 DU 全 ready（URMA_JETTY_READY=8）。**此偏差需蓝区确认派单命令后续修正**。
+
+**C. EI0006（当前卡点，需蓝区判读）**
+
+- 现象：8 worker 权重装载全部成功（各 61.3GB，EP8 分片正确），EP8 组 init 成功（world_size=8，tcp://127.0.0.1:40622，backend=hccl），但 profile_run dummy run 首次 HcclAllGather 建链超时。
+- **设备映射正确性**（排除设备分配问题）：8 worker AIV_URMA_LOCAL_EID 各绑一张物理卡（phy_id=0-7 全不同），DP0→卡0/1、DP1→卡2/3、DP2→卡4/5、DP3→卡6/7。
+- **最小 8 卡 HCCL 探针（绿区新增验证）**：容器内 8 进程 `ASCEND_RT_VISIBLE_DEVICES=rank` + `dist.init_process_group("hccl")` + `dist.all_gather`，**8/8 PASS**（init 0.0-1.4s，all_gather 1.7-2.5s，verify=True）。脚本 /home/fjj/hccl_probe_8npu.sh，日志 /tmp/hccl_probe.rank{0-7}.log。**证明裸 8 卡 HCCL 通信正常，非驱动/环境问题**。
+- 差异点：探针是同一父进程 fork 8 个 python 各绑 1 卡；vLLM 是 4 个 EngineCore（DP0-3）各 spawn 2 个 TP worker，EP8 组跨 4 进程树建 `tcp://127.0.0.1:40622` 世界组。EI0006 的 "remote end does not initiate connection request" + 8 卡同时超时，指向 vLLM EP group 的 HCCL 建链（多进程树跨 DP）与裸探针（单进程树）的差异。
+- 参考代码（绿区只读定位，未改）：vllm_ascend/ops/fused_moe/moe_comm_method.py AllGatherCommImpl（TokenDispatcherWithAllGather，用 npu_moe_init_routing_v2 + all_gather + npu_moe_token_unpermute）；vllm_ascend/worker/worker.py:403 `if not vllm_version_is("0.23.0")` 的 DP local_rank 偏移块——**该块在 0.23.0 下被跳过**（DP 设备偏移逻辑仅 v0.24+ 生效），但 EID 证明实际 8 卡分配正确，故设备偏移是否生效不影响 EI0006 结论。
+
+### git log
+
+- 框架仓：`7031076 docs(pingpong): R1 adjudication + dispatch R2 DP4/TP2(EP8) first run`（HEAD，未动代码，仅追加本交付）
+- 算子仓：`6e85590`（未动）
+
+### 日志留存
+
+- /home/fjj/pp_r2b_run.log（EI0006 全栈，行 1540-1650 崩溃点，行 1307-1509 AIV_URMA_LOCAL_EID）
+- /home/fjj/pp_r2b_pool.log（8 REMOTE_DU_SOURCE，embedded store ready）
+- /home/fjj/pp_r2b_dryrun.log / pp_r2_dryrun.log / pp_r2_run.log / pp_r2_pool.log（R2 首轮 Store instance changed + sibling）
+- /home/fjj/hccl_probe_8npu.sh + /tmp/hccl_probe.rank{0-7}.log（8 卡 HCCL 探针 PASS）
+- remote-shared.json.bak-r2 / .bak-r2b（修复前后配置）
+
+### 待蓝区决策
+
+1. **EI0006 归属**：裸 8 卡 HCCL AllGather PASS（8/8），vLLM EP8 组（跨 4 EngineCore 进程树）首次 HcclAllGather 超时。倾向框架层（EP group 建链/多进程树 HCCL），请蓝区判读并给下一手（env 绕行如 HCCL_CONNECT_TIMEOUT / ASCEND_LAUNCH_BLOCKING=1 抓准确栈，或代码修复）。
+2. **R2-0 命令偏差**：`--du-sibling-cpus 6` 改为 5（硬件兄弟核），backing 换 kv-remote-r2b，请蓝区确认后续轮沿用。
+3. **per-device store_endpoint**：绿区按文档补全（未改代码），请蓝区确认符合预期（现 Pool 用 kv-remote-r2b，device 表 store_endpoint 指向各 DU child 19080+N）。

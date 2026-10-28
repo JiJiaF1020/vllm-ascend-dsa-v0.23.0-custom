@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: R4 派单已发出（作者新流程跑通优化版：ops f63a5bfed 重编 + profile_pool_inference 一键双 Pool + graph/MTP graph 40K，BS1 首发、BS16 条件放大），等绿区回传。R3 派单已被 R4 取代（若已做实验数据照附）。R2 已判读：阴性，EP8 权重装载实测成功（61.3GB/卡），EI0006 归框架/配置层。
+- Current owner: **绿区**。Status: R5 派单已发出（EI0015 重试梯子：HCCL_CONNECT_TIMEOUT=1800 → 关 CPU 绑核 → 抓 HCCL 栈），等绿区回传。R4 已判读：阴性，但关键增量——R3-A 附带回传证明 offload 关闭也崩，故障与 remote-offload 无关，收敛到 EP8 跨 DP HCCL 建链层；双 Pool + shared-gather + 128GiB Store 全链路实测就绪。
 
 ## 0. 目标与口径
 
@@ -305,7 +305,7 @@ tar czf /home/fjj/pp_r3c_hccl_log.tgz -C ~ ascend/log 2>/dev/null; ls -l /home/f
 - **R3-A 过 + R3-B 仍 EI0006** ⇒ 阴性；R3-C 精确栈 + HCCL 日志回传，蓝区出代码修复。
 - **出现 `DSA A5 MTP LIM requires 1..4 query rows per request` / 零 miss 卡住** ⇒ 按 R2 预案同条款处理（阴性，保留日志回传）。
 
-## §R4 派单：作者新流程跑通优化版 remote-offload（蓝区，2026-10-28）
+## §R4 派单-旧：作者新流程跑通优化版 remote-offload（蓝区，2026-10-28）——已交付已判读，见 §R4 判读
 
 ### 背景（绿区必读）
 
@@ -465,6 +465,104 @@ echo "RC=$?"   # 回报
 - **R4-3/3b 均失败** ⇒ 阴性；summary/precheck/model.log 回传，蓝区对照作者流程逐参数定位。
 - **R4-4 LIM/零 miss** ⇒ 已知边界命中，阴性不阻塞主线；蓝区核对形状后决定修复或配置绕行。
 - **R4-1 构建失败** ⇒ 报错末 30 行回传，停止后续阶段。
+
+## §R4 判读（蓝区，2026-10-29）
+
+### 总结论
+
+**阴性（新卡点 EI0015），但拿到决定性增量：R3-A 附带回传证明 offload 关闭的 EP8 基线同样崩溃**——故障不是 remote-offload 引入的，收敛到「本分支 × EP8 跨 DP HCCL 建链」这一层。同时作者新流程的基础设施全链路实测就绪：f63a5bfed 重编、双 Pool（shared-gather、2×128GiB Store、384G shm）、store 路由、权重装载、DSA_EXECUTION_PLAN 全部通过。
+
+### 逐条裁决
+
+- **R4-0/R4-1/R4-2 通过**。ops tip f63a5bf 与锚点一致；wrapper/binary 新能力（gather-scheduler、du-gather-shared、DU_AND_GATHER）实测齐全；NUMA 拓扑（node0: CPU 0-95 / node2: 192-287）与工具默认 CPU 范围匹配，作者默认绑核值在绿区成立。
+- **R4-3 未通过**。崩溃点：load_model → MoE `setup_moe_comm_method` → `hcclCommInitRootInfoConfig` error code 4 → EI0015 RootInfoDetect failed；7/8 worker 中招（DP0_TP0_EP0 即 root 未报错），DSA_EXECUTION_PLAN（05:23:08）后 2 秒即崩。
+- **绿区"R4-3b 严格按字面不触发"：接受**——EI0015 确实不在 EI0006 字面上；但 EI0015 官方 solution 第 4 条与 R4-3b 同族，R5-A 直接补上这一试。
+- **R3-A 附带数据是本轮回合最大增量**：offload=0 也崩（HCCL dispatch timeout EmptyQueue，profile_run MoE 前向）→ 两个不同报错（EI0006 建链超时 / dispatch EmptyQueue / EI0015 RootInfoDetect）同族不同点，崩溃阶段还在漂移（R2 在 profile_run、R3-A 在 dummy_run、R4-3 提前到 load_model）——**阶段漂移 + 快速失败 = 典型 rank 间时序竞争**，不是单一慢节点超时。
+- **最可疑机制（估计，待 R5 逐项排除）**：R4 的 Pool 配置比 R2/R3 重得多（du-workers 7×8=56 个轮询线程 + shared gather，钉在 CPU 2-93/192-283），与框架 enable_cpu_binding 的 worker 绑核叠加，worker 建链期 CPU 饥饿 → rank 到不齐 → RootInfoDetect 快速失败。作者机同配置能跑通，差异可能在作者 va.env 里的 HCCL 调优（内容未知，已向用户索取）。
+- **指标开发附记**：metrics 汇总代码（e6fd53bd3）已随本轮 pull 进入绿区框架仓，R5 各跑程会自动带出 `[dsa-smoke][metrics]` 行（跑崩则无输出，属预期）。
+
+### 环境事实入库（后续轮次直接引用）
+
+- /dev/shm 已 remount 384G；双 Pool 由工具自生自灭，无手工 Pool 存活。
+- 容器内 github 代理：90.255.12.179:3128 持续 407，**改用 90.255.129.35:3128**（R4-1 实测 curl 200）。后续 git 代理一律用后者。
+- R4 日志资产：/home/fjj/pp_r4_run.log、pp_r4_ops_build.log、tmp/r4-author-bs1/{summary,precheck}.txt、raw/{model,pool-a,pool-b}.log。
+
+## §R5 派单：EI0015 重试梯子（蓝区，2026-10-29）
+
+### 目标
+
+用三级条件梯子越过/定位 EP8 建链失败：A 放宽 HCCL 建链超时 → B 再关 CPU 绑核（排除与 Pool 轮询线程争核）→ C 抓 HCCL 精确栈回传。任一级通过即阳性落袋，不再往下走。
+
+### 前置核验
+
+1. `ps aux | grep -E 'urma|python|vllm' | grep -v grep`：应为空（R4 工具已自行收 Pool）；不空则杀 python/vllm，urma 进程也杀（本轮工具会自己重起）。
+2. `df -h /dev/shm`：应为 384G；不是则 `mount -o remount,size=384G /dev/shm`。
+3. `rm -rf /dev/shm/offload-numa-*`（清 R4 残留 backing）。
+4. `cd /home/fjj/vllm-ascend-remote-offload && git -c http.proxy=http://90.255.129.35:3128 pull --ff-only && git log --oneline -2`：顶部应为 `e6fd53bd3`（metrics 汇总）。回报这两行。
+
+### 执行命令
+
+公共前缀（每级都一样，先 export 再跑；注意代理已换）：
+
+```bash
+cd /home/fjj/a5-remote-offload-ops
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+export VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731
+export VLLM_ASCEND_SMOKE_DATASET=chinese_40k
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=1
+export VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=45056
+export VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS=45056
+export VLLM_ASCEND_SMOKE_MAX_TOKENS=64
+export VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0
+```
+
+运行命令模板（每级仅 `<OUT>` 和额外 export 不同；各级之间必须 `ps aux | grep -E 'urma|python|vllm' | grep -v grep | awk '{print $2}' | xargs -r kill -9; sleep 5; rm -rf /dev/shm/offload-numa-*`）：
+
+```bash
+python3 tools/profile_pool_inference.py \
+  --no-perf \
+  --framework-repo /home/fjj/vllm-ascend-remote-offload \
+  --remote-config /home/fjj/a5-remote-offload-ops/tmp/eid-probe-r1/remote-shared.json \
+  --output tmp/<OUT> \
+  --payload-layers 78 \
+  --store-bytes $((128*1024*1024*1024)) \
+  --du-ports 20000,20001,20002,20003 --store-ports 19080,19081,19082,19083 \
+  --pool-b-du-ports 20004,20005,20006,20007 --pool-b-store-ports 19084,19085,19086,19087 \
+  --du-devices udmac1d1e2 --pool-b-du-devices udmac0d1e3 \
+  --du-eid-indices 0 --pool-b-du-eid-indices 0 \
+  --sample-port 20000 --sample-worker 0 \
+  --numa-node 0 --pool-b-numa-node 2 --store-numa-nodes local \
+  --pool-start-timeout 600 \
+  --shared-port-gather --du-pipeline-mib 1 \
+  2>&1 | tee /home/fjj/pp_r5_<OUT>.log
+echo "RC=$?"   # 回报
+```
+
+**R5-A**：`export HCCL_CONNECT_TIMEOUT=1800`，`<OUT>`=r5a-hccl1800。通过则停，不回传后续级别。
+
+**R5-B**（仅 R5-A 失败）：在 R5-A 基础上追加 `export VLLM_ASCEND_SMOKE_ENABLE_CPU_BINDING=0`，`<OUT>`=r5b-no-cpubind。通过则停。
+
+**R5-C**（仅 R5-B 失败）：在 R5-B 基础上追加 `export HCCL_ENTRY_LOG_ENABLE=1` 和 `export ASCEND_LAUNCH_BLOCKING=1`，`<OUT>`=r5c-hccl-trace。跑完无论成败：
+
+```bash
+tar czf /home/fjj/pp_r5c_ascend_log.tgz -C ~ ascend/log 2>/dev/null; ls -l /home/fjj/pp_r5c_ascend_log.tgz
+```
+
+### 通过标准（A/B 通用，需同时满足）
+
+工具 RC=0；`tmp/<OUT>/summary.txt` 含 `RUN_OK`；`raw/model.log` 有生成文本；日志依次 `DSA_EXECUTION_PLAN` → `DSA_STORE_PUT_DONE` → `DSA_SHARED_CONNECT_BEGIN` → `DSA_SHARED_CONNECT_OK ... backend=real_store` → ≥2 轮 `DSA_SHARED_CONSUMED` → `DSA_SHARED_DRAIN_OK`；`run-status.json` graceful=true 且 errors=[]。C 级不要求通过，栈和日志落盘即可。
+
+### 回传格式
+
+追加「§R5 交付」节：各级 RC + 通过标准逐条 + 首个报错点前后 50 行 + 日志路径（pp_r5_*.log、tmp/r5*/raw/model.log）；R5-C 附 pp_r5c_ascend_log.tgz 路径；附框架仓 `git log --oneline -2` 与执行起止时间。
+
+### 判读预案（派单时写死）
+
+- **R5-A 过** ⇒ 阳性落袋；HCCL_CONNECT_TIMEOUT=1800 入库标配；下一轮 BS16 放大 + 性能口径。
+- **R5-A 败、R5-B 过** ⇒ 阳性落袋；根因=Pool 轮询线程与框架绑核争核，CPU 绑核策略需按双 Pool 布局重做（蓝区出方案）；下一轮同上。
+- **A/B 均败** ⇒ 阴性；R5-C 栈 + ascend/log 回传，蓝区对比作者 va.env（索取中）逐参数定位。
+- **出现 LIM `1..4 query rows` / 零 miss 卡住** ⇒ 已知边界，日志回传即完成义务。
 
 ## §R2 判读（蓝区，2026-10-27）
 

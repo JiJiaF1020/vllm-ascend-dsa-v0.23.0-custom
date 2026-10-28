@@ -49,3 +49,8 @@
 **判读**（蓝区）：待定。
 
 **蓝区开发（R4 期间并行）**：simple_test.py 新增 metrics 汇总（每 rank TTFT/TPOT/吞吐 + rank0 全局合并 `<run_name>.metrics.json`，host 时钟、generate 返回后计算、零计时扰动；开关 VLLM_ASCEND_SMOKE_METRICS_SUMMARY，默认开）。纯增量，不影响 R4 执行；绿区下次 pull 后 R4-4/后续跑程自动带出 metrics 行。
+
+## §R4 作者新流程跑通优化版 — 交付与判读（2026-10-29）
+
+**交付**（commit 177f9acd3）：R4-0/1/2 全过（f63a5bf 重编、双 Pool shared-gather 就绪、384G shm、store 路由正确）；R4-3 在 load_model 阶段 MoE EP8 建链崩 EI0015（RootInfoDetect failed，7/8 worker，PLAN 后 2 秒）；R4-3b/4 条件不触发。附 R3-A 数据：offload=0 也崩（HCCL dispatch timeout EmptyQueue）。
+**判读**（蓝区）：阴性，但 R3-A 证明故障与 remote-offload 无关，收敛到本分支 EP8 跨 DP HCCL 建链层；崩溃阶段三轮漂移（profile_run→dummy_run→load_model）指向 rank 时序竞争。最可疑：重 Pool 轮询线程（du-workers 7×8）与框架绑核叠加致建链期 CPU 饥饿（估计）；作者 va.env 内容未知（已向用户索取）。代理变更为 90.255.129.35:3128。下一步：R5 三级梯子（HCCL_CONNECT_TIMEOUT=1800 → 关 CPU 绑核 → HCCL 抓栈）。

@@ -74,6 +74,8 @@ SMOKE_ENV_FIELDS = (
     "master_addr",
     "master_port",
     "sync_port",
+    # Post-generate TTFT/TPOT/throughput summary in dsa_demo smoke; 1 (default) / 0.
+    "metrics_summary",
 )
 
 env_variables: dict[str, Callable[[], Any]] = {

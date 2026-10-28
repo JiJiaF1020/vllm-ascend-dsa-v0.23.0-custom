@@ -87,6 +87,7 @@ NPU capture/replay、精度及DP/TP并发须在服务器验收。无算子/wire�
 | `RESULT_DIR` | 单机 `./results/1p`，双机 `./results/2p` | JSON 结果目录；`none` 禁用保存；重复实验请更换输出目录 |
 | `GRAPH_CAPTURE_SIZES` | `1,2,4,8,16` + `MAX_NUM_SEQS` | 请求数档位；自动补入当前 BS、去重并过滤大于 BS 的值；MTP3 时自动乘 4 |
 | `PROCESS_TIMEOUT_SECONDS` | `3600` | DP 进程及前端同步等待超时，单位秒 |
+| `METRICS_SUMMARY` | `1` | generate 返回后汇总 TTFT/TPOT/吞吐（host 时钟，不计时不扰动）；每 rank 打印 `[dsa-smoke][metrics]` 并写入结果 JSON，rank0 额外合并全局 `<run_name>.metrics.json` |
 | `DSA_INDEXER_MLA_BLOCK_RATIO` | `3` | Indexer/full KV/MTP 与 resident MLA 的 block 容量比，不是 full/shared 层数比 |
 | `DSA_MAX_ACTIVE_REQS` | `256` | 卸载活跃请求容量上限 |
 | `DSA_HOT_CPU_BLOCK_MULTIPLE` | `1.0` | 卸载 DRAM 热块容量倍率 |

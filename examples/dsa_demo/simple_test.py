@@ -59,6 +59,7 @@ class SmokeConfig:
     ready_shadow_dir: str | None = None  # 仅CLI；使用真实LIDU轨迹，候选不改变模型输出。
     ready_shadow_steps: int = 3
     ready_shadow_group: int = 0
+    metrics_summary: bool = True  # generate 返回后汇总 TTFT/TPOT/吞吐；host 时钟，不计时不扰动。
 
     @property
     def mtp_graph_enabled(self) -> bool:
@@ -385,6 +386,103 @@ def write_result(config: SmokeConfig, payload: dict[str, Any], dp_rank: int) -> 
     print(f"[dsa-smoke] wrote result: {path}", flush=True)
 
 
+def _stats(values: list[float]) -> dict[str, float] | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    n = len(ordered)
+    median = ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2
+    return {
+        "avg": round(sum(ordered) / n, 3),
+        "min": round(ordered[0], 3),
+        "p50": round(median, 3),
+        "max": round(ordered[-1], 3),
+    }
+
+
+def summarize_request_metrics(
+    outputs: list[Any],
+    gen_start: float,
+    gen_end: float,
+) -> dict[str, Any]:
+    """每请求 TTFT/TPOT + rank 级吞吐。全部在 generate 返回后计算，用 host 时钟，不加设备同步。"""
+    wall_s = gen_end - gen_start
+    per_request = []
+    ttfts: list[float] = []
+    tpots: list[float] = []
+    total_tokens = 0
+    for output in outputs:
+        n = len(output.outputs[0].token_ids)
+        total_tokens += n
+        metrics = output.metrics
+        if metrics is None or metrics.first_token_time is None or metrics.last_token_time is None:
+            per_request.append({"request_id": output.request_id, "output_tokens": n, "metrics": "unavailable"})
+            continue
+        ttft_ms = (metrics.first_token_time - metrics.arrival_time) * 1000
+        tpot_ms = (metrics.last_token_time - metrics.first_token_time) / (n - 1) * 1000 if n > 1 else None
+        ttfts.append(ttft_ms)
+        if tpot_ms is not None:
+            tpots.append(tpot_ms)
+        per_request.append(
+            {
+                "request_id": output.request_id,
+                "output_tokens": n,
+                "ttft_ms": round(ttft_ms, 3),
+                "tpot_ms": round(tpot_ms, 3) if tpot_ms is not None else None,
+            }
+        )
+    avg_tpot = sum(tpots) / len(tpots) if tpots else None
+    return {
+        "requests": len(outputs),
+        "output_tokens": total_tokens,
+        "wall_s": round(wall_s, 3),
+        "gen_start_epoch": gen_start,
+        "gen_end_epoch": gen_end,
+        "ttft_ms": _stats(ttfts),
+        "tpot_ms": _stats(tpots),
+        "decode_tps_per_seq": round(1000 / avg_tpot, 2) if avg_tpot else None,
+        "rank_output_tps": round(total_tokens / wall_s, 2) if wall_s > 0 else None,
+        "per_request": per_request,
+    }
+
+
+def merge_global_metrics(config: SmokeConfig, dp_rank: int) -> None:
+    """rank0 在 shutdown barrier 后合并各 rank 已落盘的 summary；失败不影响跑程结论。"""
+    if dp_rank != 0 or config.result_dir is None or not config.metrics_summary:
+        return
+    try:
+        summaries = []
+        for rank in range(config.data_parallel_size):
+            path = Path(config.result_dir) / f"{config.run_name}.dp{rank}.json"
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if "metrics_summary" in payload:
+                summaries.append(payload["metrics_summary"])
+        if len(summaries) != config.data_parallel_size:
+            print(f"[dsa-smoke][metrics] global merge skipped: {len(summaries)}/{config.data_parallel_size} "
+                  "rank summaries present", flush=True)
+            return
+        start = min(s["gen_start_epoch"] for s in summaries)
+        end = max(s["gen_end_epoch"] for s in summaries)
+        tokens = sum(s["output_tokens"] for s in summaries)
+        wall_s = end - start
+        tpot_avgs = [s["tpot_ms"]["avg"] for s in summaries if s["tpot_ms"]]
+        global_summary = {
+            "dp_size": config.data_parallel_size,
+            "requests": sum(s["requests"] for s in summaries),
+            "output_tokens": tokens,
+            "global_wall_s": round(wall_s, 3),
+            "global_output_tps": round(tokens / wall_s, 2) if wall_s > 0 else None,
+            "tpot_ms_avg_across_ranks": round(sum(tpot_avgs) / len(tpot_avgs), 3) if tpot_avgs else None,
+        }
+        out = Path(config.result_dir) / f"{config.run_name}.metrics.json"
+        out.write_text(json.dumps({"global": global_summary, "ranks": summaries}, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        print("[dsa-smoke][metrics][global] " + json.dumps(global_summary, ensure_ascii=False), flush=True)
+        print(f"[dsa-smoke][metrics] wrote {out}", flush=True)
+    except Exception as exc:
+        print(f"[dsa-smoke][metrics] global merge failed (non-fatal): {exc}", flush=True)
+
+
 def wait_frontend_barrier(store: Any, phase: str, dp_rank: int, dp_size: int) -> None:
     store.set(f"{phase}/{dp_rank}", "1")
     store.wait([f"{phase}/{rank}" for rank in range(dp_size)])
@@ -470,7 +568,9 @@ def run_dp_rank(
                 if config.enable_profile:
                     llm.start_profile()
                     profiling_started = True
+                gen_start = time.time()
                 outputs = llm.generate([prompt for _, prompt in items], sampling, use_tqdm=False)
+                gen_end = time.time()
             finally:
                 if profiling_started:
                     llm.stop_profile()
@@ -492,6 +592,11 @@ def run_dp_rank(
                     flush=True,
                 )
             payload["outputs"] = records
+            if config.metrics_summary:
+                summary = summarize_request_metrics(outputs, gen_start, gen_end)
+                payload["metrics_summary"] = summary
+                brief = {k: v for k, v in summary.items() if k != "per_request"}
+                print(f"[dsa-smoke][metrics][dp={dp_rank}] " + json.dumps(brief, ensure_ascii=False), flush=True)
             if config.remote_shared and config.remote_shared.get("debug") is not None:
                 from vllm_ascend.dsa_offload.remote_shared_debug import remote_shared_debug_report
 
@@ -516,6 +621,8 @@ def run_dp_rank(
             wait_frontend_barrier(store, "shutdown", dp_rank, config.data_parallel_size)
         else:
             shutdown_barrier.wait(timeout=config.process_timeout_seconds)
+        # 各 rank 的结果文件已在 barrier 前落盘；rank0 合并全局吞吐/TPOT。
+        merge_global_metrics(config, dp_rank)
         if payload.get("status") == "failed_remote_debug":
             raise RuntimeError("remote debug mismatch or insufficient coverage; see DSA_REMOTE_DEBUG_SUMMARY")
     except BaseException:

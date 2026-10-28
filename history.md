@@ -47,3 +47,5 @@
 **派单**（commit 见本节首次提交）：R3 派单 superseded。依据：① 作者 10-28 给新跑通流程（profile_pool_inference.py 一键双 Pool + 模型，graph+MTP graph、40K、BS1 为作者验证配置）并亲口确认 probe 需手工补后四卡 store_endpoint（绿区 R2 修复方向获作者证实）；② 算子仓 main 更新到 f63a5bfed（ScatterSFA 回退修 217.654→265.659μs 退化 + 新增 --shared-port-gather），绿区旧版 6e85590db 必须重编。R4-0 停旧 Pool + /dev/shm remount 384G（已授权）；R4-3 作者原配置首发（BS1），EI0006 则 R4-3b 加 HCCL_CONNECT_TIMEOUT=1800；R4-4 条件放大 BS16（40K×16 用户验收口径方向）。判读预案写死于 pingpong.md §R4。
 **交付**：待绿区回传。
 **判读**（蓝区）：待定。
+
+**蓝区开发（R4 期间并行）**：simple_test.py 新增 metrics 汇总（每 rank TTFT/TPOT/吞吐 + rank0 全局合并 `<run_name>.metrics.json`，host 时钟、generate 返回后计算、零计时扰动；开关 VLLM_ASCEND_SMOKE_METRICS_SUMMARY，默认开）。纯增量，不影响 R4 执行；绿区下次 pull 后 R4-4/后续跑程自动带出 metrics 行。

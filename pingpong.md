@@ -817,3 +817,134 @@ RuntimeError: The Inner error is reported as above. The process exits for this i
 1. **EI0006 归属**：裸 8 卡 HCCL AllGather PASS（8/8），vLLM EP8 组（跨 4 EngineCore 进程树）首次 HcclAllGather 超时。倾向框架层（EP group 建链/多进程树 HCCL），请蓝区判读并给下一手（env 绕行如 HCCL_CONNECT_TIMEOUT / ASCEND_LAUNCH_BLOCKING=1 抓准确栈，或代码修复）。
 2. **R2-0 命令偏差**：`--du-sibling-cpus 6` 改为 5（硬件兄弟核），backing 换 kv-remote-r2b，请蓝区确认后续轮沿用。
 3. **per-device store_endpoint**：绿区按文档补全（未改代码），请蓝区确认符合预期（现 Pool 用 kv-remote-r2b，device 表 store_endpoint 指向各 DU child 19080+N）。
+
+## §R4 交付（绿区，2026-10-29）
+
+### 执行起止时间
+- R4-0 起：2026-10-29 04:5x（清场+扩 /dev/shm）
+- R4-1 构建：2026-10-29 05:02–05:14（build_and_install.sh + urma_mock_pool + build_store）
+- R4-3 运行：2026-10-29 05:22:17（model.log 首行）→ 05:23:10 失败（EI0015）
+- 全程单节点（90.96.17.111，16×950DT，容器 dsa-full）
+
+### 版本基线
+- 算子仓 `git log --oneline -3`（/home/fjj/a5-remote-offload-ops，HEAD f63a5bf）：
+  - f63a5bf Update and rename remote_offload_results.csv to overlap-19090.csv
+  - 1a0f252 feat(pool): add opt-in cross-port Gather worker sharing
+  - fe974e4 revert(copy-sfa): restore first-benefit ScatterSFA kernels
+- 框架仓 `git log --oneline -2`（/home/fjj/vllm-ascend-remote-offload，HEAD 4d5ce42）：
+  - 4d5ce42 docs(pingpong): R4 派单：作者新流程跑通优化版 remote-offload；R3 superseded
+  - 1ee1faa docs(pingpong): R2 adjudication + dispatch R3 EI0006 bisect
+
+### R4-0 清场+扩 /dev/shm —— RC=0 通过
+- 杀旧 Pool/框架进程、rm 旧 backing；`mount -o remount,size=384G /dev/shm` 成功：shm 384G total / ~373G avail。
+- 通过标准逐条命中：清场无残留、remount 成功。✅
+
+### R4-1 算子仓更新+重编 —— RC=0 通过
+- 算子仓 pull：9066 代理持续 407，改用算子仓自带 git config 代理 90.255.129.35:3128（curl 200）成功 pull 至 f63a5bf。
+- 容器内后台重编全链完成：build_and_install.sh + urma_mock_pool build.sh + build_store.sh。
+- 产物核验：
+  - `import kvcache_scatter_copy_custom_ops` → MOD_OK（算子注册正常）。
+  - urma_mock_pool（/home/fjj/a5-remote-offload-ops/test/urma_mock_pool/urma_mock_pool，Oct 29 05:12 重建）help 含 `du-pipeline-mib`、`du-gather-shared`、`DU_AND_GATHER`（新能力齐全，mtime 与构建时间吻合）。
+  - urma_pool_server（/home/fjj/a5-remote-offload-ops/tmp/mempool-build/urma_pool_server）help 含 `gather-scheduler`、`du-store-prefault`（各 grep 命中 2 处）。✅
+
+### R4-2 拓扑/资源核验 —— 通过
+- 4 NUMA 节点（0-3）；node0 CPU 0-95、node2 CPU 192-287；node0↔node2 距离 20（跨 NUMA 双 Pool 拓扑成立）。
+- affinity 384 逻辑核；shm 384G。✅
+
+### R4-3 作者流程首发 BS1（profile_pool_inference.py 一键双 Pool + 模型）—— **RC=1 失败（EI0015）**
+
+**通过标准逐条判定（R4-3 通过需同时满足）：**
+- 工具退出 RC=0：❌（RC=1，`RuntimeError: model exited 1; see raw/model.log`）
+- `tmp/r4-author-bs1/summary.txt` 含 `RUN_OK`：❌（内容为 `RUN_FAILED`）
+- `raw/model.log` 有生成文本：❌（无推理生成）
+- model.log 依次出现 `DSA_EXECUTION_PLAN → DSA_STORE_PUT_DONE → DSA_SHARED_CONNECT_BEGIN → DSA_SHARED_CONNECT_OK ... backend=real_store → ≥2 轮 DSA_SHARED_CONSUMED → DSA_SHARED_DRAIN_OK`：❌（仅到达 DSA_EXECUTION_PLAN，后续阶段未触达）
+- `raw/overlap-*.csv` 存在且非空：❌（PERF_DISABLED，未采集）
+- `run-status.json` 里 `graceful=true`、`errors=[]`：❌（graceful=true 但 errors 非空，见下）
+
+**run-status.json**：
+```
+{
+  "errors": ["RuntimeError: model exited 1; see raw/model.log"],
+  "graceful": true,
+  "mode": "remote",
+  "no_perf": true,
+  "launch": {"host": "dsa-host", "entrypoint": "examples/dsa_demo/simple_test_1p.py",
+             "node_count": 1, "node_rank": 0, "master_addr": null, "master_port": null, "sync_port": null},
+  "du_reply_segments": 1, "du_pipeline_mib": 1.0, "gather_scheduler": "shared",
+  "pool_enabled": true
+}
+```
+
+**summary.txt（tmp/r4-author-bs1/）**：
+```
+RUN_FAILED
+RuntimeError: model exited 1; see raw/model.log
+PERF_DISABLED
+RUN_FAILED
+未采集SPE/缺页事件、未做时钟校准或ROI握手；不是ROI归因或性能准入结论。
+保留classify计时/overlap CSV: raw/overlap-*.csv
+推理日志: raw/model.log; Pool日志: raw/pool-*.log
+```
+
+**成功抵达的里程碑（说明双 Pool 与模型装载阶段全部正常）：**
+- 双 Pool 完全 ready：`POOL_ROI_POOL_READY groups=['a', 'b']`（8×URMA_JETTY_READY、8×EMBEDDED_STORE_READY 各 32GB）。
+- store 路由正确：device0-3→du 20000-20003/store 19080-19083；device4-7→du 20004-20007/store 19084-19087（Pool A numa0 / Pool B numa2）。
+- 8 个 worker 全部到达 `DSA_EXECUTION_PLAN`（model_runner_v1.py:419，05:23:08，权重装载+执行计划下发成功）。
+- 随后 05:23:10 七/八个 worker 在 load_model 阶段崩（EP 通信组创建）。
+
+**失败根因链（model.log 首个报错点，Worker_DP1_TP1_EP3 前后 50 行，行号 1101-1175）：**
+```
+1101:(Worker_DP1_TP1_EP3 pid=1757500) ERROR 10-29 05:23:10 WorkerProc failed to start.
+... WorkerProc.__init__ → self.worker.load_model() → model_runner.load_model() →
+... get_model → initialize_model → DeepseekV2DecoderLayer → DeepseekV2MoE.__init__ →
+... FusedMoE.__init__ → setup_moe_comm_method →
+moe_comm_method.py:57    _MoECommMethods[MoECommType.ALLTOALL] = AlltoAllCommImpl(moe_config)
+moe_comm_method.py:93    self.token_dispatcher = self._get_token_dispatcher()
+moe_comm_method.py:250   return TokenDispatcherWithAll2AllV(
+token_dispatcher.py:472  self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
+1171: RuntimeError: create_config:../torch_npu/csrc/distributed/HCCLUtils.cpp:140
+     HCCL function error: hcclCommInitRootInfoConfig(numRanks, &rootInfo, rank, config,
+     &(comm->hcclComm_)), error code is 4
+1173: [PID: 1757500] 2026-10-29-05:23:10.221.707 Communication_Error_Ranktable_Detect(EI0015):
+     Failed to collect cluster information of the communicator based on rootInfo detection.
+     Reason: RootInfoDetect failed.
+      Solution: 1. Check whether all ranks in the communicator have delivered the communicator
+      creation interface. 2. Check the connectivity between the host networks of all nodes and
+      the server node. 3. Check whether the HCCL_SOCKET_IFNAME environment variable of all
+      nodes is correctly configured. 4. Increase the timeout by configuring the
+      HCCL_CONNECT_TIMEOUT environment variable.
+```
+
+**受影响 worker（7/8，DP0_TP0_EP0 未在错误列表中）：**
+- Worker_DP1_TP1_EP3（pid 1757500）、Worker_DP3_TP1_EP7（1757502）、Worker_DP0_TP1_EP1（1757499）、Worker_DP2_TP0_EP4（1756967）、Worker_DP2_TP1_EP5（1757501）、Worker_DP1_TP0_EP2（1756965）、Worker_DP3_TP0_EP6（1756966）。
+- 触发点均为 `token_dispatcher.py:472 backend.get_hccl_comm_name(local_rank)` → `hcclCommInitRootInfoConfig ... error code is 4` → EI0015。
+
+**日志路径：**
+- 运行日志：/home/fjj/pp_r4_run.log
+- 构建日志：/home/fjj/pp_r4_ops_build.log
+- summary：/home/fjj/a5-remote-offload-ops/tmp/r4-author-bs1/summary.txt
+- precheck：/home/fjj/a5-remote-offload-ops/tmp/r4-author-bs1/precheck.txt
+- model.log 末 100 行：/home/fjj/a5-remote-offload-ops/tmp/r4-author-bs1/raw/model.log（首个报错 1101 行起）
+- Pool 日志：/home/fjj/a5-remote-offload-ops/tmp/r4-author-bs1/raw/pool-a.log、pool-b.log
+
+**判读：** 报错为 **EI0015（RootInfoDetect failed, error code 4）**，非 R4-3b 触发条件的 EI0006/HcclAllGather 超时 → **R4-3b 严格按字面不触发**。EI0015 官方 solution 第 4 条指向 HCCL_CONNECT_TIMEOUT（与 R4-3b 意图同族），但时序上从 DSA_EXECUTION_PLAN（05:23:08）到失败（05:23:10）仅 2 秒，不像超时，更像 communicator 创建时 rank 未同步。双 Pool 完全 ready → 排除 Pool 根因。失败点收敛到 MoE EP8 ALLTOALL 通信组创建（与 R2 EI0006 建链超时、R3-A dispatch timeout EmptyQueue 同族，均在 EP8 跨 DP 建链层）。
+
+### R4-3b / R4-4 —— 条件不触发，未执行
+- R4-3b 触发条件=报错含 EI0006 / HcclAllGather 超时：实际报错为 EI0015，**不触发**。
+- R4-4 触发条件=仅当 R4-3/3b 通过：R4-3 失败，**不适用**。
+
+### 判读预案命中
+- **「R4-3/3b 均失败 ⇒ 阴性」** 命中：summary/precheck/model.log 已按回传格式附上，蓝区对照作者流程逐参数定位。
+
+---
+
+### 附：R3 实验数据（按派单要求原样附加）
+
+R3 派单（1ee1faa）三阶段实验中仅 R3-A（offload 关闭对照实验）执行，R3-B/R3-C 因 R3-A 失败未触发。
+
+**R3-A 结果（offload OFF，EP8 基线）：RC=1 失败**
+- 日志：/home/fjj/pp_r3a_run.log（2026-10-28 01:07:47 启动）
+- 结尾：`RuntimeError: offline DP rank failed: dsa-dp-0=1, dsa-dp-1=1, dsa-dp-2=1, dsa-dp-3=1`（4 个 DP rank 全崩）
+- 失败根因：profile_run → _dummy_run → deepseek_v2 MoE 前向；4 个 EngineCore 均报 `No available shared memory broadcast block found in 60 seconds`（patch_shm_broadcast.py:74，01:11-01:12）；底层为 **HCCL dispatch timeout**（Process group work ALLGATHER/REDUCE_SCATTER/ALLREDUCE ... dispatch timeout. device 1: EmptyQueue）。
+- 关键含义：offload 关闭时 EP8 也崩 → 问题在 HCCL/EP 通信层而非 remote-offload 引入；裸探针 8/8 PASS 与 vLLM 多进程树差异仍在。
+- 运行起止：2026-10-28 01:07:47 → 01:12+ 失败（R3-A 报错点前后行号 767-774 见 pp_r3a_run.log）。

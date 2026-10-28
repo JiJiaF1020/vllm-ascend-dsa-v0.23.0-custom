@@ -41,3 +41,9 @@
 **派单**（commit 见本节首次提交）：R3-A offload 关闭对照（同 DP4/TP2 eager BS1）→ R3-B offload 开 + HCCL_CONNECT_TIMEOUT=1800 → 仍 EI0006 则 R3-C（ASCEND_LAUNCH_BLOCKING=1 + HCCL_ENTRY_LOG_ENABLE=1）抓精确栈。通过标准写死于 pingpong.md §R3（R3-B 沿用 R2 的日志序列/rows=4/capacity report 标准）。
 **交付**：待绿区回传。
 **判读**（蓝区）：待定。
+
+## §R4 作者新流程跑通优化版（2026-10-28）
+
+**派单**（commit 见本节首次提交）：R3 派单 superseded。依据：① 作者 10-28 给新跑通流程（profile_pool_inference.py 一键双 Pool + 模型，graph+MTP graph、40K、BS1 为作者验证配置）并亲口确认 probe 需手工补后四卡 store_endpoint（绿区 R2 修复方向获作者证实）；② 算子仓 main 更新到 f63a5bfed（ScatterSFA 回退修 217.654→265.659μs 退化 + 新增 --shared-port-gather），绿区旧版 6e85590db 必须重编。R4-0 停旧 Pool + /dev/shm remount 384G（已授权）；R4-3 作者原配置首发（BS1），EI0006 则 R4-3b 加 HCCL_CONNECT_TIMEOUT=1800；R4-4 条件放大 BS16（40K×16 用户验收口径方向）。判读预案写死于 pingpong.md §R4。
+**交付**：待绿区回传。
+**判读**（蓝区）：待定。

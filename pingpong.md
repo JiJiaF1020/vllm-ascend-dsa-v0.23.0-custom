@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: R3 派单已发出（EI0006 定位与越过：offload-off 对照 + HCCL_CONNECT_TIMEOUT=1800），等绿区回传。R2 已判读：阴性，EP8 权重装载实测成功（61.3GB/卡），EI0006 归框架/配置层。
+- Current owner: **绿区**。Status: R4 派单已发出（作者新流程跑通优化版：ops f63a5bfed 重编 + profile_pool_inference 一键双 Pool + graph/MTP graph 40K，BS1 首发、BS16 条件放大），等绿区回传。R3 派单已被 R4 取代（若已做实验数据照附）。R2 已判读：阴性，EP8 权重装载实测成功（61.3GB/卡），EI0006 归框架/配置层。
 
 ## 0. 目标与口径
 
@@ -14,7 +14,7 @@
 **锚点事实**（蓝区已核对，绿区不得变更口径）：
 
 - 本仓分支 tip：`cac7e2c4e` + 蓝区 pingpong 文档提交（pull --ff-only 后 `git log --oneline -3` 顶部应是 pingpong 提交）。
-- 算子仓：`https://github.com/JiJiaF1020/a5-remote-offload-ops`，main tip `6e85590db`。
+- 算子仓：`https://github.com/JiJiaF1020/a5-remote-offload-ops`，main tip `f63a5bfed`（R4 起；ScatterSFA 回退 + shared-port-gather）。
 - 模型：`/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731`（GLM-5.2，78 层 target，W4A4C8 mxfp4）。先 `ls` 确认；路径不对就只回报实际路径，不要自己换模型。
 - 容器：`dsa-full`（镜像 `vllm-ascend:v0.23.0-a5-openeuler`，host 网络/pid，挂 /etc /data /home）。`docker ps` 核对；容器名不同就按实际的进。
 - 本轮只判"通/不通"，不做任何性能结论。带宽/TPOT 等性能口径后续轮次单独派单。
@@ -203,7 +203,7 @@ python examples/dsa_demo/simple_test_1p.py \
 
 （新轮次从这里往下追加：蓝区写「派单」节，绿区写「交付」节，蓝区写「判读」节。最新一轮在最上面，旧轮次标题加「-旧」标记。）
 
-## §R3 派单：EI0006 定位与越过（蓝区，2026-10-27）
+## §R3 派单-旧：EI0006 定位与越过（蓝区，2026-10-27）——已被 §R4 取代；若已执行部分实验，数据原样附入 §R4 交付
 
 ### 目标
 
@@ -304,6 +304,167 @@ tar czf /home/fjj/pp_r3c_hccl_log.tgz -C ~ ascend/log 2>/dev/null; ls -l /home/f
 - **R3-A 过 + R3-B 过** ⇒ 根因=HCCL 建链超时（worker 启动偏斜），HCCL_CONNECT_TIMEOUT=1800 入库为本分支标配；R3-B 通过标准全中即**阳性落袋**，下一轮 graph 模式 + 带宽/TPOT 性能口径（另写派单）。
 - **R3-A 过 + R3-B 仍 EI0006** ⇒ 阴性；R3-C 精确栈 + HCCL 日志回传，蓝区出代码修复。
 - **出现 `DSA A5 MTP LIM requires 1..4 query rows per request` / 零 miss 卡住** ⇒ 按 R2 预案同条款处理（阴性，保留日志回传）。
+
+## §R4 派单：作者新流程跑通优化版 remote-offload（蓝区，2026-10-28）
+
+### 背景（绿区必读）
+
+作者 10-28 给了新的跑通流程，并确认两件事：① probe 产物需要给后四个 NPU 手工补 store_endpoint——**证实绿区 R2 修复方向正确**，继续沿用修复后的 remote-shared.json；② 作者自家跑通配置 = graph + MTP graph、40K 上下文、BS1（run 目录名 `dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared`）。同时算子仓 main 已更新到 `f63a5bfed`（ScatterSFA 内核回退修性能退化 + 新增 `--shared-port-gather` 跨端口 Gather 共享），绿区机器上的 6e85590db 是**含性能退化的旧版**，本轮必须同步重编。本轮起改用算子仓自带工具 `tools/profile_pool_inference.py` 一键起双 Pool + 模型（不再手工起 Pool，R1-R3 的"不杀 Pool"旧规本轮起作废）。
+
+### 目标
+
+按作者流程跑通优化版 remote-offload 整网：Stage 1 作者原配置（graph+MTP graph、40K、BS1）拿跑通证据；Stage 2 条件放大到 BS16（40K×16，用户验收口径方向）。本轮仍以"通/不通"为主，overlap CSV 落盘即可，性能判读后续轮次。
+
+### 前置核验
+
+1. `docker ps` 确认 `dsa-full` 在运行；除注明外命令都在容器内执行。
+2. `npu-smi info | head -30`：8 卡空闲、无残留进程。
+3. `ls /data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731 | head`：权重在。
+4. `ls /home/fjj/a5-remote-offload-ops/tmp/eid-probe-r1/remote-shared.json`：R1 探测产物在。不在就回报 `ls /home/fjj/a5-remote-offload-ops/tmp/` 实际内容，**不要重新 probe**。
+
+### 执行命令
+
+**R4-0 · 清场 + 停旧 Pool + 扩 /dev/shm**（本轮要起双 Pool 占用 19080-19087/20000-20007，旧 Pool 必须停；shm 要装 2×128GiB Store + Gather arena，384G remount 已获蓝区授权——容器 ipc=host，会影响宿主机 /dev/shm，属预期）
+
+```bash
+ps aux | grep -E 'urma_pool_server|urma_mock_pool' | grep -v grep | awk '{print $2}' | xargs -r kill -9
+ps aux | grep -E 'python|vllm' | grep -v grep | awk '{print $2}' | xargs -r kill -9
+sleep 5
+ps aux | grep -E 'urma|python|vllm' | grep -v grep   # 应为空，回报实际输出
+rm -rf /dev/shm/kv-remote-r1 /dev/shm/kv-remote-r2 /dev/shm/kv-remote-r2b /dev/shm/kv-remote-r3 /dev/shm/offload-numa-*
+mount -o remount,size=384G /dev/shm && df -h /dev/shm   # 回报 df 行
+```
+
+**R4-1 · 算子仓更新 + 重编**（含 ScatterSFA 回退和 shared-port-gather 新能力；Pool wrapper/binary 必须重编，工具会校验新选项）
+
+```bash
+cd /home/fjj/a5-remote-offload-ops
+git -c http.proxy=http://90.255.12.179:3128 pull --ff-only
+git log --oneline -3   # 回报；顶部必须是 f63a5bfed
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+USE_NINJA=1 SOC_VERSION=ascend950 BUILD_JOBS=128 ENABLE_C8_MTP_OPS=1 ENABLE_LOCAL_AIV=1 \
+ENABLE_AICPU_KERNEL=0 KVCACHE_SCATTER_COPY_OP_NAME=ALL \
+bash build_and_install.sh 2>&1 | tee /home/fjj/pp_r4_ops_build.log
+bash test/urma_mock_pool/build.sh 2>&1 | tee -a /home/fjj/pp_r4_ops_build.log
+bash test/urma_mock_pool/build_store.sh 2>&1 | tee -a /home/fjj/pp_r4_ops_build.log
+# 新能力自检（两组 grep 都要有输出，原文回报）
+test/urma_mock_pool/urma_mock_pool --help 2>&1 | grep -E "du-gather-shared|du-pipeline-mib|DU_AND_GATHER"
+tmp/mempool-build/urma_pool_server --help 2>&1 | grep -E "gather-scheduler|du-store-prefault"
+```
+
+**R4-2 · 拓扑/资源核验**（只读，原文回报；CPU 范围用工具默认值即可，前提是核数和 NUMA 布局与作者机一致）
+
+```bash
+numactl -H | head -20
+python3 -c "import os; a=sorted(os.sched_getaffinity(0)); print(len(a)); print(a[:8]); print(a[-8:])"
+df -h /dev/shm
+```
+
+**R4-3 · 作者流程首发（BS1、graph+MTP graph、40K）**——工具自己起双 Pool（A：numa0/du 20000-20003/udmac1d1e2；B：numa2/du 20004-20007/udmac0d1e3，均为绿区 R1 实测分组）+ 框架 simple_test_1p.py（DP4TP2EP8 默认）。CPU 绑核、du-workers、requests 等全部用工具默认值（=作者值）。一次跑几十分钟量级。
+
+```bash
+cd /home/fjj/a5-remote-offload-ops
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+export VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731
+export VLLM_ASCEND_SMOKE_DATASET=chinese_40k
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=1
+export VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=45056
+export VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS=45056
+export VLLM_ASCEND_SMOKE_MAX_TOKENS=64
+export VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0
+python3 tools/profile_pool_inference.py \
+  --no-perf \
+  --framework-repo /home/fjj/vllm-ascend-remote-offload \
+  --remote-config /home/fjj/a5-remote-offload-ops/tmp/eid-probe-r1/remote-shared.json \
+  --output tmp/r4-author-bs1 \
+  --payload-layers 78 \
+  --store-bytes $((128*1024*1024*1024)) \
+  --du-ports 20000,20001,20002,20003 --store-ports 19080,19081,19082,19083 \
+  --pool-b-du-ports 20004,20005,20006,20007 --pool-b-store-ports 19084,19085,19086,19087 \
+  --du-devices udmac1d1e2 --pool-b-du-devices udmac0d1e3 \
+  --du-eid-indices 0 --pool-b-du-eid-indices 0 \
+  --sample-port 20000 --sample-worker 0 \
+  --numa-node 0 --pool-b-numa-node 2 --store-numa-nodes local \
+  --pool-start-timeout 600 \
+  --shared-port-gather --du-pipeline-mib 1 \
+  2>&1 | tee /home/fjj/pp_r4_run.log
+echo "RC=$?"   # 回报
+```
+
+**R4-3b ·（仅当 R4-3 失败且报错含 EI0006 / HcclAllGather 超时）放宽 HCCL 建链超时重试一次**
+
+```bash
+rm -rf /dev/shm/offload-numa-* tmp/r4-author-bs1
+export HCCL_CONNECT_TIMEOUT=1800
+python3 tools/profile_pool_inference.py \
+  --no-perf \
+  --framework-repo /home/fjj/vllm-ascend-remote-offload \
+  --remote-config /home/fjj/a5-remote-offload-ops/tmp/eid-probe-r1/remote-shared.json \
+  --output tmp/r4-author-bs1 \
+  --payload-layers 78 \
+  --store-bytes $((128*1024*1024*1024)) \
+  --du-ports 20000,20001,20002,20003 --store-ports 19080,19081,19082,19083 \
+  --pool-b-du-ports 20004,20005,20006,20007 --pool-b-store-ports 19084,19085,19086,19087 \
+  --du-devices udmac1d1e2 --pool-b-du-devices udmac0d1e3 \
+  --du-eid-indices 0 --pool-b-du-eid-indices 0 \
+  --sample-port 20000 --sample-worker 0 \
+  --numa-node 0 --pool-b-numa-node 2 --store-numa-nodes local \
+  --pool-start-timeout 600 \
+  --shared-port-gather --du-pipeline-mib 1 \
+  2>&1 | tee /home/fjj/pp_r4b_run.log
+echo "RC=$?"   # 回报
+```
+
+**R4-4 ·（仅当 R4-3 或 R4-3b 通过）放大到 BS16（40K×16，用户验收口径方向）**
+
+```bash
+ps aux | grep -E 'urma_pool_server|urma_mock_pool' | grep -v grep | awk '{print $2}' | xargs -r kill -9
+sleep 5; rm -rf /dev/shm/offload-numa-*
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=16
+python3 tools/profile_pool_inference.py \
+  --no-perf \
+  --framework-repo /home/fjj/vllm-ascend-remote-offload \
+  --remote-config /home/fjj/a5-remote-offload-ops/tmp/eid-probe-r1/remote-shared.json \
+  --output tmp/r4-bs16 \
+  --payload-layers 78 \
+  --store-bytes $((128*1024*1024*1024)) \
+  --du-ports 20000,20001,20002,20003 --store-ports 19080,19081,19082,19083 \
+  --pool-b-du-ports 20004,20005,20006,20007 --pool-b-store-ports 19084,19085,19086,19087 \
+  --du-devices udmac1d1e2 --pool-b-du-devices udmac0d1e3 \
+  --du-eid-indices 0 --pool-b-du-eid-indices 0 \
+  --sample-port 20000 --sample-worker 0 \
+  --numa-node 0 --pool-b-numa-node 2 --store-numa-nodes local \
+  --pool-start-timeout 600 \
+  --shared-port-gather --du-pipeline-mib 1 \
+  2>&1 | tee /home/fjj/pp_r4_bs16.log
+echo "RC=$?"   # 回报
+```
+
+### 通过标准
+
+- **R4-1**：`git log` 顶部 f63a5bfed；build RC=0；两组 help grep 均有输出。
+- **R4-3（或 R4-3b）通过**（需同时满足）：工具退出 RC=0；`tmp/r4-author-bs1/summary.txt` 含 `RUN_OK`；`raw/model.log` 有生成文本；model.log 依次出现 `DSA_EXECUTION_PLAN` → `DSA_STORE_PUT_DONE` → `DSA_SHARED_CONNECT_BEGIN` → `DSA_SHARED_CONNECT_OK ... backend=real_store` → ≥2 轮 `DSA_SHARED_CONSUMED` → `DSA_SHARED_DRAIN_OK`；`raw/overlap-*.csv` 存在且非空；`run-status.json` 里 `graceful=true`、`errors=[]`。
+- **R4-4**：标准同 R4-3（目录换 tmp/r4-bs16）；失败不阻塞本轮，按判读预案处理。
+
+### 已知边界（遇到不算新发现，按判读预案处理）
+
+- BS16 + MTP graph 可能命中 `DSA A5 MTP LIM requires 1..4 query rows per request`（本分支未修的 LIM 校验）——命中则 R4-4 记阴性、日志回传，不影响 R4-3 结论。
+- "零 miss 第二轮全 hit 卡住"：保留 Pool 日志（tmp/r4-*/raw/pool-*.log）+ model.log 原样回传。
+- 工具不会删 backing；R4-4 前已含清理步骤，此外不要手工删其它路径。
+- R4-0 的 `mount -o remount` 影响宿主机 /dev/shm，已授权；不要动宿主机其它挂载。
+
+### 回传格式
+
+在 pingpong.md 追加「§R4 交付」节，格式同前：R4-0/1/2/3(/3b/4) 各阶段 RC + 通过标准逐条命中/未命中 + 关键日志原文行；失败给首个报错点前后 50 行 + 对应日志路径（pp_r4*.log、tmp/r4-*/summary.txt、tmp/r4-*/precheck.txt、tmp/r4-*/raw/model.log 末 100 行）；附算子仓 `git log --oneline -3`、框架仓 `git log --oneline -2` 与执行起止时间。若 R3 已做过部分实验，数据原样附在交付末尾。
+
+### 判读预案（派单时写死）
+
+- **R4-3 直接通过** ⇒ 阳性落袋（作者优化版在绿区复现）；R4-4 数据用于 BS16 评估；蓝区随后启动 bench 汇总输出（TPOT/吞吐）开发。
+- **R4-3 EI0006、R4-3b 通过** ⇒ 阳性落袋，HCCL_CONNECT_TIMEOUT=1800 入库为本分支标配，R3 的建链偏斜假说坐实。
+- **R4-3/3b 均失败** ⇒ 阴性；summary/precheck/model.log 回传，蓝区对照作者流程逐参数定位。
+- **R4-4 LIM/零 miss** ⇒ 已知边界命中，阴性不阻塞主线；蓝区核对形状后决定修复或配置绕行。
+- **R4-1 构建失败** ⇒ 报错末 30 行回传，停止后续阶段。
 
 ## §R2 判读（蓝区，2026-10-27）
 

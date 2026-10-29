@@ -583,6 +583,67 @@ tar czf /home/fjj/pp_r5c_ascend_log.tgz -C ~ ascend/log 2>/dev/null; ls -l /home
 - **A/B 均败** ⇒ 阴性；R5-C 栈 + ascend/log 回传，蓝区对比作者 va.env（索取中）逐参数定位。
 - **出现 LIM `1..4 query rows` / 零 miss 卡住** ⇒ 已知边界，日志回传即完成义务。
 
+
+## §R5 交付（绿区，2026-10-29 21:00）
+
+### 各级结果：A/B 均败（阴性），R5-C 栈+日志已落盘回传
+
+| 级 | 变体 | 结果 | 失败签名 | 关键时间 |
+|---|---|---|---|---|
+| R5-A | HCCL_CONNECT_TIMEOUT=1800 | **FAIL** | EI0015×7（与 R4-3 完全相同） | 19:52:49 启动 → 19:53:49 EI0015 |
+| R5-B | +VLLM_ASCEND_SMOKE_ENABLE_CPU_BINDING=0 | **FAIL** | EI0015×7（关绑核无效） | 20:08:35 启动 → 20:09:23 EI0015 |
+| R5-C | +HCCL_ENTRY_LOG_ENABLE=1 +ASCEND_LAUNCH_BLOCKING=1 | **N/A** | 4×ValidationError：`ACL graph is incompatible with ASCEND_LAUNCH_BLOCKING=1`，config 校验期即拒，未到建链 | 20:12:56 启动即败 |
+
+### 通过标准逐条核验（A/B 通用）
+
+- 工具 RC=0：**不满足**（A/B 均 `RuntimeError: model exited 1`，summary.txt=`RUN_FAILED`）
+- `tmp/<OUT>/summary.txt` 含 `RUN_OK`：**不满足**（三级别均 `RUN_FAILED`）
+- `raw/model.log` 有生成文本：**不满足**（无生成阶段）
+- 日志序列 `DSA_EXECUTION_PLAN`→`DSA_STORE_PUT_DONE`→`DSA_SHARED_CONNECT_BEGIN`→`DSA_SHARED_CONNECT_OK`→`≥2 DSA_SHARED_CONSUMED`→`DSA_SHARED_DRAIN_OK`：**不满足**（remote-shared 推理路径仍未触达，与 R2/R4 一致）
+- `run-status.json` graceful=true 且 errors=[]：**不存在**（模型装载阶段即崩）
+
+### 关键证据
+
+**R5-A/B 失败机制（与 R4-3 完全同构，确认复现而非新卡点）**：
+- 失败点：`WorkerProc failed to start` → `DeepseekV2MoE.__init__` → `FusedMoE.__init__` → `setup_moe_comm_method` → `AlltoAllCommImpl` → `TokenDispatcherWithAll2AllV.__init__` → `token_dispatcher.py:472 backend.get_hccl_comm_name(local_rank)` → `hcclCommInitRootInfoConfig(...) error code is 4` → **EI0015 Communication_Error_Ranktable_Detect / RootInfoDetect failed**
+- 影响 worker：R5-A 7 worker（EP1/3/4/5/6/7，DP0-3 跨 4 EngineCore）、R5-B 7 worker（同族）
+- **快速失败非超时**：EI0015 出现在模型装载完成（DSA 执行计划已下发，见下）后 1-2 秒内，HCCL_CONNECT_TIMEOUT=1800 未改变时序 ⇒ solution#4 超时方向不适用
+- **模型装载已成功**：R5-A 崩溃前 worker 已打印 `model_runner_v1.py:419` 全部 remote_shared 执行计划（`50 14 50 hbm pool lis_send_full durable_with_causal_tail` / `51-53 remote_pool pool remote_shared source_plan scatter_sfa` 等逐层 plan），EP8 权重装载完成，仅 MoE 通信组初始化（all2all comm）失败
+
+**R5-C 失败机制（派单变量自身兼容性问题，非 EI0015 缓解/证据）**：
+- `ASCEND_LAUNCH_BLOCKING=1` 与 ACL graph 模式不兼容，vLLM 在 `VllmConfig` pydantic 校验期即拒绝：`Value error, ACL graph is incompatible with ASCEND_LAUNCH_BLOCKING=1. Please unset ASCEND_LAUNCH_BLOCKING or set it to 0`
+- 4 个 DP rank（dsa-dp-0/1/2/3）全部在 `create_engine_config` 阶段失败，**未到模型装载/建链**，故无 HCCL 栈可抓（EI0015 计数=0）
+- 派单预案「C 级不要求通过，栈和日志落盘即可」：**已满足**——ascend/log 全量打包含历史 R5-A/B 的 EI0015 plog
+
+### 日志路径
+
+- R5-A：`/home/fjj/pp_r5_r5a-hccl1800.log`；`/home/fjj/a5-remote-offload-ops/tmp/r5a-hccl1800/raw/model.log`；首个报错点前后 50 行存档 `/home/fjj/r5a_first_error_ctx.txt`
+- R5-B：`/home/fjj/pp_r5_r5b-nocpubind.log`；`/home/fjj/a5-remote-offload-ops/tmp/r5b-no-cpubind/raw/model.log`；首个报错点前后 50 行存档 `/home/fjj/r5b_first_error_ctx.txt`
+- R5-C：`/home/fjj/pp_r5_r5c-hccl-trace.log`；`/home/fjj/a5-remote-offload-ops/tmp/r5c-hccl-trace/raw/model.log`；**HCCL 栈包 `/home/fjj/pp_r5c_ascend_log.tgz`（3429428 字节，296 文件）**
+- tgz 内容：`ascend/log/` 全量 = `vllm_ascend/` 框架日志 + `run/device-*/` 设备日志 + `run/plog/` + `debug/plog/`（159 个 plog，含 R5-A plog-2274708、R5-B plog-2320216 等 EI0015 时点 plog）+ `debug/device-*`
+
+### 框架仓版本与执行时间
+
+```
+$ git log --oneline -2
+3670a39 docs(pingpong): R5-0 作者现场取证（同机 w00919836 账号，va.env/EID/成功日志）
+074ebe9 docs(pingpong): R5 前置核验补 HDK 驱动/固件版本采集
+```
+
+- 执行起止：R5-A 19:52:49~19:53:49；R5-B 20:08:35~20:09:23；R5-C 20:12:56（即败）+ 20:13 tgz 打包完成
+
+### 供蓝区参考的差异点（R5-0 取证已确认）
+
+1. 作者 va.env **无任何 HCCL 调优变量**（推翻「作者有 HCCL 超时调优」猜测）——但作者跑程成功，绿区 A/B 相同命令失败，差异不在 HCCL 变量
+2. 作者框架仓 scp-va HEAD=cac7e2c4 **比绿区 3670a39 新 3 commit**（未推送：`perf(dsa): dispatch shared group IO once from Full`、`fix(dsa): 远端直通仅保留本地 KV 计划元数据` 等）；未提交改动：simple_test.py `min_tokens=max_tokens, ignore_eos=True`；simple_test_1p.py 参数调整
+3. 作者 EID 表与绿区差异：du_endpoint 19090-19097（绿区 20000-20007）；pool_eid 作者 0f7f03.../0f3f03...（绿区 0f7f02...）
+4. 作者跑程 binding=none（未绑核）；绿区 R5-B 关绑核后仍 EI0015 ⇒ **绑核不是根因**
+5. 作者 smoke 参数差异：CHUNKED_PREFILL=1、DP4/TP2、MAX_NUM_SEQS=16、MAX_MODEL_LEN=40960（绿区 R5 用 CHUNKED 默认、MAX_NUM_SEQS=1、MAX_MODEL_LEN=45056）
+
+### 判读预案命中
+
+- 「A/B 均败 ⇒ 阴性；R5-C 栈 + ascend/log 回传，蓝区对比作者 va.env 逐参数定位」→ **命中**，回传材料齐备。
+- 未出现「LIM `1..4 query rows` / 零 miss 卡住」边界，该预案不适用。
 ## §R2 判读（蓝区，2026-10-27）
 
 ### 总结论

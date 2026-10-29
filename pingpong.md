@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **蓝区**。Status: R8 交付已回传（6 组只读证据 + udmac 节点批量重建/UDMA 高频活动/kvaf_cpu_service 持有 d1e6，npu-smi -t error-code 本机不支持已注明），附 /etc/hccl_rootinfo.json 空目录排查结论（排除为 EI0015 根因，MemFabric 专用非裸探针消费）。等蓝区整理管理员简报。
+- Current owner: **蓝区**。Status: R8 补充已回传——/etc/hccl_rootinfo.json 已被重新生成（02:07:16，19496B 合法 JSON，非绿区操作），探针错误面从 EI0015 前移到 EI0020（NPU 网络端口 16666 被占用，8/8）；用户指示有人占用先不跑，等占用释放/蓝区指示（HCCL_NPU_SOCKET_PORT_RANGE 可规避）。
 
 ## 0. 目标与口径
 
@@ -742,6 +742,34 @@ root 1776834 docker run -it --name deepseek-v41-950dt-2 ... --device /dev/uburma
 **补充：udmac 节点刷新源追查**：udmac d1e2~d1e5 节点在 01:48:48、01:49:50 连续两个时刻批量重建（R7 00:32 亦刷新），而 d1e6 旧节点（10-22/10-23）不受影响。刷新时无进程新建、udev 无事件、无规则文件 → 指向**内核/驱动层周期性重建 UDMA 设备节点**（ubcore/uburma 模块在跑），非用户态创建。与 EI0015 故障窗口（10-27→10-30）在时间上重叠，供机器管理员核查驱动 25.6.rc2 的 UDMA 节点管理行为。
 
 **回传判读落点**：6 组命令全部执行（2 组 npu-smi 子命令本机不支持已注明替代）；机器层证据（UDMA 高频活动 + udmac 节点批量重建 + kvaf_cpu_service 持有 d1e6）已采集，供蓝区整理管理员简报。绿区未执行任何修复动作（按派单预案）。
+### R8 补充：/etc/hccl_rootinfo.json 被重新生成 + 探针错误面推进 EI0015→EI0020（绿区，2026-10-30 04:1x）
+
+**背景**：用户发现 `/etc/hccl_rootinfo.json` 被**重新生成**（不再是空目录），指示再跑探针验证。
+
+**新文件事实**（已核验，只读）：
+- `/etc/hccl_rootinfo.json` = **19496 字节合法 JSON**（Birth 2026-10-30 02:07:16，Modify 同刻），`file` 识别 `JSON text data`。
+- 内容：`version=2.0`、`topo_file_path=/usr/local/Ascend/driver/topo/950/atlas_850_1.json`（存在，18687 字节，10-22 旧文件）、`rank_count=8`、`rank_list` 含 device_id 0-7 各 8 卡、EID 地址 + ports + plane_id。python json.load 校验通过。
+- **生成者**：绿区未操作（绿区命令无 touch /etc 记录）；推断为机器管理员/驱动侧修复动作（02:07:16 生成）。
+
+**探针结果（04:09~04:12 三次）**：**EI0015 消失 → 推进到 EI0020**。
+```text
+[rank0-7] Communication_Error_Bind_IP_Port(EI0020): Failed to enable listening for the NPU network adapter socket.
+Reason: The IP address IpAddress[...::f47:500:10:0:df00:xxxx...] and port 16666 have already been bound.
+Solution: ... configure the port number using the environment variable HCCL_NPU_SOCKET_PORT_RANGE.
+```
+- 8/8 rank 全报 EI0020，错误面从 `RootInfoDetect failed`（EI0015）**前移**到 `Bind_IP_Port`（EI0020，NPU 网络适配器 socket bind 16666 冲突）。
+- **解读**：新 rootinfo 文件让 RootInfoDetect 通过了（EI0015 修复），但 8 个 rank 的 NPU 网络地址（UB 平面 IPv6 `::f4x:500:10:0:df00:*`）上端口 **16666 被占用**。
+
+**占用排查（只读）**：
+- 宿主 `ss -tlnp`/`netstat` 与全部 6 个容器内 `ss` 均**看不到 16666 监听** → 16666 绑定在 NPU 网卡内部地址（UB 平面），不暴露给宿主 TCP 栈。
+- 无残留 probe/python 进程；`ip link` 显示 `ipourma0/1/2` 接口存在（NOARP,UP,LOWER_UP）。
+- `kvaf_cpu_service`（PID 182921，udmac0d1e6，--port 28999）在监听 28999（`ss` 可见），持有 2 个 socket fd。
+- **用户指示「有人在占用就先不跑了」→ 探针未再重试，等待占用释放/蓝区指示。**
+
+**判读落点**：
+- rootinfo 文件被生成后 EI0015 不再出现 → **该文件确实是 RootInfoDetect 的输入**（先前排除结论需修正：空目录虽非绿区造成，但确实是 EI0015 的一个必要条件；蓝区判读时请纳入）。
+- 当前故障面 = **NPU 网络端口 16666 占用**（EI0020）。按 solution 可用 `HCCL_NPU_SOCKET_PORT_RANGE` 指定端口段规避，或等占用释放。绿区不执行修复，等蓝区/用户指示。
+
 
 
 ## §R5 判读（蓝区，2026-10-29）

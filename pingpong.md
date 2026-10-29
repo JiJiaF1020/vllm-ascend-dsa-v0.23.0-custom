@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **蓝区**。Status: §R14 已交付（R14-0 作者 shell history 无 smoke env 导出；R14-1 scp-va 代码+env 值全集在作者数据面 EI0006 复现→配置值轴坐实；R14-2 五步逐项 unset 全复现 EI0006，5 候选配置值均非独立元凶，等蓝区重估）。R9 阳性落袋不变。
+- Current owner: **绿区**。Status: §R14 已判读（代码轴排除；非单一配置值；剩余 4 env 中 3 个本地判 inert，**唯一活嫌疑 = MODEL_PATH 两 ckpt 可能不同**）+ **§R15 派单已发**（R15-0 ckpt config diff 只读锁定；R15-1 今日重放 R11-D 机器对照；R15-2 只留 MODEL_PATH 对照 + R16 分支预案）。R9 阳性落袋不变；bench 基线 0/8。
 
 ## 0. 目标与口径
 
@@ -1423,6 +1423,69 @@ step5: VLLM_ASCEND_SMOKE_GPU_MEMORY_UTILIZATION=
 日志：/home/fjj/pp_r14.log（R14-1）、/home/fjj/pp_r14_step{1..5}.log；各步证据 tmp/r14-va-env-authorplane-step{1..5}/raw/model.log
 起止：2026-10-30 11:10（R14-0）~ 12:15（step5 清场完成）
 
+
+## §R14 判读（蓝区，2026-10-30）
+
+### 裁决
+
+1. **配置值轴坐实、代码轴排除**：同值在 scp-va（作者代码）上也崩（R14-1）→ bench commit 彻底洗清；EI0006 由配置值集合触发。
+2. **但非单一配置值**：五步逐个 unset（batched_tokens/model_len/chunked/BS/gpu_mem）全崩（R14-2），5 个候选均非独立元凶。且 step1（batched 25600）与 R11-D 的 profile 形状相同仍崩 → 连"profile 尺寸"都排除。
+3. **剩余差分穷尽**（崩组 vs R11-D 组）：unset 从未触及的 env 只剩 4 个——MODEL_PATH、DATASET、MAX_TOKENS、ENABLE_PROFILE。蓝区本地已证：DATASET 只换 prompts（init 配置的 budget/thresholds 全部来自默认值，两组完全一致；profile run 不用真实 prompts）→ **DATASET 判 inert**；MAX_TOKENS 只碰 sampling → **inert**；ENABLE_PROFILE 在 --no-perf 下无采样器 → **基本 inert**；ENABLE_CPU_BINDING 已被 R13-1+正交性排除。**唯一活嫌疑 = MODEL_PATH**：我们 `/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731` vs R11-D 走作者脚本默认 `/home/models/GLM-5.2-w4a4c8-mxfp4_99`——**若是两个不同 ckpt（config.json 有差异），模型初始化路径（DSA 计划/KV 布局）即不同**，这是最后一个能解释"同相位恒定崩溃"的配置级变量。
+4. **时间线旁证**：R11-D（08:51/09:02 不崩）被 R11-B（08:44 崩）与 R12-1（10:02 崩）夹在中间 → 「机器状态时段」相关性也被破坏，纯时间假说不成立。
+5. bench 基线 0/8 轮到 generate；本轮 6 轮全是归因轮。
+
+### 判读落点
+
+R15：只读取证先锁 MODEL_PATH 轴（两 ckpt 的 config.json diff——免费且决定性）；再跑两个对照（今日重放 R11-D = 机器状态对照；R14-1 只留 MODEL_PATH = env 机制对照）。
+
+## §R15 派单：MODEL_PATH 轴锁定 + 双对照（蓝区，2026-10-30）
+
+### 原则
+
+R15-0 只读先行；R15-1/R15-2 顺序执行。白名单 = 1004（≤2 次重跑，每次 ≥5 分钟静置 + 完整清场）；EI0006 复现按分支走；白名单外新报错停。
+
+### R15-0 · 只读取证（两个模型目录是否同一 ckpt）
+
+```bash
+ls -la /home/models/ 2>&1 | head -10
+ls /home/models/GLM-5.2-w4a4c8-mxfp4_99/ 2>&1
+diff <(cat /home/models/GLM-5.2-w4a4c8-mxfp4_99/config.json 2>/dev/null) \
+     <(cat /data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731/config.json 2>/dev/null) \
+  && echo SAME_CONFIG || echo DIFF_CONFIG
+# 顺带：两个数据集各有多少条 prompt（请求数差异也一并记录）
+cd /home/w00919836/scp-va/examples/dsa_demo && python3 -c "
+from novel_dataset import chinese_23k
+import importlib, sys
+sys.path.insert(0, '/home/fjj/vllm-ascend-remote-offload/examples/dsa_demo')
+from novel_dataset import chinese_40k
+print('23k prompts:', len(chinese_23k)); print('40k prompts:', len(chinese_40k))"
+```
+
+原文回传。判读用：DIFF_CONFIG ⇒ MODEL_PATH 直接升唯一元凶候选（R15-2 验证）；SAME_CONFIG ⇒ MODEL_PATH 排除，R15-2 变为纯 env 机制对照。
+
+### R15-1 · 今日重放 R11-D（机器状态对照）
+
+逐字 §R6-1（scp-opt + va.env + dp4tp2.json + udmac1d1e3/e3 + 19090 段 + pool-cpus，零 smoke env），输出目录 `tmp/r15-r11d-replay`，日志 `/home/fjj/pp_r15a.log`。
+- 过 profile 相位（1004 或 RUN_OK 都算）⇒ 机器状态正常，R11-D 配方仍有效，进 R15-2。
+- **EI0006** ⇒ 机器状态自 09:02 后劣化（R11-D 配方失效），停，回传，蓝区转机器层取证路线。
+
+### R15-2 · R14-1 只留 MODEL_PATH（env 机制对照）
+
+R14-1 逐字，但只 export 一个 smoke env：
+
+```bash
+export VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731
+# 其余 9 个 smoke env 一律不导（va.env 已 unset）；PYTHONPATH/import 核验同 R14-1（须 scp-va）
+```
+
+输出目录 `tmp/r15-only-modelpath`。⚠️ 注意：enable_cpu_binding 回落默认 True（与 R11-D 一致，已证正交，不算新变量）。
+- **过 profile 相位** ⇒ 元凶在 DATASET/MAX_TOKENS/ENABLE_PROFILE 三 add-back 里（尽管本地判 inert，实证优先）→ 蓝区发 R16 add-back 梯子。
+- **EI0006** ⇒ 只剩两个解释：MODEL_PATH（依 R15-0 结论）或 env 机制本身 → 蓝区定 R16（SAME_CONFIG 时直接换用 /home/models/99 路径跑同命令，一刀分开 MODEL_PATH 与 env 机制）。
+- 1004 ⇒ 白名单重跑。
+
+### 通过标准与回传格式
+
+同 §R14（R15-0 三块原文必回；R15-1/R15-2 附 import 路径、日志路径、起止时间、EI0006 计数/相位）。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

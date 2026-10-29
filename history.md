@@ -139,3 +139,9 @@
 **交付**（commit c526a38）：R14-0 ：/home/w00919836/.bash_history 不存在，实际 HOME=/root，/root/.bash_history 含 VLLM_ASCEND_SMOKE=0 命中（全部为装机/克隆命令），作者无 smoke env 导出痕迹；scp-va 未提交 diff=只加 profile_dir/7开关/gpu_mem0.97，不含 BS16/40960/chunked1。R14-1（scp-va+env 值全集+作者数据面）：EI0006 复现（11:34:45 齐射×20，0×1004，崩在 worker.py:564 determine_available_memory MoE 前向）→ 配置值轴坐实（代码轴排除）。R14-2 五步逐项 unset（batched_tokens→model_len→chunked→seqs→gpu_mem）全部 EI0006 复现（各×20，0×1004，同崩相位），5 候选配置值均非独立元凶。数据出处：/home/fjj/pp_r14.log + pp_r14_step{1..5}.log + tmp/r14-va-env-authorplane-step{1..5}/raw/model.log。
 
 **判读**（蓝区）：待定（配置值轴坐实但非单一 env 变量，建议全部 unset 到纯默认对照或核查 scp-opt vs scp-va 残余差异）。
+
+## §R14 交付判读 + §R15 MODEL_PATH 轴派单（2026-10-30）
+
+**R14 交付**（commit c526a3860）：R14-0——作者 /root/.bash_history 无 smoke env 导出，scp-va diff 仍仅 2 文件 15 行（无大配置字段）⇒ 作者成功跑程=入口默认小配置。R14-1——scp-va 代码+我们 env 值全集+作者数据面 EI0006 复现（11:34:45）⇒ 配置值轴坐实、代码轴排除。R14-2——五步逐项 unset（batched_tokens/model_len/chunked/BS/gpu_mem）全复现 EI0006，无单一元凶；step1 profile 形状与 R11-D 相同仍崩。
+**R14 判读**（蓝区）：剩余 4 个从未 unset 的 env 中，DATASET/MAX_TOKENS/ENABLE_PROFILE 本地判 inert（DSA budget 全来自默认值，profile 不用真实 prompts）→ 唯一活嫌疑 = MODEL_PATH（/data/model/...-A5-0731 vs R11-D 作者默认 /home/models/GLM-5.2-w4a4c8-mxfp4_99，可能不同 ckpt）；时间线旁证排除纯机器时段假说（R11-D 被崩溃轮夹在中间）。bench 0/8 到 generate。
+**R15 派单**：R15-0 只读（两 ckpt config.json diff + 数据集 prompt 数——免费决定性）；R15-1 今日重放 R11-D（机器状态对照，EI0006=机器劣化转取证路线）；R15-2 R14-1 只留 MODEL_PATH（过=三 add-back 梯子；崩=依 R15-0 换 ckpt 路径一刀分 MODEL_PATH vs env 机制）。

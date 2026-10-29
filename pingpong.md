@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R12 已交付（fjj 框架+BENCH=1+作者数据面配置下 EI0006 仍复现，数据面配置排除，指向 fjj 框架/env）。R9 阳性落袋不变；bench 基线仍未落袋。
+- Current owner: **绿区**。Status: §R12 已判读（数据面配置排除；蓝区本地核实代码差分仅 bench 口径且不在 init 路径，**头号嫌疑 = enable_cpu_binding 默认 True 致 worker 绑核 + NPU IRQ 重定向在共享机争核**，作者 binding=none）+ **§R13 派单已发**（R13-1 关绑核直测，过则根因坐实 + bench 基线同轮落袋；R13-2 env 二分预案）。R9 阳性落袋不变。共享机纪律：fjj 仓 smoke 必须显式 ENABLE_CPU_BINDING=0。
 
 ## 0. 目标与口径
 
@@ -1106,6 +1106,79 @@ crw-rw-rw-. 1 root root 509, 6 2026-10-29 19:48:48.544365130 +0800 udmac1d1e6
 - 清场完成:无残留 urma/VLLM/python 进程(PCP pmda 2 个系统守护除外);端口 19090-19097/20000-20007 空闲;/dev/shm 373G 可用。
 - 日志资产:`/home/fjj/pp_r12.log`(tee 输出)+ `pp_r12_console.log`;`/home/w00919836/scp-opt/tmp/r12-fjj-bench-authorplane/raw/model.log`(571KB)+ pool 日志;R12-0 证据见上文原文。
 - 待蓝区判读:R12-1 证明 EI0006 与作者数据面配置无关(fjj 框架+作者数据面仍崩),指向 **fjj 框架/scp-va 之外代码或 smoke env 差异**;蓝区做 fjj vs scp-va 代码 diff 定位。
+
+## §R12 判读（蓝区，2026-10-30）
+
+### 裁决
+
+1. **数据面配置排除（第二次自我修正）**：R12-1 在作者数据面（udmac1d1e3/e3 + 19090 段 + dp4tp2.json）下 EI0006 仍复现 → R11 判读「EI0006 归因 fjj 数据面配置」证伪。e2/20000 段/eid-probe-r1 json 全部排除。崩溃相位不变：KV-cache init dummy run 的 MoE EP8 all-gather **首次建连**。
+2. **决定性矩阵收敛**：
+   - 崩：`smoke env×fjj代码` × {fjj 数据面, 作者数据面} × {graph, eager}（4/4）；
+   - 不崩：`无 smoke env×scp-va代码` × 作者数据面 × eager（R11-D，EI0006=0）。
+   剩余双变量 = **smoke env 集合** 与 **框架代码（fjj vs scp-va）**。
+3. **蓝区本地代码核实（cac7e2c4e→HEAD 全量 diff）**：代码差分仅 `examples/dsa_demo/simple_test.py` +155 行（bench 口径）与 `vllm_ascend/envs.py` +4 行（字段注册），**均不在 init/通信路径**——纯代码差分解释不了 EI0006。**但发现关键嫌疑**：`SmokeConfig.enable_cpu_binding` **默认 True**（cac7e2c4e 起即如此，simple_test.py:42，注释自书「共用宿主机、不希望改变绑核时设 False」）→ simple_test.py:288 注入 additional_config → ascend_config.py:171 → worker.py:786 init 后 `bind_cpus(local_rank)` → cpu_binding.py:792-798：线程绑核 **+ NPU MSI IRQ smp_affinity 机器级重定向**。作者 scp-va 跑的是 binding=none（R5-0 已确认）。共享机上：pool 已固定占 `2-17,21-36,...`/`192-...` 核 + 其他租户进程，worker 绑核计划若与之重叠或 IRQ 重定向影响 NPU 网络平面，HCCL 首连 socket 线程被饿死 → 「remote end does not initiate a connection request」→ **EI0006 齐射，机制完全吻合**。R10/R11-A/B/R12-1 的 env 清单**均未设** `VLLM_ASCEND_SMOKE_ENABLE_CPU_BINDING` → 全部落在默认 True；R11-D 无 env → binding=none → 不崩。**相关性+机制双成立，升头号嫌疑**。
+4. **1004 旁证记录**：绑核开（R12-1）反而 0×1004 过了 bind 阶段；绑核关（R11-D）DP1 1004 两跑——相关非因果，R13 观察项。
+5. R12-0 机器面：NPU 2/3 EID 枚举健康（19 EID×2 轮）；udmac 节点 09:42 又批量重建（周期性，d1e6 稳定旧节点）；dmesg 无错误码。机器层无实锤。
+
+### 环境事实入库
+
+- EI0006 触发面排除清单（实锤）：graph/eager（R11-B）、数据面配置 e2/20000/json（R12-1）、机器 EID 枚举（R12-0）、NPU 2/3 健康（R12-0）。
+- **共享机纪律补充：凡跑 fjj 框架仓 smoke，必须显式 `VLLM_ASCEND_SMOKE_ENABLE_CPU_BINDING=0`**（与作者 binding=none 对齐），除非专门测绑核。
+
+## §R13 派单：绑核嫌疑直测 + bench 基线同轮补打（蓝区，2026-10-30）
+
+### 原则
+
+R13-1 是头号嫌疑直测（预期：过）。崩溃发生在 init 后 ~5 分钟，单轮成本低。白名单 = 1004（≤2 次重跑，每次 ≥5 分钟静置 + 完整清场）；EI0006 复现 → 进 R13-2；白名单外新报错 → 停，回传。
+
+### R13-1 · R12-1 逐字 + 关绑核
+
+```bash
+cd /home/w00919836/scp-opt
+source /home/w00919836/va.env
+export VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731
+export VLLM_ASCEND_SMOKE_DATASET=chinese_40k
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=16
+export VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=40960
+export VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS=40960
+export VLLM_ASCEND_SMOKE_MAX_TOKENS=1024
+export VLLM_ASCEND_SMOKE_ENABLE_CHUNKED_PREFILL=1
+export VLLM_ASCEND_SMOKE_GPU_MEMORY_UTILIZATION=0.97
+export VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0
+export VLLM_ASCEND_SMOKE_BENCH=1
+export VLLM_ASCEND_SMOKE_ENABLE_CPU_BINDING=0   # ← 本轮唯一变量（头号嫌疑直测）
+export PYTHONPATH=/home/fjj/vllm-ascend-remote-offload:$PYTHONPATH
+python3 -c "import vllm_ascend; print(vllm_ascend.__file__)"   # 须指向 fjj 仓
+python3 tools/profile_pool_inference.py --du-store-prefault read \
+  --framework-repo /home/fjj/vllm-ascend-remote-offload \
+  --output tmp/r13-nobind-bench --sample-port 19090 --sample-worker 0 \
+  --remote-config ../dp4tp2.json --no-perf --payload-layers 78 \
+  --du-pipeline-mib 1 --store-bytes $((128*1024*1024*1024)) \
+  --pool-start-timeout 600 --pool-count 2 --numa-node 0 --pool-b-numa-node 2 \
+  --store-numa-nodes local \
+  --pool-cpus '2-17,21-36,40-55,59-74,78-93' \
+  --pool-b-cpus '192-207,211-226,230-245,249-264,268-283' \
+  --shared-port-gather --du-devices udmac1d1e3 --du-eid-indices 0 \
+  --pool-b-du-devices udmac0d1e3 --pool-b-du-eid-indices 0 \
+  2>&1 | tee /home/fjj/pp_r13.log
+echo "RC=$?"
+```
+
+**绑核关闭生效核验**（须原文回传）：`grep -iE "bind|affinity" /home/w00919836/scp-opt/tmp/r13-nobind-bench/raw/model.log | head -20`——预期无 CpuAlloc 绑核计划输出；若有 `Bind cpus` 相关行也原样回传。
+
+- **过** ⇒ 绑核根因坐实 + bench 基线同轮落袋，按 §R10 通过标准第 3/4 条原文回传 metrics。
+- **EI0006 复现** ⇒ 绑核排除 → R13-2。
+- **1004** ⇒ 白名单重跑（≤2）。
+
+### R13-2 · env 集合二分（R13-1 复现后执行）
+
+R13-1 逐字但 `VLLM_ASCEND_SMOKE_BENCH=0`（其余 env 全保留，ENABLE_CPU_BINDING=0 保留），输出目录 `tmp/r13-envbis-nobench`。
+- **过** ⇒ 触发面在 bench env/代码路径（min_tokens/ignore_eos/metrics），蓝区复查 717c396fc  diff。
+- **复现** ⇒ 触发面在基础 env 集合（MAX_NUM_BATCHED_TOKENS/CHUNKED_PREFILL/GPU_MEM 等），蓝区给定下一轮逐项 unset 二分表。
+
+### 通过标准（同 §R10）与回传格式
+
+同 §R12 派单（含绑核核验 grep 输出、import 路径、metrics 原文若过、日志路径、起止时间）。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

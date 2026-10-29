@@ -111,3 +111,9 @@
 **交付**（commit 309113d）：R12-0 五块全过（EID 两轮探测干净无 1004、UB 节点 09:42 批量重建与 R8 同型、端口全空闲）；R12-1 EI0006 复现（10:02:15 齐射，EI0006×20，0×1004，崩溃在 _initialize_kv_caches → determine_available_memory 内 MoE 前向 HcclAllGather，与 R10/R11 同签名同相位）→ 数据面配置排除，指向 fjj 框架/scp-va 之外代码或 smoke env 差异。数据出处：/home/fjj/pp_r12.log + tmp/r12-fjj-bench-authorplane/raw/model.log。
 
 **判读**（蓝区）：待定（蓝区做 fjj vs scp-va 代码 diff）。
+
+## §R12 交付判读 + §R13 绑核直测派单（2026-10-30）
+
+**R12 交付**（commit 309113df0/e70df42ea）：R12-0 取证——NPU 2/3 EID 健康（19 EID×2 轮）、udmac 节点 09:42 周期性重建、dmesg 无错误码。R12-1 主实验（fjj 框架+BENCH=1+作者数据面）EI0006 复现（10:02:15 齐射，0×1004，0 DRAIN）→ 数据面配置排除。
+**R12 判读**（蓝区）：第二次自我修正（数据面排除）；决定性矩阵收敛为 smoke env 集合 × 框架代码双变量。本地全量代码 diff（cac7e2c4e→HEAD）仅 bench 口径（simple_test.py +155/envs.py +4），不在 init 路径；**发现 enable_cpu_binding 默认 True**（simple_test.py:42/288→ascend_config.py:171→worker.py:786 bind_cpus→cpu_binding.py:792-798 线程绑核+NPU IRQ smp_affinity 机器级重定向），作者 scp-va 为 binding=none（R5-0），共享机争核致 HCCL 首连超时，机制吻合，升头号嫌疑。共享机纪律入库：fjj 仓 smoke 必须显式 ENABLE_CPU_BINDING=0。
+**R13 派单**：R13-1 = R12-1 逐字 + VLLM_ASCEND_SMOKE_ENABLE_CPU_BINDING=0（头号嫌疑直测，过则根因坐实+bench 基线同轮落袋，须回传绑核关闭 grep 核验）；R13-2 = env 集合二分（BENCH=0 其余保留）预案。

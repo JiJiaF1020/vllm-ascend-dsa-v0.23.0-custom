@@ -97,3 +97,9 @@
 
 **派单**（d6bf390）：对 R10 EI0006 做隔离梯子，排除瞬时/graph/数据面/机器漂移。白名单=RaGetDevEidInfoNum 1004/EI0015/EI0020/EI0006 一次性重跑（仅 R11-A）。
 **交付**（commit 3b84df4）：R11-A 原样重跑 EI0006 稳定复现（8 worker 08:26:50 齐射）→瞬时排除；R11-B eager EI0006 仍复现（8 worker 08:44:26 齐射, acl_graph 计数=0）→ graph 非触发面，跳过 R11-C；R11-D 作者逐字配置 2 跑 EI0006=0 但前移 DP1 专属 RaGetDevEidInfoNum code=1004（aiv_urma_query_eids, KV-cache 绑定阶段, 非瞬时），0 DRAIN，未到 generate。无 bench 通过步。数据出处：pp_r11a/b/d.log + tmp/r11a-bench-bs16/ + tmp/r11b-bench-bs16-eager/ + /home/w00919836/scp-opt/tmp/prefault-read-r11d/。
+
+## §R11 交付判读 + §R12 归因拆解派单（2026-10-30）
+
+**R11 交付**（commit 923d852ee）：梯子全执行——R11-A EI0006 稳定复现（非瞬时）；R11-B eager 同签名复现（acl_graph 计数=0）→ graph 面排除；R11-C 跳过；R11-D 作者配置 2 跑 EI0006=0 但前移 DP1 专属 1004（aiv_urma_query_eids，physical 2/3，两跑复现非瞬时），0 DRAIN。
+**R11 判读**（蓝区）：① R10 主嫌疑 graph 证伪，自我修正；② EI0006 归因 fjj 数据面配置（e2/20000 段/eid-probe-r1 json，三选一未拆），fjj 配置 3/3 崩、作者配置 0 崩；③ 1004 与 R9 首跑交集 physical 2 + R7/R8 节点重建证据 → NPU 2/3 UB/EID 状态面嫌疑上升；④ 1004「重跑即过」修正为「取决于机器 UB 面状态，上限 2 次」。
+**R12 派单**：R12-0 只读取证（EID 探测×3 轮重点 2/3 + uburma 节点 + dmesg + npu-smi + 端口快照）；R12-1 主实验 = fjj 框架仓 + BENCH=1 + 作者数据面配置逐字（scp-opt + dp4tp2.json + udmac1d1e3/e3 + 19090 段 + --framework-repo 混用），过则 EI0006 归因数据面且 bench 基线同轮落袋，复现则转 fjj 代码 diff。须先核验 vllm_ascend import 指向 fjj 仓。

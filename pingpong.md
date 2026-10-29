@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R11 已交付（隔离梯子全执行：R11-A 原样重跑 EI0006 稳定复现→非瞬时；R11-B eager EI0006 仍复现（acl_graph计数=0）→graph 非触发面；R11-D 作者配置 2 跑 EI0006=0 但前移 DP1 专属 RaGetDevEidInfoNum code=1004（KV-cache 绑定阶段，非瞬时））。等蓝区判读。R9 阳性落袋不变。
+- Current owner: **绿区**。Status: §R11 已判读（graph 面排除；EI0006 归因 fjj 数据面配置；作者配置下前移 DP1 专属 1004，NPU 2/3 UB 面嫌疑）+ **§R12 派单已发**（R12-0 取证 + R12-1 主实验：fjj 框架+BENCH=1+作者数据面配置，过则 bench 基线同轮落袋）。R9 阳性落袋不变。
 
 ## 0. 目标与口径
 
@@ -943,6 +943,98 @@ R10 命令改两处：`export VLLM_ASCEND_SMOKE_RUN_MODE=graph`（保持默认�
 - 清场完成:无残留 python/vllm/urma_pool 进程;NPU 8/8 空闲;端口段空闲;/dev/shm 373G 可用。
 - 日志资产:pp_r11a.log、pp_r11b.log、pp_r11d.log;tmp/r11a-bench-bs16/raw/、tmp/r11b-bench-bs16-eager/raw/、/home/w00919836/scp-opt/tmp/prefault-read-r11d/raw/。
 - 待蓝区判读:R11-D 的 DP1 专属 1004(`aiv_urma_query_eids` 在 KV-cache 绑定阶段)与作者 R6-1 时点的差异;或按 R8 模板补机器层取证(若判定 1004 为机器/驱动层问题)。
+
+## §R11 判读（蓝区，2026-10-30）
+
+### 裁决
+
+1. **graph 面排除（自我修正）**：R11-B eager 同签名复现且日志无 acl_graph → R10 判读的主嫌疑「graph+MTP graph 首次上机」证伪。EI0006 与执行模式无关。
+2. **EI0006 归因方向 = fjj 数据面配置**：作者配置（udmac1d1e3/e3 + 19090 段 + dp4tp2.json）下 0 次 EI0006（两跑），fjj 配置（udmac1d1e2 + 20000 段 + eid-probe-r1 json）下 3/3 全崩。R11-0 块1 无 rank 停在 URMA/DSA 数据面、块3 全体走完 store OPEN 进 dummy run——即某 rank 在「到达首次 MoE EP8 all-gather 之前」有日志不可见的延迟/挂起，与其通信对端 socket 超时。根因仍在数据面差分内部（e2 设备 / 20000 端口段 / eid-probe-r1 json 三者未拆），见 R12 拆解。
+3. **作者配置下前移 DP1 专属 1004（两跑复现，非瞬时）**：`aiv_urma_query_eids` 在 KV-cache 绑定阶段炸在 DP1 设备（Worker_DP1_TP0_EP2 / DP1_TP1_EP3，physical 2/3）。与 R9 首跑 1004（physical 0/2/7）交集 = **physical 2**；叠加 R7/R8 证据（udmac d1e2~d1e5 节点 01:48 批量重建、多租户机），**NPU 2/3 的 UB/EID 状态面嫌疑上升**，先取证再动。
+4. bench 基线仍未落袋（0/4 轮跑到 generate）。
+
+### 环境事实入库
+
+- EI0006 签名 = 某 rank 未到达首次运行时 EP8 all-gather（dummy run/profile run 阶段），对端 socket 超时齐射；与 graph/eager 无关，与 fjj 数据面配置强相关。
+- 1004 非「重跑即过」铁律：R9 时段成立，R11-D 时段 DP1 两跑复现——**是否瞬时取决于机器 UB 面状态**，重跑上限 = 2 次，之后必须取证。
+- fjj 配置 vs 作者配置差异清单（EI0006 相关）：pool-a du 设备 e2↔e3、du 端口 20000-20007↔19090-19097、store 端口 19080-19087↔dp4tp2.json 内值、eid json eid-probe-r1↔dp4tp2.json。
+
+## §R12 派单：EI0006 归因拆解 + bench 基线同轮补打（蓝区，2026-10-30）
+
+### 原则
+
+顺序执行。R12-0 只读取证先行；R12-1 是本轮主实验（一把同时回答两个问题：EI0006 是数据面配置还是 fjj 代码引入；过了就把 bench 基线落袋）。白名单 = 1004（上限 2 次重跑，每次须 ≥5 分钟静置 + 完整清场）；白名单外新报错 → 停，回传首个报错点前后 50 行。
+
+### R12-0 · 只读取证（NPU 2/3 UB/EID 状态面）
+
+```bash
+# 1) EID 单卡探测 ×3 轮（重点 2/3），复用绿区 R9 用过的探测方式：
+#    逐卡 aiv_urma_query_eids，pool 未起时 1 轮 + pool 起来后 1 轮（用作者配置起 pool，
+#    或若工具不便单独起 pool 则只跑 pool 未起轮），physical 2/3 各卡结果单独标注
+# 2) UB 设备节点 mtime 现状（对照 R8 的 01:48 批量重建）
+ls -l --time-style=full-iso /dev/uburma/ 2>&1
+# 3) dmesg 近 2 小时 NPU 2/3 相关
+dmesg -T 2>/dev/null | grep -iE 'npu|ub|urma|udma' | tail -40
+# 4) npu-smi 2/3 健康与错误码
+for i in 2 3; do echo "== npu $i =="; npu-smi info -t health -i $i 2>&1 | head -8; npu-smi info -t error-code -i $i 2>&1 | head -5; done
+# 5) 19090-19097 与 20000-20007 端口占用快照
+ss -tlnp | grep -E ':(19[09][0-9]|2000[0-7])' || echo "all free"
+```
+
+原文回传五块。
+
+### R12-1 · 主实验：fjj 框架 + BENCH=1 + 作者数据面配置
+
+目的：数据面逐项换回作者值、只保留 fjj 框架仓 + bench 代码 + smoke env。若 EI0006 消失且 RUN_OK ⇒ EI0006 = 数据面配置问题（e2/20000/eid json 三选一，R13 再拆），且 **bench 基线同轮落袋**；若 EI0006 复现 ⇒ fjj 代码/env 引入，回传后蓝区做代码 diff。
+
+```bash
+cd /home/w00919836/scp-opt
+source /home/w00919836/va.env
+# 关键：va.env 之后 export smoke env，确保生效
+export VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731
+export VLLM_ASCEND_SMOKE_DATASET=chinese_40k
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=16
+export VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=40960
+export VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS=40960
+export VLLM_ASCEND_SMOKE_MAX_TOKENS=1024
+export VLLM_ASCEND_SMOKE_ENABLE_CHUNKED_PREFILL=1
+export VLLM_ASCEND_SMOKE_GPU_MEMORY_UTILIZATION=0.97
+export VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0
+export VLLM_ASCEND_SMOKE_BENCH=1
+# 生效核验（必须回传输出）：必须指向 /home/fjj/vllm-ascend-remote-offload
+python3 -c "import vllm_ascend; print(vllm_ascend.__file__)"
+# 若指向 scp-va：export PYTHONPATH=/home/fjj/vllm-ascend-remote-offload:$PYTHONPATH 后再验一次
+python3 tools/profile_pool_inference.py --du-store-prefault read \
+  --framework-repo /home/fjj/vllm-ascend-remote-offload \
+  --output tmp/r12-fjj-bench-authorplane --sample-port 19090 --sample-worker 0 \
+  --remote-config ../dp4tp2.json --no-perf --payload-layers 78 \
+  --du-pipeline-mib 1 --store-bytes $((128*1024*1024*1024)) \
+  --pool-start-timeout 600 --pool-count 2 --numa-node 0 --pool-b-numa-node 2 \
+  --store-numa-nodes local \
+  --pool-cpus '2-17,21-36,40-55,59-74,78-93' \
+  --pool-b-cpus '192-207,211-226,230-245,249-264,268-283' \
+  --shared-port-gather --du-devices udmac1d1e3 --du-eid-indices 0 \
+  --pool-b-du-devices udmac0d1e3 --pool-b-du-eid-indices 0 \
+  2>&1 | tee /home/fjj/pp_r12.log
+echo "RC=$?"
+```
+
+注意：`--framework-repo` 与 `--remote-config` 相互独立，本条刻意混用（框架=fjj 带 bench 代码，数据面=作者 json 逐字）。R6 已验证此环境下 vllm_ascend 解析到 fjj editable 安装——本轮仍必须按上面命令实测回传，因为本轮 bench 代码是否生效取决于它。
+
+### 失败处置
+
+- `RaGetDevEidInfoNum code=1004`：按白名单重跑（≤2 次，每次 ≥5 分钟静置 + 完整清场）；仍败 → 停，附 R12-0 取证回传。
+- EI0006 复现：停，回传首个报错点前后 50 行（蓝区转代码 diff 排查）。
+- `DSA A5 MTP LIM requires 1..4 query rows`：老梯子（BS 16→8→4，输出目录改后缀）。
+- 其它：停，回传。
+
+### 通过标准（同 §R10）
+
+1. 工具 RC=0、summary.txt 含 RUN_OK、model.log 有生成文本；2. `DSA_SHARED_DRAIN_OK` ×8；3. `[dsa-smoke][metrics][dp=N]` ×4 + `results/1p/<run_name>.metrics.json` 存在且 global 含 requests=64/分位数/吞吐/tpot_under_50ms；4. 原文回传 metrics global 行与报告块。
+
+### 回传格式
+
+追加「§R12 交付」节：R12-0 五块原文 + import 路径核验输出 + RC + 通过标准逐条 + metrics 原文（若过）+ 日志路径 + 执行起止时间。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

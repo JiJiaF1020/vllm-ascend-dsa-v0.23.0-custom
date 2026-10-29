@@ -597,6 +597,21 @@ bash /home/fjj/hccl_probe_8npu.sh 2>&1 | tail -20
 - `hccl_probe_8npu.sh` 是有效机器层探针：10-27 PASS（R2 留存），10-30 3×全败 EI0015。
 - R7 日志资产：`/home/fjj/r7_evidence/`（r7_0_summary.txt + probe{1,2,3}/ 共 24 份 rank 日志）。
 - 驱动 25.6.rc2 / 固件 7.0.9.100.203 / Chip V120（10-30 当前值，与 R6 时一致——期间未变）。
+### R7 补充排查：/etc/hccl_rootinfo.json 空目录（绿区，2026-10-30，随附 hccl_rootinfo 调查）
+
+**问题**：绿区排查 EI0015 时发现宿主机 `/etc/hccl_rootinfo.json` 是**空目录**（非文件），疑似根因被排除，但调查结论入库供蓝区参考。
+
+**结论：不是 EI0015 根因（排除）**。证据链：
+
+1. **该路径在宿主机从未有过真实文件**：`/etc/hccl_rootinfo.json` = 空目录，`not owned by any package`，`find / -xdev` 全盘无任何同名真实文件；所有 16 卡容器创建时 `-v /etc/hccl_rootinfo.json:/etc/hccl_rootinfo.json` 挂载源就是空目录（docker 对不存在的挂载源自动 mkdir），overlay2 各容器层里也是空目录（deepseek-v41-950dt 04:27、vllm-wzh 19:29、dsa-full 17:34 均如此）。
+2. **空目录创建时间戳**：宿主 `/etc/hccl_rootinfo.json` Birth = **2026-10-29 17:34:45**，docker journal 显示同秒 `Container create done(Name: /deepseek-v41-rc2-a5 ID: 8909a363...)` → 该空目录是 `deepseek-v41-rc2-a5` 容器启动时挂载自动 mkdir 的（**非绿区操作**，绿区命令时间线 17:04-17:13 无任何触碰 /etc 记录）。
+3. **R2 时（10-27）8/8 PASS**，而该空目录在 R2 时也已存在（宿主机 /root/.bash_history 有 `ll /etc/hccl_rootinfo.json` + `rmdir /etc/hccl_rootinfo.json/` 记录，说明早有人注意到它）→ 空目录存在与探针 PASS/FAIL 无相关性。
+4. **该文件是 MemFabric 专用配置**（仓库 `examples/dsa_demo/L3_cache_sys_api_test/audit_hccl_rootinfo.py` 明确 `Summarize and validate the HCCL rootinfo fields consumed by MemFabric`，含 `topo_file_path`/`rank_list`/EID 端口校验），**裸 HCCL 探针与模型侧 MoE 建链不消费它**。代码层 `grep rootinfo` 无引用（C++/运行时层），HCCL lib `strings` 无 `hccl_rootinfo` 命中。
+
+**与 EI0015 的关系**：EI0015 `hcclCommInitRootInfoConfig ... RootInfoDetect failed` 的 `rootInfo` 是 HCCL 运行时内部 rootInfo（通过 rootinfo detection 服务收集 rank 信息），**与 `/etc/hccl_rootinfo.json` 文件无直接关联**（命名相似但来源不同）。
+
+**遗留线索**（供蓝区判断）：宿主机 `/root/.bash_history` 显示曾有人（非绿区）`npu-smi set -t custom-op-secverify-mode -i 5/6/7 -d 0` + `ll /etc/hccl_rootinfo.json` + `rmdir /etc/hccl_rootinfo.json/`——机器曾被人手动操作过 /etc 相关配置。`/lib/route.conf` 目录存在但为空。
+
 
 ## §R7 判读（蓝区，2026-10-30）
 

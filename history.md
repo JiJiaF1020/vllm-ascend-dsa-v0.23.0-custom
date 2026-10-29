@@ -61,3 +61,8 @@
 
 **交付**（commit 13ac84c36）：R5-A（HCCL_CONNECT_TIMEOUT=1800）、R5-B（+关绑核）均复现 EI0015×7 失败；R5-C 因 ASCEND_LAUNCH_BLOCKING 与 ACL graph 互斥即败（蓝区派单缺陷），ascend/log tgz 已留存。R5-0 取证：作者 va.env 无 HCCL 变量；作者参数 CHUNKED_PREFILL=1/BS16/MAX_MODEL_LEN=40960/du 19090 段/binding=none。
 **判读**（蓝区）：阴性。超时与绑核两方向实测排除；"作者有 HCCL 调优"假说作废。蓝区比对 GitHub 原始仓后修正误判：作者 scp-va HEAD cac7e2c4e 即分支 tip，与绿区同一份代码；真正差异只剩 smoke 未提交本地改动（min_tokens=max_tokens、ignore_eos=True）+ 执行参数 + 执行上下文（容器 vs 宿主，未知）。下一步：R6 逐字复现作者现场（作者目录/环境/配置原样），成则差分二分，败则查机器环境漂移。
+
+## §R6 逐字复现作者现场 — 交付与判读（2026-10-29）
+
+**交付**（commit f50e3884d）：作者命令逐字复现（同 scp-opt/scp-va/va.env/dp4tp2.json/19090 段）仍 EI0015×7；首跑撞他人 write-bench 占 udmac1d1e3/19090（hold-999，未杀，自然释放后重跑）。补漏入库：宿主机无 CANN toolkit；驱动 25.6.rc2/固件 7.0.9.100.203；作者无 bash_history；作者 smoke 改动=min_tokens=max_tokens+ignore_eos=True、gpu_mem=0.97。
+**判读**（蓝区）：阴性，但故障性质改写为间歇性——时间线"绿区败（10-27/28）→作者过（10-28 04:07）→绿区败（10-29）"，非单向漂移。头号嫌疑：16 卡共享机多租户干扰（10-29 新增他人 v0.30 容器 + 当场抓到他人占用我方 UB 设备）。下一步：R7 间歇性鉴别（占用取证 + HCCL 裸探针 + 复现×3），探针败即机器层实锤。

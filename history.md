@@ -165,3 +165,9 @@
 **R16-0**：va.env 原文——13 个 smoke env（RUN_MODE=graph、MTP 3/1/1、DP4/TP2、MAX_NUM_BATCHED_TOKENS=2048、MAX_TOKENS=256、MODEL_PATH 尾斜杠、ASCEND_RT_VISIBLE_DEVICES=0-7）；D 集合无 DSA_RESIDENT_BUDGET/MAX_ACTIVE_REQS/PROMPT_BUDGET_THRESHOLDS/INDEXER_MLA_BLOCK_RATIO/GRAPH_CAPTURE_SIZES；非 smoke 独有 `VLLM_ASCEND_DSA_HOST_MSTX=0`（DSA 前缀）；**无 HCCL 变量**。
 
 **R16-1**（交付 commit 12866a46b81d566486a6570886f5c8042384f0a2）：**EI0006（配方不成立）**——容器内跑（宿主无 vllm 修正），8 worker 权重装载成功（13:51:20，389.88 GiB）后 13:54:49 DP1_TP1_EP3 HcclAllGather 超时 EI0006，model.log 20 处，1004=0，summary RUN_FAILED。命中预案「EI0006 ⇒ D 非保护因子、保护机制在 va.env 别处（非 smoke 变量/启动顺序）→ 停回传」。与 R14-1/R15-2 同签名（worker.py:564 HcclAllGather），但相位在权重装载后。执行修正 3 项：宿主 python3 无 vllm→容器内跑；残留输出目录 FileExistsError→清理；/dev/shm 268G 残留 backing→清理。数据：/home/fjj/pp_r16.log + tmp/r16-vaenv-fusion/。
+
+## §R16 交付判读 + §R17 保护因子直测派单（2026-10-30）
+
+**R16 交付**（commit 12866a46b）：R16-0 va.env 全文——13 smoke env；关键值 MAX_NUM_BATCHED_TOKENS=$((2048))、MAX_TOKENS=256、RUN_MODE=graph、MTP×3、TP2/DP4、chinese_40k、MODEL_PATH=/data/...0731/；非 smoke 独有 VLLM_ASCEND_DSA_HOST_MSTX=0；无 HCCL 变量。R16-1 融合配方（va.env 全量+我们 10 值覆盖，scp-va+作者数据面）EI0006×20 → D 非保护因子、MSTX=0 排除（非充分）。
+**R16 判读**（蓝区）：D 集合审计——MTP/TP/DP/RUN_MODE 与脚本默认值同值天然 inert；真不同值仅 batched_tokens/MAX_TOKENS/MSTX。**batched_tokens 相关性闭环：profile 过的 run（R9 RUN_OK/R15-1/作者现场）全=2048；崩的 10+ run 全≥25600（含 unset 默认 25600）→ 唯一完美相关变量**。机制：determine_available_memory dummy 前向 batch=batched_tokens，大 batch 首个 EP8 all-gather 首连超时。bench 口径预告：2048 下 prefill 分块、TPOT 不受影响。
+**R17 派单**：R15-2 基线（仅 MODEL_PATH）逐个加回：①batched=2048 ②+chunked1 ③+MSTX=0 ④+MAX_TOKENS=256，命中即停（过 profile=EI0006=0）；每步 env 原文核验+默认值回显；R18 预案=命中组合+fjj 仓+BENCH=1 落 bench 基线。

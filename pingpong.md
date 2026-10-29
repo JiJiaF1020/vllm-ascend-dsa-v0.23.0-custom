@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **蓝区**。Status: §R16-1 已交付（EI0006×20，RUN_FAILED——va.env+我们值覆盖仍崩，D 非保护因子，保护机制在 va.env 别处）
+- Current owner: **绿区**。Status: §R16 已判读（**真凶定位：MAX_NUM_BATCHED_TOKENS——profile 过的 run 全=2048（va.env），崩的 run 全≥25600**；MSTX=0 被 R16-1 排除；MTP/TP/DP 等 D 变量与默认值同值天然 inert）+ **§R17 派单已发**（R15-2 基线逐个加回保护因子：batched2048→+chunked1→+MSTX→+MAX_TOKENS256，命中即停；R18 bench 配方预案已写死）。bench 0/10。
 
 ## 0. 目标与口径
 
@@ -1690,6 +1690,68 @@ VLLM_ASCEND_SMOKE_TENSOR_PARALLEL_SIZE=2
 - **判读**：命中派单预案 **EI0006 ⇒ D 非保护因子、保护机制在 va.env 别处（非 smoke 变量/启动顺序）→ 停，回传，蓝区重估**。融合配方（va.env 全集+我们的值覆盖）仍崩，与 R14-1/R15-2 同签名（worker.py:564 HcclAllGather）。注意：R16-1 的 EI0006 相位在**权重装载后**（13:51:20 起 loading，13:54:49 崩），非 init 早期。
 - **日志**：/home/fjj/pp_r16.log；raw/model.log；raw/summary.txt（/home/w00919836/scp-opt/tmp/r16-vaenv-fusion/）。
 - **清场**：shm 已清（372G 可用），端口 19080-19087/19090-19097/20000-20007 全空闲，无残留进程。
+
+## §R16 判读（蓝区，2026-10-30）：真凶定位——MAX_NUM_BATCHED_TOKENS
+
+### 裁决
+
+1. **D 集合审计**：va.env 13 个 smoke env 中，RUN_MODE=graph / MTP×3 / TP2 / DP4 与入口脚本默认值**同值**（天然 inert）；与默认值真正不同的只有三个：**MAX_NUM_BATCHED_TOKENS=2048**（我们 40960，unset 默认 25600）、**MAX_TOKENS=256**（sampling，inert at profile）、以及非 smoke 的 **VLLM_ASCEND_DSA_HOST_MSTX=0**。
+2. **R16-1 排除 MSTX**：va.env 全量（含 MSTX=0）+ 我们的值覆盖（batched=40960）→ 仍 EI0006 ⇒ MSTX=0 非充分保护因子，真凶在值差里。
+3. **batched_tokens 相关性闭环**：profile 相位通过的 run（R9 RUN_OK、R15-1、作者 10-28 现场）**全部 batched=2048**；profile 崩的 10+ run **全部 ≥25600**（含 R14-2 step1 的默认 25600）。**MAX_NUM_BATCHED_TOKENS 是唯一与「profile 崩/过」完美相关的配置变量**——机制：determine_available_memory 的 dummy 前向 batch = batched_tokens，2048 时首连小步通过、≥25600 时首个 EP8 all-gather 首连即超时（具体子机制待归因后深挖，不影响配方落地）。
+4. bench 口径影响预告：batched=2048 → prefill 按 2048 分块，TTFT/吞吐口径会受影响，TPOT（decode 相位）不受影响；基线落袋后可再做 batched 尺寸阶梯（2048→8192→…）找上限。
+
+### 判读落点
+
+R17 阶梯：R15-2（仅 MODEL_PATH，崩）基础上逐个加回保护因子，首步直测 batched=2048。
+
+## §R17 派单：保护因子直测阶梯（蓝区，2026-10-30）
+
+### 原则
+
+基线命令 = R15-2 逐字（scp-va + 作者数据面 + 仅 `export VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731`），按序每次加一个变量。**过 profile 判据 = EI0006=0**（后续 1004/hang 也算过相位）；命中即停。1004 白名单 ≤2 次（≥5 分钟静置 + 完整清场）。
+
+| 步 | 加回变量 | 输出目录 |
+|---|---|---|
+| R17-1 | `export VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS=2048` | tmp/r17-b2048 |
+| R17-2（1 崩后） | 再加 `export VLLM_ASCEND_SMOKE_ENABLE_CHUNKED_PREFILL=1` | tmp/r17-b2048-c1 |
+| R17-3（2 崩后） | 再加 `export VLLM_ASCEND_DSA_HOST_MSTX=0` | tmp/r17-b2048-c1-mstx |
+| R17-4（3 崩后） | 再加 `export VLLM_ASCEND_SMOKE_MAX_TOKENS=256` | tmp/r17-b2048-c1-mstx-mt256 |
+
+四步全崩 ⇒ 停，回传，蓝区重估（届时附 R14-2 step1 复核：unset 后默认值到底是多少——要求本阶梯第一步先跑 `python3 -c` 回显 `SmokeConfig` 默认 max_num_batched_tokens 原文，锁死基线值）。
+
+执行命令模板（以 R17-1 为例，R17-2/3/4 追加对应 export）：
+
+```bash
+cd /home/w00919836/scp-opt
+source /home/w00919836/va.env
+# 清干净 va.env 的 smoke env，只留我们要的（R15-2 已验证的做法）：
+for v in $(env | grep -oE '^VLLM_ASCEND_SMOKE_[A-Z_]+'); do unset $v; done
+export VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731
+export VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS=2048   # R17-1；后续步追加
+python3 tools/profile_pool_inference.py --du-store-prefault read \
+  --framework-repo /home/w00919836/scp-va \
+  --output tmp/r17-b2048 --sample-port 19090 --sample-worker 0 \
+  --remote-config ../dp4tp2.json --no-perf --payload-layers 78 \
+  --du-pipeline-mib 1 --store-bytes $((128*1024*1024*1024)) \
+  --pool-start-timeout 600 --pool-count 2 --numa-node 0 --pool-b-numa-node 2 \
+  --store-numa-nodes local \
+  --pool-cpus '2-17,21-36,40-55,59-74,78-93' \
+  --pool-b-cpus '192-207,211-226,230-245,249-264,268-283' \
+  --shared-port-gather --du-devices udmac1d1e3 --du-eid-indices 0 \
+  --pool-b-du-devices udmac0d1e3 --pool-b-du-eid-indices 0 \
+  2>&1 | tee /home/fjj/pp_r17.log
+echo "RC=$?"
+```
+
+注意：① `for v in $(env | grep -oE ...); do unset $v; done` 是兑现"仅 MODEL_PATH+阶梯变量"的关键步骤，每步执行后须 `env | grep SMOKE | sort` 原文回传核验；② 每步开头回显 `python3 -c "from examples.dsa_demo.simple_test import SmokeConfig; import inspect; print(SmokeConfig.max_num_batched_tokens)"`（或等价方式）锁默认基线值。
+
+### R18 预案（某步过 profile 后执行）
+
+完整 bench 配方 = fjj 框架仓（`--framework-repo /home/fjj/vllm-ascend-remote-offload` + PYTHONPATH 前置 fjj）+ **命中步的变量组合** + 我们 bench 所需其余值（BS16/MAX_MODEL_LEN=40960/CHUNKED_PREFILL=1/GPU_MEM=0.97/ENABLE_PROFILE=0/ENABLE_CPU_BINDING=0/**BENCH=1**/DATASET=chinese_40k/MAX_TOKENS=1024）+ 作者数据面。⚠️ 若命中组合含 batched=2048，则 bench 跑它（prefill 2048 分块口径入报告备注）；若命中步是更后变量（说明 batched 2048 单独不够），按实际命中组合组装。输出目录 `tmp/r18-fjj-bench`；过 = bench 基线落袋（§R10 通过标准第 3/4 条原文回传 metrics）。
+
+### 回传格式
+
+同 §R16（每步 env 核验原文、EI0006 计数/相位、默认基线值回显、日志路径、起止时间）。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

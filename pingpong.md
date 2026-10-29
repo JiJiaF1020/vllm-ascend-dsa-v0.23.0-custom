@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: R6 派单已发出（逐字复现作者跑通现场 + R5-0 取证补漏），等绿区回传。R5 已判读：阴性，HCCL 超时/绑核两方向被实测排除；关键增量——作者与绿区跑的是**同一份代码**（cac7e2c4e），差异只剩执行环境/参数，作者 smoke 有未提交本地改动（min_tokens=max_tokens、ignore_eos=True）。
+- Current owner: **蓝区**。Status: R6 交付已回传（逐字复现作者命令，EI0015×7 复现失败；作者 10-28 成功跑 full01 RUN_OK 对照；命中「机器环境已漂移」判读分支）。首跑撞端口 19090（他人 write-bench，未杀，自然释放后重跑）。等蓝区判读。
 
 ## 0. 目标与口径
 
@@ -551,6 +551,127 @@ echo "RC=$?"   # 回报
 ### 回传格式
 
 追加「§R6 交付」节：前置补漏各项原文 + R6-1 RC + 通过标准逐条 + 关键日志行 + 路径（pp_r6_author_repro.log、tmp/prefault-read-r6/）；附执行起止时间。
+
+## §R6 交付（绿区，2026-10-29 23:05）
+
+### 结论
+
+**复现失败，且失败签名与 R4-3/R5-A/R5-B 完全相同（EI0015×7）** ⇒ 按派单判读预案命中「**复现失败且同为 EI0015 ⇒ 机器环境自作者跑通后已漂移**」。
+
+决定性对照：作者 10-28 自己跑通的 `tmp/prefault-read-full01`（`summary.txt = RUN_OK model_exit=0`，8 worker 全部 `DSA_SHARED_DRAIN_OK`，remote_shared.py:568）与绿区 10-29 逐字复现用的是**同一命令、同一配置、同一份代码**（scp-opt f63a5bfe = scp-va cac7e2c4e，作者自己的目录/va.env/dp4tp2.json/输出目录名），唯一差别是执行日期与机器状态。作者跑通后机器环境发生了漂移，导致 EP8 跨 DP MoE all2all 建链层 EI0015 复现。
+
+**首跑还叠加一个环境性前置失败（端口占用），已按派单「原样回传即可，不算阴性」处理，并在端口自然释放后完成了真实复现**，详见下。
+
+---
+
+### 前置核验 7 项（R5-0 补漏，只读，原文回传）
+
+1. **scp-opt git log（作者算子仓版本，R5-0 漏报项）**：
+   ```
+   f63a5bfe Update and rename remote_offload_results.csv to overlap-19090.csv
+   1a0f2528 feat(pool): add opt-in cross-port Gather worker sharing
+   fe974e4b revert(copy-sfa): restore first-benefit ScatterSFA kernels
+   6e85590d feat(tools): report per-epoch layer cross-port latency dispersion
+   ea377615 feat(tools): split Gather and DU reports and exclude initial loads
+   ```
+   scp-opt HEAD `f63a5bfe` = 绿区 a5-remote-offload-ops `f63a5bf`（同一 commit f63a5bfedf6eaa0e1e06d51ca48e26558a5f3d70，已核对）。
+
+2. **.bash_history**：`无 .bash_history`。作者实际执行方式不可考（无法确认容器内 vs 宿主机直接跑）。按派单要求**仍在容器 dsa-full 内复现**并在此注明。
+
+3. **scp-va git diff（作者 smoke 未提交改动原文，R5-0 漏报项）**：
+   - `examples/dsa_demo/simple_test.py:467`：`min_tokens=config.max_tokens, ignore_eos=True`（原为 `min_tokens=0, ignore_eos=False`）——强制满长 decode。
+   - `examples/dsa_demo/simple_test_1p.py`：`profile_dir` 改 `./40k_1p`，追加 `enable_profile=True / enable_mtp=True / enable_mtp_graph=True / run_mode='graph' / enable_offload=True / enable_a5_packed_c8=True / gpu_memory_utilization=0.97`。
+
+4. **宿主机 /usr/local/Ascend 布局**：仅 `driver / firmware / host_servers_remove.sh / host_servers_setup.sh / host_services_exit.sh / host_services_setup.sh / host_sys_init.sh / version.info`——**无 ascend-toolkit**（CANN 全在容器内）。`ascend-toolkit/latest/` 目录不存在。
+
+5. **ascend_toolkit_install.info**：`install.info 不存在`。
+
+6. **docker ps 容器清单**（R5 前置第5条漏报项）：
+   ```
+   vllm-wzh                         38b801e64b88
+   deepseek-v41-rc2-a5-20261029-175627  quay.io/ascend/vllm-ascend:v0.30.0rc2-a5
+   deepseek-v41-950dt-2              quay.io/ascend/vllm-ascend:v0.30.0rc2-a5-openeuler
+   deepseek-v41-950dt                quay.io/ascend/vllm-ascend:v0.30.0rc2-a5-openeuler
+   dsa-full                          quay.io/ascend/vllm-ascend:v0.23.0-a5-openeuler
+   a5-nds-parameter                  quay.io/ascend/vllm-ascend:v0.30.0rc1-a5-openeuler
+   ```
+   R6 复现用 `dsa-full`（v0.23.0-a5-openeuler）。其余容器多为 v0.30.0rc 系（deepseek-v41-*），若作者在别的容器跑过，容器版本可能不同——但 R6 按派单在 dsa-full 内复现。
+
+7. **npu-smi board 版本**（R5 前置第5条漏报项）：
+   ```
+   Chip Version      : V120
+   Software Version  : 25.6.rc2
+   Firmware Version  : 7.0.9.100.203
+   ```
+
+---
+
+### R6-0 清场
+
+同 R4-0 执行（kill urma_pool/profile_pool 相关 + rm /dev/shm/offload-numa-*），shm 384G 总量、清场后 373G 可用，无残留进程。
+
+---
+
+### R6-1 逐字复现作者命令
+
+**执行方式**：在容器 dsa-full 内，`cd /home/w00919836/scp-opt && source /home/w00919836/va.env` 后逐字执行派单命令（工具默认 `--framework-repo=/home/w00919836/scp-va`）。命令原文与派单一字不差。
+
+**结果分两段**：
+
+#### R6-1a · 首跑（22:44:xx 启动）——端口占用（环境性错误，不算阴性）
+
+- `RuntimeError: ports already in use: [19090]; existing processes left untouched`
+- `summary.txt = RUN_FAILED`；`run-status.json errors = ["RuntimeError: ports already in use: [19090]; existing processes left untouched"]`
+- 占用者：宿主机 pid 2481305，pts/16 交互终端 root bash 启动（父链 2328474←2328473），22:43:09 启动，
+  `test/urma_mock_pool/urma_mock_pool --write-bench --device udmac1d1e3 --eid-index 0 --control-port 19090 --jetty-count 1 --topk-probe-memory normal --hold-seconds 999`
+  ——用的是作者 EID 表（udmac1d1e3）+ 作者端口段（19090）+ 长驻 hold 999s，疑似作者/他人独立 write-bench 测试，**未杀**（可能影响他人作业）。
+- 处置：按派单「19090 段端口被占用工具会报错，原样回传即可」+「环境性错误原样回传，不算阴性」。占用进程 999s 自然结束（22:59:56 释放，已用 `kill -0` 轮询确认 PID 消失 + `ss -tlnp` 确认 19090 无 LISTEN），随后**重跑真实复现**。
+- 首跑失败证据已留存：`/home/fjj/r6_port_conflict_evidence/{summary,run-status,precheck}.txt`。
+
+#### R6-1b · 重跑（23:00 端口释放后）——EI0015×7，复现失败
+
+- **RC**：工具退出 `RuntimeError: model exited 1; see raw/model.log`，`summary.txt = RUN_FAILED`（`run-status.json errors = ["RuntimeError: model exited 1; see raw/model.log"]`）。
+- **通过标准逐条**：
+  - 工具 RC=0？ **否**（模型退出码 1）。
+  - `tmp/prefault-read-r6/summary.txt` 含 RUN_OK？ **否**（`RUN_FAILED`）。
+  - raw/model.log 有生成文本？ **否**（未到 decode）。
+  - 日志序列到 DSA_SHARED_DRAIN_OK？ **否**（DSA_SHARED_CONNECT/CONSUMED/DRAIN 均未触达；连 CONNECT rows 都未到）。
+- **失败签名**：EI0015×7（7/7 WorkerProc failed），`offline DP rank failed: dsa-dp-1=1, dsa-dp-2=1, dsa-dp-3=1`。
+- **失败时序**（raw/model.log）：
+  - 23:01:23 8 worker 全部 `DSA_EXECUTION_PLAN`（model_runner_v1.py:419，权重装载 + 执行计划下发成功，与 R4-3/R5 完全同构）。
+  - 23:01:25.5~25.7 首个 EI0015（`Communication_Error_Ranktable_Detect(EI0015): Failed to collect cluster information of the communicator based on rootInfo detection. Reason: RootInfoDetect failed.`）。
+  - 23:01:26 WorkerProc failed（`WorkerProc failed to start`，DP0_TP1_EP1 / DP2_TP1_EP5 / DP3_TP0_EP6 / DP3_TP1_EP7 / DP1_TP0_EP2 / DP2_TP0_EP4 / DP1_TP1_EP3）。
+  - 崩溃栈与 R4-3/R5-A/R5-B 完全一致：`DeepseekV2MoE.__init__ → FusedMoE.__init__ → _get_token_dispatcher() → token_dispatcher.py:472 → hcclCommInitRootInfoConfig(numRanks, &rootInfo, rank, config, &comm) error code is 4`（moE_comm_method.py:250 → token_dispatcher.py:472 → HCCLUtils.cpp:140）。
+- **关键日志行**：
+  ```
+  1205:(Worker_DP0_TP1_EP1 pid=2501402) ERROR ... EI0015: ... RootInfoDetect failed.
+  1657:(Worker_DP3_TP1_EP7 pid=2501391) ... RuntimeError: create_config:../torch_npu/csrc/distributed/HCCLUtils.cpp:140 HCCL function error: hcclCommInitRootInfoConfig(...), error code is 4
+  1659:(Worker_DP3_TP1_EP7 pid=2501391) ERROR ... EI0015: ... RootInfoDetect failed.
+  ```
+- **执行起止**：23:00:xx 启动（输出目录 tmp/prefault-read-r6 创建 23:00），23:01:38 model.log 定格（23:01:38.8 pp_r6_author_repro.log 定格）。
+
+#### 作者成功跑程对照（关键证据）
+
+- 作者 `tmp/prefault-read-full01`（10-28 04:07）`summary.txt = RUN_OK model_exit=0; owned Pool processes stopped`。
+- 同配置核对（commands.json）：du_ports=[19090-19097]、store_port 19080/19084、store_bytes=137438953472（128GiB）、du_devices=udmac1d1e3/udmac0d1e3、du_eid_indices=0、gather_scheduler=shared、du_pipeline_mib=1.0、store_numa_nodes=local——**与 R6-1b 逐字段一致**。
+- 作者 model.log 8 worker 全部 `DSA_SHARED_DRAIN_OK host=dsa-host ... real_store=1`（remote_shared.py:568，04:07:13）——完整 remote-offload store 周期跑通。
+- 作者跑程结束同样 force-kill 残留进程（04:07:18 shutdown），与首跑端口占用后 22:59:56 释放一致（作者 10-28 跑完即释放 19090 段）。
+
+---
+
+### 判读落点
+
+- **复现失败且同为 EI0015** ⇒ 机器环境自作者跑通后已漂移（命中派单预案第二分支）。
+- 漂移面候选（按派单预案，下一轮需对比作者成功时驱动/固件/CANN 当前值 + 查期间机器变更记录）：驱动 25.6.rc2 / 固件 7.0.9.100.203 / Chip V120 为**当前值**；作者成功跑时（10-28 04:07）的值未留存，需蓝区或后续取证。
+- 期间机器变更线索（本机观察）：10-29 有 `deepseek-v41-rc2-a5-20261029-175627`（v0.30.0rc2，17:56 创建的容器）、`deepseek-v41-950dt-2`（v0.30.0rc2-a5-openeuler）等新容器出现——**有他人作业在同一批 NPU/环境上跑**，可能是漂移来源（如固件/驱动被其他作业升级、或 NPU 被其他容器占用过）。R6 复现时 8 卡均空闲（npu-smi 0% util、HBM ~4.7G/卡空闲常驻）。
+- **不构成阴性**：首跑端口占用为环境性错误（派单明确不算阴性）；重跑 EI0015 与 R4-3/R5 同构，进一步坐实「EP8 跨 DP MoE all2all 建链层」故障面，且是**作者现场原样复现失败**——排除了「绿区参数/目录/环境差异」这一方向的解释。
+
+### 环境事实入库（后续轮次直接引用）
+
+- 作者现场成功基线：`tmp/prefault-read-full01`（10-28，RUN_OK，DSA_SHARED_DRAIN_OK×8）。
+- R6 日志资产：`/home/fjj/pp_r6_author_repro.log`、`/home/fjj/r6_port_conflict_evidence/`、`/home/w00919836/scp-opt/tmp/prefault-read-r6/`（summary/run-status/raw/model.log）。
+- 首跑端口占用进程详情：pid 2481305（已自然退出），write-bench hold-999。
+- 容器内复现（无法确认作者是否容器内跑，已按派单注明）。
 
 ## §R4 判读（蓝区，2026-10-29）
 

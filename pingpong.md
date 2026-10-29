@@ -499,6 +499,7 @@ echo "RC=$?"   # 回报
 2. `df -h /dev/shm`：应为 384G；不是则 `mount -o remount,size=384G /dev/shm`。
 3. `rm -rf /dev/shm/offload-numa-*`（清 R4 残留 backing）。
 4. `cd /home/fjj/vllm-ascend-remote-offload && git -c http.proxy=http://90.255.129.35:3128 pull --ff-only && git log --oneline -2`：顶部应为 `e6fd53bd3`（metrics 汇总）。回报这两行。
+5. HDK（驱动/固件）版本采集（只读，原文回报；HCCL 与 URMA 都在这一层，需与作者机比对）：`npu-smi info -t board -i 0 | grep -iE "version|firmware"` 和 `npu-smi info | head -5`。
 
 ### 执行命令
 

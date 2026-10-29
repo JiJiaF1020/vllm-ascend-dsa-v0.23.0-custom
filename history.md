@@ -125,3 +125,9 @@
 **交付**（commit 34a2b10）：R13-1 关绑核 EI0006 复现（10:54:05 齐射×20），绑核关闭核验通过（enable_cpu_binding=False 生效，无绑核执行痕迹）→ 绑核排除；R13-2 BENCH=0 仍 复现（11:03:16 ×20）→ bench env/代码路径排除，触发面在基础 env 集合或更底层。两轮均 0×1004，0 DRAIN，崩溃相位同签名（KV-cache init MoE 前向 HcclAllGather）。数据出处：/home/fjj/pp_r13.log + pp_r13b.log + tmp/r13-nobind-bench/ + tmp/r13-envbis-nobench/。
 
 **判读**（蓝区）：待定（给定下一轮 逐项 unset 二分表）。
+
+## §R13 交付判读 + §R14 env机制vs配置值正交派单（2026-10-30）
+
+**R13 交付**（commit 34a2b10d5）：R13-1 关绑核（核验干净：additional_config False+无执行痕迹）EI0006 仍复现→绑核排除（第三次自我修正）；R13-2 BENCH=0 仍复现→bench env/代码排除；崩溃相位恒为 determine_available_memory 的 MoE EP8 all-gather 首连。0/7 轮到 generate。
+**R13 判读**（蓝区）：发现配置层混淆——入口 simple_test_1p.py 无 env 时默认 BS1/23k/25600/chunked-off/0.85，而作者 diff 只加 7 开关不含 BS16/40960/chunked1；R5-0 记录的作者大参数只能来自其 shell 导出（bash_history）。「env 相关性」可能实为「配置尺寸相关性」；头号嫌疑转 MAX_NUM_BATCHED_TOKENS=40960（profile run 直接输入）。NATIVE_RUNTIME_ENV_OVERRIDES 无条件施加，非差分。
+**R14 派单**：R14-0 只读（作者 bash_history smoke env 痕迹+scp-va 现状 diff+1p 脚本原文——判定 env 机制 vs 配置值的钥匙）；R14-1 正交实验=scp-va 代码+我们 env 值全集+作者数据面（禁导 BENCH，作者 envs.py 不认识会报错），崩=配置值轴/过 profile=代码轴；R14-2 预写五步逐项 unset 二分（batched_tokens→model_len→chunked→bs→gpu_mem）。

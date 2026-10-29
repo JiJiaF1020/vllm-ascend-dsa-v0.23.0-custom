@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R13 已交付（R13-1 关绑核 EI0006 仍复现，绑核排除（头号嫌疑证伪）；R13-2 BENCH=0 仍复现，触发面在基础 env 集合）。R9 阳性落袋不变；bench 基线仍未落袋。
+- Current owner: **绿区**。Status: §R13 已判读（绑核排除、bench 排除；**发现配置层混淆**——无 env 时入口默认是 BS1/25600/chunked-off 小配置，「env 相关性」可能实为「配置尺寸相关性」，头号嫌疑转 MAX_NUM_BATCHED_TOKENS=40960）+ **§R14 派单已发**（R14-0 作者 bash_history 取证=钥匙；R14-1 scp-va 代码+我们的 env 值正交实验；R14-2 逐项 unset 二分表已预写）。R9 阳性落袋不变。
 
 ## 0. 目标与口径
 
@@ -1234,6 +1234,89 @@ va.env 后 `vllm_ascend.__file__` 指向 scp-va → prepend `PYTHONPATH=/home/fj
 - 清场完成:无残留 urma/VLLM/python 进程(PCP pmda 2 个系统守护除外);端口 19090-19097/20000-20007 空闲;/dev/shm 373G 可用。
 - 日志资产:`/home/fjj/pp_r13.log`(R13-1 tee)+ `pp_r13b.log`(R13-2 tee);`tmp/r13-nobind-bench/raw/model.log` + `tmp/r13-envbis-nobench/raw/model.log` + pool 日志。
 - 待蓝区判读:R13-1 绑核排除(头号嫌疑证伪);R13-2 触发面在基础 env 集合或更底层,蓝区给定下一轮逐项 unset 二分表。
+
+## §R13 判读（蓝区，2026-10-30）
+
+### 裁决
+
+1. **绑核排除**（R13-1）：关绑核核验干净（additional_config False + 无绑核执行痕迹）仍 EI0006 → R12 头号嫌疑证伪，第三次自我修正。
+2. **bench env/代码排除**（R13-2）：BENCH=0 仍复现，且崩溃相位在 init 的 determine_available_memory（早于一切 bench 逻辑）→ `min_tokens/ignore_eos/metrics` 路径全部排除。
+3. **基础 env 集合 ≠ 均匀嫌疑——存在配置层混淆**：蓝区本地复核入口 `simple_test_1p.py`（fjj=upstream）：无 env 时配置 = **BS1 / chinese_23k / max_model_len 25600 / batched 25600 / chunked_prefill=False / gpu_mem 0.85**；而作者 scp-va 的未提交 diff（§R5-0 已回传）只加了 profile_dir+7 个开关，**不含 BS16/40960/chunked1**——R5-0 记录的「作者参数 BS16/40960/chunked1」若属实，只能来自**作者 shell 里的 VLLM_ASCEND_SMOKE_* 导出**（bash_history，R14-0 取证）。这意味着：现有「有 env 必崩 / 无 env 不崩」的相关性，**可能实际是「BS16/40960/40960/chunked1 大配置必崩 / BS1/25600 小配置不崩」**。R11-D 通过的 profile 相位在我们这边全崩，差的不只是 env 机制，更是整套配置尺寸。**头号嫌疑转配置值：MAX_NUM_BATCHED_TOKENS=40960（profile run 用 batched_tokens 做 dummy 前向，是 determine_available_memory 的直接输入）**。
+4. NATIVE_RUNTIME_ENV_OVERRIDES（HCCL_OP_EXPANSION_MODE=AIV 等 6 项，simple_test.py:542/698）**无条件施加**，R11-D 同样生效，非差分。
+5. 1004 两轮均 0；绑核关 + 1004 消失并存观察项继续挂账。
+
+### 判读落点
+
+R14 两个动作：**R14-0 只读取证**（作者 bash_history 的 smoke env 导出痕迹 = 判定「env 机制 vs 配置值」的钥匙），**R14-1 代码正交实验**（作者代码 scp-va + 我们的 env 值全集 + 作者数据面）：崩 = 配置值轴（R14-2 逐项 unset 二分）；过 = 代码轴（蓝区复查 bench commit 与工具文件选择）。
+
+## §R14 派单：env 机制 vs 配置值正交拆解（蓝区，2026-10-30）
+
+### 原则
+
+R14-0 先行（免费、决定性）。R14-1 按结果分支。EI0006 不在白名单，复现即按分支走；1004 白名单 ≤2 次（≥5 分钟静置 + 完整清场）。
+
+### R14-0 · 只读取证（作者成功跑程的真实配置来源）
+
+```bash
+grep -n "VLLM_ASCEND_SMOKE" /home/w00919836/.bash_history | tail -40
+cd /home/w00919836/scp-va && git log --oneline -1 && git diff | head -80
+grep -n "SmokeConfig" -A 12 /home/w00919836/scp-va/examples/dsa_demo/simple_test_1p.py
+```
+
+回传三块原文。判读用：若 bash_history 有 smoke env 导出（尤其 MAX_NUM_BATCHED_TOKENS/MAX_MODEL_LEN/CHUNKED_PREFILL/MAX_NUM_SEQS）→ 作者成功跑程与我们的配置值同源，「env 机制」轴基本排除，锁配置值轴；若没有 → 作者成功跑程是 BS1/25600 小配置，配置值轴坐实。
+
+### R14-1 · 代码正交实验：scp-va 代码 + 我们的 env 值全集 + 作者数据面
+
+```bash
+cd /home/w00919836/scp-opt
+source /home/w00919836/va.env
+# 注意：scp-va 的 envs.py 不认识 BENCH/METRICS_SUMMARY，导出会报 Unknown smoke
+# environment variables —— 本轮【不要】导 BENCH。其余逐字：
+export VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731
+export VLLM_ASCEND_SMOKE_DATASET=chinese_40k
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=16
+export VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=40960
+export VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS=40960
+export VLLM_ASCEND_SMOKE_MAX_TOKENS=1024
+export VLLM_ASCEND_SMOKE_ENABLE_CHUNKED_PREFILL=1
+export VLLM_ASCEND_SMOKE_GPU_MEMORY_UTILIZATION=0.97
+export VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0
+export VLLM_ASCEND_SMOKE_ENABLE_CPU_BINDING=0
+python3 -c "import vllm_ascend; print(vllm_ascend.__file__)"   # 须指向 /home/w00919836/scp-va
+python3 tools/profile_pool_inference.py --du-store-prefault read \
+  --framework-repo /home/w00919836/scp-va \
+  --output tmp/r14-va-env-authorplane --sample-port 19090 --sample-worker 0 \
+  --remote-config ../dp4tp2.json --no-perf --payload-layers 78 \
+  --du-pipeline-mib 1 --store-bytes $((128*1024*1024*1024)) \
+  --pool-start-timeout 600 --pool-count 2 --numa-node 0 --pool-b-numa-node 2 \
+  --store-numa-nodes local \
+  --pool-cpus '2-17,21-36,40-55,59-74,78-93' \
+  --pool-b-cpus '192-207,211-226,230-245,249-264,268-283' \
+  --shared-port-gather --du-devices udmac1d1e3 --du-eid-indices 0 \
+  --pool-b-du-devices udmac0d1e3 --pool-b-du-eid-indices 0 \
+  2>&1 | tee /home/fjj/pp_r14.log
+echo "RC=$?"
+```
+
+- **EI0006 复现** ⇒ 配置值轴（同样值在作者代码上也崩）→ 执行 R14-2。
+- **过 profile 相位**（无论最终 1004/通过）⇒ 代码轴 → 停，回传，蓝区复查。
+- 1004 ⇒ 白名单重跑。
+
+### R14-2 · 配置值逐项 unset 二分（R14-1 复现后执行，每步 ~10 分钟）
+
+R14-1 逐字，按序每次只 unset 一个变量（其余全留），命中即停：
+
+1. `unset VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS`（40960→默认 25600；**最高优先**，profile run 直接输入）
+2. `unset VLLM_ASCEND_SMOKE_MAX_MODEL_LEN`（40960→25600）
+3. `unset VLLM_ASCEND_SMOKE_ENABLE_CHUNKED_PREFILL`（1→False）
+4. `unset VLLM_ASCEND_SMOKE_MAX_NUM_SEQS`（16→1）
+5. `unset VLLM_ASCEND_SMOKE_GPU_MEMORY_UTILIZATION`（0.97→0.85）
+
+输出目录后缀 `-stepN`（如 tmp/r14-va-env-authorplane-step1）。某步过后 profile 相位通过（哪怕后续 1004/其它错）→ **该变量 = 元凶**，停，回传该步完整日志；五步全复现 EI0006 → 停，回传，蓝区重估（届时应有 R14-0 答案辅助）。
+
+### 通过标准与回传格式
+
+同 §R13（R14-1 无 BENCH，metrics 不适用；R14-0 三块原文必回）。附各步 import 路径核验、日志路径、起止时间。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

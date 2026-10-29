@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **蓝区**。Status: R9 交付已回传——占用者（他人 vLLM 作业，deepseek-v41-rc2-a5 容器）已按用户授权 kill，裸 HCCL 探针 8/8 PASS，R6 整网复现 RUN_OK model_exit=0（8 worker 全 DSA_SHARED_DRAIN_OK，put_pages=389376）；EI0015/EI0020/RaGetDevEidInfoNum 全部消失（后者为瞬时竞争，重跑即过）。等蓝区下一手。
+- Current owner: **绿区**。Status: R10 派单已发出（规范化 bench 首发：BS16×40K 定长 decode，bench 口径报告），等绿区回传。R9 已判读：**阳性落袋**——占用容器清理后探针 8/8 PASS、整网 RUN_OK（8 worker DRAIN_OK，put_pages=389376），机器层故障面清除。
 
 ## 0. 目标与口径
 
@@ -641,7 +641,84 @@ bash /home/fjj/hccl_probe_8npu.sh 2>&1 | tail -20
 - 驱动 25.6.rc2 / 固件 7.0.9.100.203（10-27 至今未变 ⇒ 排除驱动版本号变化，但不排除驱动运行态/配置变更）。
 - R7 证据：/home/fjj/r7_evidence/。
 
-## §R8 派单：机器层证据采集（蓝区，2026-10-30）
+## §R9 判读（蓝区，2026-10-30）
+
+**阳性落袋。** 根因链闭合：EI0020 = 他人 vLLM 作业（deepseek-v41-rc2-a5 容器，27 个进程，01:58 起）占用 NPU 网络端口 16666（UB 平面，ss 不可见）；EI0015 = rootinfo 空目录（02:07 重新生成后消失）。清理占用后：探针 8/8 PASS → R6 逐字复现 RUN_OK（8 worker DSA_SHARED_DRAIN_OK、DSA_STORE_CLOSED requests=16 put_pages=389376、remote_get=1）。**remote-offload 整网链路正式跑通**（第二次，作者之外首次复现）。
+
+入库规则：① `RaGetDevEidInfoNum code=1004` 是他人作业释放 NPU 后的瞬时竞争，**先重跑一次再定性**；② 每次跑模型前必做占用取证（R7-0 模板）+ 探针；③ 杀他人作业须有用户授权（本轮已获）。
+
+## §R10 派单：规范化 bench 首发（BS16×40K 定长 decode）（蓝区，2026-10-30）
+
+### 目标
+
+用新入库的 bench 口径（commit 717c396fc，VLLM_ASCEND_SMOKE_BENCH=1：定长 decode + 官方 bench 风格报告 + 全局分位数）跑第一轮规范化 bench：DP4/TP2/EP8、BS16/DP（全局 64 请求）、40K 输入、定长 1024 输出、offload 开、graph+MTP graph。产出：TTFT/TPOT p50/p90/p99、request/output 吞吐、`tpot_under_50ms` 判定。本轮是 bench 基线轮，不做性能结论对比（offload-off 对照另派）。
+
+### 前置核验
+
+1. 框架仓更新：`cd /home/fjj/vllm-ascend-remote-offload && git -c http.proxy=http://90.255.129.35:3128 pull --ff-only && git log --oneline -2`（顶部应 717c396fc）。回报。
+2. 占用取证（R7-0 模板）：`docker ps` / `npu-smi info | head -40` / `ps aux | grep -iE 'urma|vllm|python' | grep -v grep` / `ss -tlnp | grep -E ':(19|20)0[0-9][0-9]'`。有他人 NPU 作业 → **停下回传取证，等用户授权**，不要自行 kill。
+3. 探针：`bash /home/fjj/hccl_probe_8npu.sh 2>&1 | tail -5` 须 8/8 PASS；不 PASS 则停下回传，不烧模型装载。
+4. 清场：`ps aux | grep -E 'urma_pool_server|urma_mock_pool' | grep -v grep | awk '{print $2}' | xargs -r kill -9; ps aux | grep -E 'python|vllm' | grep -v grep | awk '{print $2}' | xargs -r kill -9; sleep 5; rm -rf /dev/shm/offload-numa-*`；`df -h /dev/shm` 应为 384G。
+
+### 执行命令
+
+```bash
+cd /home/fjj/a5-remote-offload-ops
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+export VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731
+export VLLM_ASCEND_SMOKE_DATASET=chinese_40k
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=16
+export VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=40960
+export VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS=40960
+export VLLM_ASCEND_SMOKE_MAX_TOKENS=1024
+export VLLM_ASCEND_SMOKE_ENABLE_CHUNKED_PREFILL=1
+export VLLM_ASCEND_SMOKE_GPU_MEMORY_UTILIZATION=0.97
+export VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0
+export VLLM_ASCEND_SMOKE_BENCH=1
+python3 tools/profile_pool_inference.py \
+  --no-perf \
+  --framework-repo /home/fjj/vllm-ascend-remote-offload \
+  --remote-config /home/fjj/a5-remote-offload-ops/tmp/eid-probe-r1/remote-shared.json \
+  --output tmp/r10-bench-bs16 \
+  --payload-layers 78 \
+  --store-bytes $((128*1024*1024*1024)) \
+  --du-ports 20000,20001,20002,20003 --store-ports 19080,19081,19082,19083 \
+  --pool-b-du-ports 20004,20005,20006,20007 --pool-b-store-ports 19084,19085,19086,19087 \
+  --du-devices udmac1d1e2 --pool-b-du-devices udmac0d1e3 \
+  --du-eid-indices 0 --pool-b-du-eid-indices 0 \
+  --sample-port 20000 --sample-worker 0 \
+  --numa-node 0 --pool-b-numa-node 2 --store-numa-nodes local \
+  --pool-start-timeout 600 \
+  --shared-port-gather --du-pipeline-mib 1 \
+  2>&1 | tee /home/fjj/pp_r10_bench.log
+echo "RC=$?"
+```
+
+### 失败处置（按序）
+
+- 出现 `RaGetDevEidInfoNum` code=1004 或 EI0015/EI0020：**清场后原样重跑一次**（瞬时竞争规则）；仍败 → 回传，不做第三次。
+- 出现 `DSA A5 MTP LIM requires 1..4 query rows`：`VLLM_ASCEND_SMOKE_MAX_NUM_SEQS` 减半重试（16→8→4，输出目录改 tmp/r10-bench-bs8/bs4），每次都要完整清场。任一 BS 过即停。
+- 其它新报错：回传首个报错点前后 50 行，不自行重试。
+
+### 通过标准（需同时满足）
+
+1. 工具 RC=0，summary.txt 含 RUN_OK，model.log 有生成文本；
+2. 日志序列到 `DSA_SHARED_DRAIN_OK`（8 worker）；
+3. **bench 证据**：4 个 rank 各有 `[dsa-smoke][metrics][dp=N]` 行 + bench 报告块；`results/1p/<run_name>.metrics.json` 存在且 global 含 requests=64、ttft_ms/tpot_ms 分位数、request_throughput_rps、global_output_tps、tpot_under_50ms；
+4. **原文回传** `[dsa-smoke][metrics][global]` 行和全局 bench 报告块全文。
+
+### 回传格式
+
+追加「§R10 交付」节：前置核验逐项 + RC + 通过标准逐条 + metrics global 行/bench 报告块原文 + 日志路径；附框架仓 `git log --oneline -2` 与执行起止时间。
+
+### 判读预案（派单时写死）
+
+- **全中** ⇒ bench 基线落袋；下一轮 offload-off 对照（+20% 口径）与 100K 输入放大。
+- **BS 降级后过** ⇒ 落袋该 BS 的基线，LIM 约束记录为已知边界，蓝区评估修复。
+- **metrics 缺失/字段不全** ⇒ 说明绿区框架仓不是 717c396fc，回传 git log，重拉再跑。
+
+## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 
 ### 目标
 

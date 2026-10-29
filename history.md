@@ -77,3 +77,10 @@
 **R8 交付**（commit 44686ea）：6 组只读证据全部执行——udmac d1e2~d1e5 八个节点 01:48/01:49 批量重建（内核/驱动层周期性重建）；dmesg UDMA/ubase 层 01:45-01:46 高频活动；唯一 /dev/uburma holder = kvaf_cpu_service（udmac0d1e6, --port 28999, PID 182921）；npu-smi -t health/error-code 本机 25.6.rc2 不支持已用 npu-smi info 替代；8 卡 Health 全 OK/0% util/无进程。
 **R8 补充**（commit 1aab4f9）：/etc/hccl_rootinfo.json 被重新生成（02:07:16，19496B 合法 JSON）→ 探针 EI0015 消失 → 前移 EI0020（NPU 网络端口 16666 被占用 8/8）；用户指示有人占用先不跑。
 **R9 交付**（本 commit）：按用户授权杀占用容器 deepseek-v41-rc2-a5-20261029-175627（他人 vLLM 作业，27 个 VLLM 进程）→ 裸 HCCL 探针 8/8 PASS（04:34）→ R6 整网复现 RUN_OK model_exit=0（05:09，8 worker 全 DSA_SHARED_DRAIN_OK + DSA_STORE_CLOSED put_pages=389376）。首次 R6 曾遇 RaGetDevEidInfoNum code=1004（physical 0/2/7，瞬时竞争，EID 顺序/并发/pool 运行三态探测全 OK，重跑即过）。作者跑通现场逐字复现成功。
+
+## §R9 跑通落袋 + §R10 规范化 bench 派单（2026-10-30）
+
+**R9 交付**（commit 262d70a16）：用户授权杀占用容器（deepseek-v41-rc2-a5，他人 vLLM 作业占 NPU 16666 端口=EI0020 根因；rootinfo 空目录 02:07 重新生成=EI0015 根因）→ 探针 8/8 PASS → R6 逐字复现 RUN_OK（8 worker DRAIN_OK，put_pages=389376）。RaGetDevEidInfoNum code=1004 定性为瞬时竞争（重跑即过）。
+**R9 判读**（蓝区）：阳性落袋，remote-offload 整网链路正式跑通。
+**蓝区开发**：bench 口径入库（commit 717c396fc）——VLLM_ASCEND_SMOKE_BENCH=1 定长 decode（min_tokens=max_tokens, ignore_eos）+ vllm bench serve 风格报告块 + 全局分位数（per_request 明细重算 p50/p90/p99）+ request_throughput_rps + tpot_under_50ms 验收判定。mock 全过。
+**R10 派单**：规范化 bench 首发：DP4/TP2/EP8、BS16/DP（64 请求）、40K 输入、定长 1024 输出、offload 开、graph+MTP graph。前置=占用取证+探针；LIM 命中则 BS 减半梯子（16→8→4）。判读预案写死。

@@ -88,6 +88,7 @@ NPU capture/replay、精度及DP/TP并发须在服务器验收。无算子/wire�
 | `GRAPH_CAPTURE_SIZES` | `1,2,4,8,16` + `MAX_NUM_SEQS` | 请求数档位；自动补入当前 BS、去重并过滤大于 BS 的值；MTP3 时自动乘 4 |
 | `PROCESS_TIMEOUT_SECONDS` | `3600` | DP 进程及前端同步等待超时，单位秒 |
 | `METRICS_SUMMARY` | `1` | generate 返回后汇总 TTFT/TPOT/吞吐（host 时钟，不计时不扰动）；每 rank 打印 `[dsa-smoke][metrics]` 并写入结果 JSON，rank0 额外合并全局 `<run_name>.metrics.json` |
+| `BENCH` | `0` | bench 口径开关：定长 decode（`min_tokens=max_tokens, ignore_eos=True`）+ vllm bench serve 风格报告块（含 p90/p99 与 request/output 吞吐）；指标名与公式与官方 bench 对齐 |
 | `DSA_INDEXER_MLA_BLOCK_RATIO` | `3` | Indexer/full KV/MTP 与 resident MLA 的 block 容量比，不是 full/shared 层数比 |
 | `DSA_MAX_ACTIVE_REQS` | `256` | 卸载活跃请求容量上限 |
 | `DSA_HOT_CPU_BLOCK_MULTIPLE` | `1.0` | 卸载 DRAM 热块容量倍率 |

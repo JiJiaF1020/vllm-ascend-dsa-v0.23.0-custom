@@ -76,6 +76,8 @@ SMOKE_ENV_FIELDS = (
     "sync_port",
     # Post-generate TTFT/TPOT/throughput summary in dsa_demo smoke; 1 (default) / 0.
     "metrics_summary",
+    # Bench 口径：定长 decode（min_tokens=max_tokens、ignore_eos）+ bench 风格报告；1/0，默认0。
+    "bench",
 )
 
 env_variables: dict[str, Callable[[], Any]] = {

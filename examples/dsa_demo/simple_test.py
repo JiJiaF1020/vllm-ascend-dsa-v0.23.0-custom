@@ -60,6 +60,7 @@ class SmokeConfig:
     ready_shadow_steps: int = 3
     ready_shadow_group: int = 0
     metrics_summary: bool = True  # generate 返回后汇总 TTFT/TPOT/吞吐；host 时钟，不计时不扰动。
+    bench: bool = False  # bench 口径：定长 decode（min_tokens=max_tokens, ignore_eos）+ 官方 bench 风格报告。
 
     @property
     def mtp_graph_enabled(self) -> bool:
@@ -386,6 +387,14 @@ def write_result(config: SmokeConfig, payload: dict[str, Any], dp_rank: int) -> 
     print(f"[dsa-smoke] wrote result: {path}", flush=True)
 
 
+def _percentile(ordered: list[float], q: float) -> float:
+    n = len(ordered)
+    if n == 1:
+        return ordered[0]
+    rank = min(n - 1, max(0, int(round(q * (n - 1)))))
+    return ordered[rank]
+
+
 def _stats(values: list[float]) -> dict[str, float] | None:
     if not values:
         return None
@@ -396,8 +405,32 @@ def _stats(values: list[float]) -> dict[str, float] | None:
         "avg": round(sum(ordered) / n, 3),
         "min": round(ordered[0], 3),
         "p50": round(median, 3),
+        "p90": round(_percentile(ordered, 0.9), 3),
+        "p99": round(_percentile(ordered, 0.99), 3),
         "max": round(ordered[-1], 3),
     }
+
+
+def _bench_report(scope: str, requests: int, output_tokens: int, wall_s: float,
+                  ttft: dict[str, float] | None, tpot: dict[str, float] | None) -> str:
+    """vllm bench serve 风格的报告块，指标同名同公式，离线口径。"""
+    def row(label, stats, unit="ms"):
+        if not stats:
+            return f"{label}: unavailable"
+        return (f"{label}: avg={stats['avg']}{unit} p50={stats['p50']} p90={stats['p90']} "
+                f"p99={stats['p99']} max={stats['max']}")
+    lines = [
+        f"============ DSA Smoke Benchmark Result ({scope}, offline) ============",
+        f"Successful requests: {requests}",
+        f"Benchmark duration (s): {round(wall_s, 2)}",
+        f"Total generated tokens: {output_tokens}",
+        f"Request throughput (req/s): {round(requests / wall_s, 3) if wall_s > 0 else None}",
+        f"Output token throughput (tok/s): {round(output_tokens / wall_s, 2) if wall_s > 0 else None}",
+        row("TTFT (ms)", ttft),
+        row("TPOT (ms, excl. 1st token)", tpot),
+        "=" * 72,
+    ]
+    return "\n".join(lines)
 
 
 def summarize_request_metrics(
@@ -465,19 +498,27 @@ def merge_global_metrics(config: SmokeConfig, dp_rank: int) -> None:
         end = max(s["gen_end_epoch"] for s in summaries)
         tokens = sum(s["output_tokens"] for s in summaries)
         wall_s = end - start
-        tpot_avgs = [s["tpot_ms"]["avg"] for s in summaries if s["tpot_ms"]]
+        # 全局分位数从各 rank per_request 明细重算，不做 rank 平均的平均。
+        all_ttft = [r["ttft_ms"] for s in summaries for r in s["per_request"] if "ttft_ms" in r]
+        all_tpot = [r["tpot_ms"] for s in summaries for r in s["per_request"] if r.get("tpot_ms") is not None]
+        ttft_stats, tpot_stats = _stats(all_ttft), _stats(all_tpot)
+        requests = sum(s["requests"] for s in summaries)
         global_summary = {
             "dp_size": config.data_parallel_size,
-            "requests": sum(s["requests"] for s in summaries),
+            "requests": requests,
             "output_tokens": tokens,
             "global_wall_s": round(wall_s, 3),
+            "request_throughput_rps": round(requests / wall_s, 3) if wall_s > 0 else None,
             "global_output_tps": round(tokens / wall_s, 2) if wall_s > 0 else None,
-            "tpot_ms_avg_across_ranks": round(sum(tpot_avgs) / len(tpot_avgs), 3) if tpot_avgs else None,
+            "ttft_ms": ttft_stats,
+            "tpot_ms": tpot_stats,
+            "tpot_under_50ms": (tpot_stats["p99"] < 50) if tpot_stats else None,
         }
         out = Path(config.result_dir) / f"{config.run_name}.metrics.json"
         out.write_text(json.dumps({"global": global_summary, "ranks": summaries}, ensure_ascii=False, indent=2),
                        encoding="utf-8")
         print("[dsa-smoke][metrics][global] " + json.dumps(global_summary, ensure_ascii=False), flush=True)
+        print(_bench_report("global", requests, tokens, wall_s, ttft_stats, tpot_stats), flush=True)
         print(f"[dsa-smoke][metrics] wrote {out}", flush=True)
     except Exception as exc:
         print(f"[dsa-smoke][metrics] global merge failed (non-fatal): {exc}", flush=True)
@@ -562,7 +603,9 @@ def run_dp_rank(
             print(f"[dsa-smoke][dp={dp_rank}] cache initialized; offload={config.enable_offload}", flush=True)
         else:
             items = shard_prompts(config, dp_rank)
-            sampling = SamplingParams(temperature=0.0, max_tokens=config.max_tokens, min_tokens=0, ignore_eos=False)
+            sampling = SamplingParams(temperature=0.0, max_tokens=config.max_tokens,
+                                      min_tokens=config.max_tokens if config.bench else 0,
+                                      ignore_eos=config.bench)
             profiling_started = False
             try:
                 if config.enable_profile:
@@ -597,6 +640,9 @@ def run_dp_rank(
                 payload["metrics_summary"] = summary
                 brief = {k: v for k, v in summary.items() if k != "per_request"}
                 print(f"[dsa-smoke][metrics][dp={dp_rank}] " + json.dumps(brief, ensure_ascii=False), flush=True)
+                if config.bench:
+                    print(_bench_report(f"dp={dp_rank}", summary["requests"], summary["output_tokens"],
+                                        summary["wall_s"], summary["ttft_ms"], summary["tpot_ms"]), flush=True)
             if config.remote_shared and config.remote_shared.get("debug") is not None:
                 from vllm_ascend.dsa_offload.remote_shared_debug import remote_shared_debug_report
 

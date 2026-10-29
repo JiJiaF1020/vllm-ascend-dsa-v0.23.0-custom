@@ -54,3 +54,5 @@
 
 **交付**（commit 177f9acd3）：R4-0/1/2 全过（f63a5bf 重编、双 Pool shared-gather 就绪、384G shm、store 路由正确）；R4-3 在 load_model 阶段 MoE EP8 建链崩 EI0015（RootInfoDetect failed，7/8 worker，PLAN 后 2 秒）；R4-3b/4 条件不触发。附 R3-A 数据：offload=0 也崩（HCCL dispatch timeout EmptyQueue）。
 **判读**（蓝区）：阴性，但 R3-A 证明故障与 remote-offload 无关，收敛到本分支 EP8 跨 DP HCCL 建链层；崩溃阶段三轮漂移（profile_run→dummy_run→load_model）指向 rank 时序竞争。最可疑：重 Pool 轮询线程（du-workers 7×8）与框架绑核叠加致建链期 CPU 饥饿（估计）；作者 va.env 内容未知（已向用户索取）。代理变更为 90.255.129.35:3128。下一步：R5 三级梯子（HCCL_CONNECT_TIMEOUT=1800 → 关 CPU 绑核 → HCCL 抓栈）。
+
+**R5 修订**（同日）：用户确认作者（w00919836）就是在绿区本机跑通的——差分框架从"作者机 vs 绿区机"修正为"同机不同账号/环境"。R5 前置加 R5-0 作者现场取证（va.env / dp4tp2.json / scp-opt、scp-va 版本 / 成功 run 日志 / 作者 EID 表，全只读），并授权绿区：va.env 里发现未设的 HCCL 变量可直接补上当级重跑。

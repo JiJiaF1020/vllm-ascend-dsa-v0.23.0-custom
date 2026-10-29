@@ -495,6 +495,24 @@ echo "RC=$?"   # 回报
 
 ### 前置核验
 
+**R5-0 · 作者现场取证（只读，最先做，可能直接读出答案）**：作者（w00919836）就是在本机跑通的（用户 10-29 确认），他的环境文件和成功日志应仍在盘上。逐项执行，原文回传；某条不存在就如实写"不存在"，不要去找替代品。
+
+```bash
+ls /home/w00919836/ 2>&1
+cat /home/w00919836/va.env 2>&1                       # 作者跑前 source 的环境，头号嫌疑
+cat /home/w00919836/dp4tp2.json 2>&1                  # 作者的 remote-config 原文
+cd /home/w00919836/scp-opt && git log --oneline -5 2>&1   # 作者算子仓版本，比对 f63a5bfed
+cd /home/w00919836/scp-va && git log --oneline -3 && git status -sb | head -20 2>&1   # 作者框架仓版本+未提交改动
+ls -t /home/w00919836/scp-opt/tmp/ | head 2>&1        # 作者成功的 run 目录
+cat /home/w00919836/scp-opt/tmp/prefault-read-full01/summary.txt 2>&1
+tail -50 /home/w00919836/scp-opt/tmp/prefault-read-full01/raw/model.log 2>&1   # 作者成功跑程的日志尾巴
+cat /home/w00919836/scp-opt/tmp/eid-probe-run01/remote-shared.json 2>&1        # 作者 EID 表，与绿区 tmp/eid-probe-r1 版比对
+```
+
+若 va.env 存在：把其中所有 `export` 行原文回传（含 HCCL_/ASCEND_/VLLM_ 开头的一切）。蓝区拿到后会出 va.env 差分清单。**取证结果回传前可以先做 R5-A，但如果 va.env 里出现我们没设的 HCCL 变量，直接在当次跑程补上并重跑该级**（在交付里注明补了哪些）。
+
+### 其余前置核验
+
 1. `ps aux | grep -E 'urma|python|vllm' | grep -v grep`：应为空（R4 工具已自行收 Pool）；不空则杀 python/vllm，urma 进程也杀（本轮工具会自己重起）。
 2. `df -h /dev/shm`：应为 384G；不是则 `mount -o remount,size=384G /dev/shm`。
 3. `rm -rf /dev/shm/offload-numa-*`（清 R4 残留 backing）。

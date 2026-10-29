@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: R5 派单已发出（EI0015 重试梯子：HCCL_CONNECT_TIMEOUT=1800 → 关 CPU 绑核 → 抓 HCCL 栈），等绿区回传。R4 已判读：阴性，但关键增量——R3-A 附带回传证明 offload 关闭也崩，故障与 remote-offload 无关，收敛到 EP8 跨 DP HCCL 建链层；双 Pool + shared-gather + 128GiB Store 全链路实测就绪。
+- Current owner: **绿区**。Status: R6 派单已发出（逐字复现作者跑通现场 + R5-0 取证补漏），等绿区回传。R5 已判读：阴性，HCCL 超时/绑核两方向被实测排除；关键增量——作者与绿区跑的是**同一份代码**（cac7e2c4e），差异只剩执行环境/参数，作者 smoke 有未提交本地改动（min_tokens=max_tokens、ignore_eos=True）。
 
 ## 0. 目标与口径
 
@@ -466,6 +466,92 @@ echo "RC=$?"   # 回报
 - **R4-4 LIM/零 miss** ⇒ 已知边界命中，阴性不阻塞主线；蓝区核对形状后决定修复或配置绕行。
 - **R4-1 构建失败** ⇒ 报错末 30 行回传，停止后续阶段。
 
+## §R5 判读（蓝区，2026-10-29）
+
+### 总结论
+
+**阴性，但排查空间大幅收敛**。R5-A（HCCL_CONNECT_TIMEOUT=1800）与 R5-B（+关绑核）均复现 EI0015×7，超时方向与绑核争核方向**实测排除**。R5-0 取证推翻两个蓝区假说、纠正一个误判：
+
+1. 作者 va.env **无 HCCL 调优变量** ⇒ "作者有 HCCL 环境调优"假说作废。
+2. 蓝区 R5-0 前的解读修正：经比对 GitHub 原始仓，作者 scp-va HEAD cac7e2c4e **就是**分支 tip，"3 个未推送 commit"全部已包含在绿区代码里——**作者与绿区跑的是同一份框架代码**。真正的代码差异只剩作者 smoke 脚本的未提交本地改动（`min_tokens=max_tokens, ignore_eos=True` 强制满长 decode；simple_test_1p.py 参数调整）。
+3. 参数差异清单（作者 → 绿区）：CHUNKED_PREFILL=1→默认关、MAX_NUM_SEQS=16→1、MAX_MODEL_LEN=40960→45056、du 端口 19090 段→20000 段、binding=none→（R5-B 已排除）。**没有一条能解释建链期 EI0015**。
+4. 剩余最大未知：**作者的执行上下文**（容器内 vs 宿主机直接跑、CANN/torch_npu 版本是否与我们容器内一致）——R5-0 未覆盖，R6 补。
+
+### 逐条裁决
+
+- **R5-A/B 失败机制与 R4-3 同构：接受**。快速失败（1-2s）非超时，HCCL_CONNECT_TIMEOUT 方向关闭；R5-B 证明绑核不是根因。
+- **R5-C 即败是蓝区派单缺陷**：ASCEND_LAUNCH_BLOCKING=1 与 ACL graph 模式互斥（config 校验期拒绝），派单时未考虑 graph 默认开。后续若需精确栈，须 RUN_MODE=eager + ASCEND_LAUNCH_BLOCKING=1。ascend/log tgz（3.4MB，296 文件）已留存，蓝区需要时再取。
+- **R5-0 取证质量：接受**，但有漏项（见 R6 前置）：作者 scp-opt 的 git log 未回传、作者是否在容器内执行未确认、作者 smoke 未提交改动的 diff 原文未回传。
+
+### 环境事实入库（后续轮次直接引用）
+
+- 作者现场：`/home/w00919836/{scp-opt,scp-va,va.env,dp4tp2.json}`；va.env 无 HCCL 变量；scp-va 有未提交 smoke 改动；作者参数 CHUNKED_PREFILL=1/BS16/MAX_MODEL_LEN=40960/du 19090 段/binding=none。
+- R5 日志资产：pp_r5_*.log、tmp/r5{a,b,c}-*/、r5a/r5b_first_error_ctx.txt、pp_r5c_ascend_log.tgz（含 EI0015 plog）。
+
+## §R6 派单：逐字复现作者跑通现场（蓝区，2026-10-29）
+
+### 目标
+
+用作者自己的目录、自己的环境、自己的配置**逐字复现**他的成功跑程。复现成功 → 拿到工作基线，逐项换回绿区参数做差分二分；复现失败 → 机器环境自作者跑通后发生漂移（驱动/固件/CANN/其他作业），直接改排查主线。
+
+### 前置核验（R5-0 补漏，只读，原文回传）
+
+```bash
+cd /home/w00919836/scp-opt && git log --oneline -5   # 作者算子仓版本（R5-0 漏报）
+tail -200 /home/w00919836/.bash_history              # 作者实际怎么跑的（是否 docker exec、实际命令行）
+cd /home/w00919836/scp-va && git diff                # 作者 smoke 未提交改动原文
+ls /usr/local/Ascend/                                 # 宿主机 CANN 版本布局
+cat /usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/ascend_toolkit_install.info 2>/dev/null || true
+docker ps --format '{{.Names}} {{.Image}}'            # 当前容器清单（判断作者是否可能用了别的容器）
+npu-smi info -t board -i 0 | grep -iE "version|firmware"   # R5 前置第5条漏报项
+```
+
+### 执行命令
+
+**R6-0 · 清场**（同 R4-0，工具会自己起 Pool）
+
+```bash
+ps aux | grep -E 'urma_pool_server|urma_mock_pool' | grep -v grep | awk '{print $2}' | xargs -r kill -9
+ps aux | grep -E 'python|vllm' | grep -v grep | awk '{print $2}' | xargs -r kill -9
+sleep 5; rm -rf /dev/shm/offload-numa-*; df -h /dev/shm
+```
+
+**R6-1 · 逐字复现作者命令**——用作者的 scp-opt、作者的 va.env、作者的 dp4tp2.json、作者的输出目录名。工具默认 `--framework-repo=/home/w00919836/scp-va`，会自动用作者的框架仓（含未提交 smoke 改动）。在容器内执行；若 bash_history 显示作者是在宿主机直接跑的，**先仍在容器内复现并在交付注明**。
+
+```bash
+cd /home/w00919836/scp-opt
+source /home/w00919836/va.env
+python3 tools/profile_pool_inference.py --du-store-prefault read \
+  --output tmp/prefault-read-r6 --sample-port 19090 --sample-worker 0 \
+  --remote-config ../dp4tp2.json --no-perf --payload-layers 78 \
+  --du-pipeline-mib 1 --store-bytes $((128*1024*1024*1024)) \
+  --pool-start-timeout 600 --pool-count 2 --numa-node 0 --pool-b-numa-node 2 \
+  --store-numa-nodes local \
+  --pool-cpus '2-17,21-36,40-55,59-74,78-93' \
+  --pool-b-cpus '192-207,211-226,230-245,249-264,268-283' \
+  --shared-port-gather --du-devices udmac1d1e3 --du-eid-indices 0 \
+  --pool-b-du-devices udmac0d1e3 --pool-b-du-eid-indices 0 \
+  2>&1 | tee /home/fjj/pp_r6_author_repro.log
+echo "RC=$?"   # 回报
+```
+
+注意：作者的 dp4tp2.json 用 du 19090-19097，本条命令**不改**（这正是复现的目的）；若 19090 段端口被占用工具会报错，原样回传即可。框架侧 import 的 vllm_ascend 是 fjj 仓的 editable 安装，与作者代码同为 cac7e2c4e，可接受；若报 import 错误，原样回传不自行修。
+
+### 通过标准
+
+- **R6-1 复现成功**：工具 RC=0；tmp/prefault-read-r6/summary.txt 含 RUN_OK；raw/model.log 有生成文本；日志序列到 DSA_SHARED_DRAIN_OK。
+- **复现失败**：按失败签名分类回传（EI0015 / 端口占用 / import 错 / 其它），首个报错点前后 50 行。
+
+### 判读预案（派单时写死）
+
+- **复现成功** ⇒ 拿到工作基线。下一轮逐项差分（绿区参数→作者参数，一次一项）：BS/MAX_MODEL_LEN/CHUNKED_PREFILL → du 端口段 → smoke 本地改动。
+- **复现失败且同为 EI0015** ⇒ 机器环境自作者跑通后已漂移；下一轮对比作者成功时的驱动/固件/CANN 与当前值，并查期间机器变更记录（重启、其他作业、驱动升级）。
+- **复现失败且为环境性错误（端口/import/路径）** ⇒ 原样回传，蓝区修命令，不算阴性。
+
+### 回传格式
+
+追加「§R6 交付」节：前置补漏各项原文 + R6-1 RC + 通过标准逐条 + 关键日志行 + 路径（pp_r6_author_repro.log、tmp/prefault-read-r6/）；附执行起止时间。
+
 ## §R4 判读（蓝区，2026-10-29）
 
 ### 总结论
@@ -487,7 +573,7 @@ echo "RC=$?"   # 回报
 - 容器内 github 代理：90.255.12.179:3128 持续 407，**改用 90.255.129.35:3128**（R4-1 实测 curl 200）。后续 git 代理一律用后者。
 - R4 日志资产：/home/fjj/pp_r4_run.log、pp_r4_ops_build.log、tmp/r4-author-bs1/{summary,precheck}.txt、raw/{model,pool-a,pool-b}.log。
 
-## §R5 派单：EI0015 重试梯子（蓝区，2026-10-29）
+## §R5 派单-旧：EI0015 重试梯子（蓝区，2026-10-29）——已交付已判读，见 §R5 判读
 
 ### 目标
 

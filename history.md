@@ -56,3 +56,8 @@
 **判读**（蓝区）：阴性，但 R3-A 证明故障与 remote-offload 无关，收敛到本分支 EP8 跨 DP HCCL 建链层；崩溃阶段三轮漂移（profile_run→dummy_run→load_model）指向 rank 时序竞争。最可疑：重 Pool 轮询线程（du-workers 7×8）与框架绑核叠加致建链期 CPU 饥饿（估计）；作者 va.env 内容未知（已向用户索取）。代理变更为 90.255.129.35:3128。下一步：R5 三级梯子（HCCL_CONNECT_TIMEOUT=1800 → 关 CPU 绑核 → HCCL 抓栈）。
 
 **R5 修订**（同日）：用户确认作者（w00919836）就是在绿区本机跑通的——差分框架从"作者机 vs 绿区机"修正为"同机不同账号/环境"。R5 前置加 R5-0 作者现场取证（va.env / dp4tp2.json / scp-opt、scp-va 版本 / 成功 run 日志 / 作者 EID 表，全只读），并授权绿区：va.env 里发现未设的 HCCL 变量可直接补上当级重跑。
+
+## §R5 EI0015 重试梯子 — 交付与判读（2026-10-29）
+
+**交付**（commit 13ac84c36）：R5-A（HCCL_CONNECT_TIMEOUT=1800）、R5-B（+关绑核）均复现 EI0015×7 失败；R5-C 因 ASCEND_LAUNCH_BLOCKING 与 ACL graph 互斥即败（蓝区派单缺陷），ascend/log tgz 已留存。R5-0 取证：作者 va.env 无 HCCL 变量；作者参数 CHUNKED_PREFILL=1/BS16/MAX_MODEL_LEN=40960/du 19090 段/binding=none。
+**判读**（蓝区）：阴性。超时与绑核两方向实测排除；"作者有 HCCL 调优"假说作废。蓝区比对 GitHub 原始仓后修正误判：作者 scp-va HEAD cac7e2c4e 即分支 tip，与绿区同一份代码；真正差异只剩 smoke 未提交本地改动（min_tokens=max_tokens、ignore_eos=True）+ 执行参数 + 执行上下文（容器 vs 宿主，未知）。下一步：R6 逐字复现作者现场（作者目录/环境/配置原样），成则差分二分，败则查机器环境漂移。

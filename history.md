@@ -88,3 +88,8 @@
 ## §R10 规范化 bench 首发 — 交付（2026-10-30 07:24~07:43）
 
 **交付**（commit 待回填）：bench 首发失败 EI0006。前置核验全过（框架 0180ceb 含 717c396fc bench 口径；占用取证 8 卡空闲；探针 8/8 PASS；清场干净）。双 pool-a/b READY（POOL_ROI_POOL_READY groups=['a','b']，store 19080-19087/du 20000-20007），8 worker 全 DSA_EXECUTION_PLAN（权重装载 + MTP draft 加载成功），07:29:18 **8 worker 同时 EI0006**（Communication_Error_Get_Socket: Getting socket times out），栈 = 运行时 MoE 前向 `npu_dynamic_mx_quant → HcclAllGather`（EP8 all-gather）。工具 RC=0 但 summary 未生成、无 DRAIN_OK、无 metrics/results。EI0006 不在瞬时重跑白名单，按「其它新报错 → 回传」处置。日志：/home/fjj/a5-remote-offload-ops/tmp/r10-bench-bs16/ + /home/fjj/pp_r10_bench.log。
+
+## §R10 判读 + §R11 EI0006 隔离梯子派单（2026-10-30）
+
+**R10 判读**（蓝区）：EI0006 = 8 worker 同一秒 socket 超时齐射 = 有 rank 未按时到达运行时 MoE 前向 EP8 all-gather（07:26:45 draft 就绪 → 07:29:18 齐射，~153s≈HCCL socket 超时量级）。不判机器层复发（探针 8/8、占用干净）。差分 R9 RUN_OK：R10 独有变量 = run_mode=graph+MTP graph 首次上机（R9 为 eager，主嫌疑）、数据面 udmac1d1e2/20000 段/eid-probe-r1 json（次嫌疑）、BENCH=1 仅 sampling 参数（嫌疑最低）。bench 基线未落袋。
+**R11 派单**：隔离梯子——R11-0 只读取证（model.log 找没到的 rank + capture 标记 + URMA 行）→ R11-A 原样重跑（EI0006 入一次性白名单）→ R11-B RUN_MODE=eager 隔离 graph（过=eager bench 基线落袋）→ R11-C graph+ENABLE_MTP_GRAPH=0 分离 acl graph vs MTP graph → R11-D 回作者逐字配置验证数据面/机器漂移。白名单外新报错即停回传。

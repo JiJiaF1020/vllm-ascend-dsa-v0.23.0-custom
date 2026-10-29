@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R10 交付已回传（bench 首发失败 EI0006，运行时 MoE 前向 EP8 all-gather 超时，8 worker 07:29:18 同时），等蓝区判读/下一手。R9 已判读：**阳性落袋**——占用容器清理后探针 8/8 PASS、整网 RUN_OK（8 worker DRAIN_OK，put_pages=389376），机器层故障面清除。
+- Current owner: **绿区**。Status: §R10 已判读（EI0006=有 rank 未到达 EP8 all-gather 的超时齐射；主嫌疑=graph+MTP graph 首次上机，次嫌疑=数据面 e2/20000 段/eid json 差分）+ **§R11 派单已发**（隔离梯子：R11-0 取证 → A 原样重跑 → B eager 隔离 → C graph 去 MTP graph → D 回作者逐字配置）。R9 阳性落袋不变：整网 eager RUN_OK、机器层故障面清除。
 
 ## 0. 目标与口径
 
@@ -797,6 +797,75 @@ echo "RC=$?"
 ```
 
 **8 worker EI0006 分布**（全部 07:29:18 同一时刻）：DP0_TP0_EP0/DP0_TP1_EP1/DP1_TP0_EP2/DP1_TP1_EP3/DP2_TP0_EP4/DP2_TP1_EP5/DP3_TP0_EP6/DP3_TP1_EP7 各 2~3 条。
+
+## §R10 判读（蓝区，2026-10-30）
+
+### 性质判定
+
+EI0006（Communication_Error_Get_Socket）8 worker 同一秒齐射 = **有 rank 未按时到达 EP8 all-gather，其余 rank socket 超时齐发**，不是链路断。时间线吻合：07:26:45 MTP draft 加载完 → 07:29:18 超时（~153s，HCCL socket 超时量级）。挂住点在某 rank 的首次前向路径上（prefill/capture/warmup 阶段）。
+
+### 与 R9 RUN_OK 的差分（R10 独有变量，按嫌疑排序）
+
+1. **run_mode=graph + MTP graph（R10 首次上机）**：R9/R6 作者现场是 **eager**。graph capture/warmup 阶段 MoE EP8 all-gather 在 capture 内执行，remote-offload + MTP graph 组合从未在这台机器跑过。capture 期任一 rank 卡住（含 URMA 路径参与 capture）→ 同签名。**最大嫌疑**。
+2. **数据面差异**：pool-a du 设备 udmac1d1e2（作者 e3）、20000 端口段（作者 19090 段）、fjj eid-probe-r1/remote-shared.json（作者 dp4tp2.json）。EI0006 本身是 HCCL socket，与 URMA 设备无直接关系，但**若某 rank 在注意力层 URMA GET 挂住，其余 rank 同样会等在 MoE all-gather**——不能排除，靠 R11-0 取证鉴别。
+3. **BENCH=1**：仅改 sampling 参数（min_tokens=max_tokens、ignore_eos），作者 smoke 未提交改动本就是同行为，非新代码路径。嫌疑最低。
+
+### 结论
+
+不判机器层复发（探针 8/8 PASS、占用取证干净）。判 **graph 模式首发触发的运行时集合通信超时**，隔离梯子见 §R11。bench 基线未落袋，顺延。
+
+## §R11 派单：EI0006 隔离梯子 + bench 基线补打（蓝区，2026-10-30）
+
+### 原则
+
+顺序执行 R11-0 → A →（按结果分支）。每步独立完整清场；任一步出白名单外新报错 → 停，回传首个报错点前后 50 行。白名单 = RaGetDevEidInfoNum code=1004 / EI0015 / EI0020 / **EI0006 一次性重跑**（仅 R11-A）。
+
+### R11-0 · 只读取证（无机器成本，先做）
+
+对 `/home/fjj/a5-remote-offload-ops/tmp/r10-bench-bs16/raw/model.log`：
+
+```bash
+L=/home/fjj/a5-remote-offload-ops/tmp/r10-bench-bs16/raw/model.log
+# 1) 每个 Worker_DP 在 07:26:45~07:29:18 之间的最后一条日志行（找谁没到）
+for dp in 0 1 2 3; do for tp in 0 1; do
+  echo "== DP${dp}_TP${tp} =="; grep "Worker_DP${dp}_TP${tp}" $L | sed -n '/07:2[6-9]/p' | tail -3
+done; done
+# 2) capture/warmup 标记是否出现、走到哪
+grep -nE "Capturing|capture|warmup|acl_graph|GRAPH_CAPTURE" $L | tail -30
+# 3) 07:26:45 之后是否有 URMA/DSA GET/PUT 相关行
+sed -n '/07:2[6-9]/p' $L | grep -iE "urma|dsa_(get|put|store)|remote" | head -40
+```
+
+原文回传三块输出。判读用：若某 rank 最后行停在 URMA/DSA 数据面 → 变量 2 升主嫌疑；若全体整齐进 capture 后无声 → 变量 1 坐实。
+
+### R11-A · R10 原样重跑一次（瞬时排除）
+
+命令逐字同 §R10「执行命令」，输出目录改 `tmp/r11a-bench-bs16`，日志 `/home/fjj/pp_r11a.log`。
+- **过** ⇒ EI0006 定性瞬时，bench 基线落袋，直接回传按 §R10 通过标准逐条。
+- **复现 EI0006** ⇒ 进 R11-B。
+- **白名单外新报错** ⇒ 停，回传。
+
+### R11-B · eager 隔离 graph（A 复现后执行）
+
+R10 命令仅改一处：`export VLLM_ASCEND_SMOKE_RUN_MODE=eager`（MTP graph 随 run_mode!=graph 自动关，脚本内置保证），输出目录 `tmp/r11b-bench-bs16-eager`，日志 `pp_r11b.log`。
+- **过** ⇒ bench 基线（eager 口径）落袋 + 坐实 graph 面；进 R11-C。
+- **复现 EI0006** ⇒ 非 graph 独有 → 进 R11-D。
+
+### R11-C · graph 去 MTP graph（B 过后执行）
+
+R10 命令改两处：`export VLLM_ASCEND_SMOKE_RUN_MODE=graph`（保持默认即可）+ `export VLLM_ASCEND_SMOKE_ENABLE_MTP_GRAPH=0`，输出目录 `tmp/r11c-bench-bs16-graph-nomtpgraph`。
+- **过** ⇒ MTP graph 是触发面，acl graph 本体可用；回传后蓝区定修复/绕行。
+- **败** ⇒ acl graph 本体与 remote-offload 组合有问题；回传，蓝区上代码级排查。
+
+### R11-D · 回作者逐字配置（B 也败时执行，验证数据面/机器漂移）
+
+逐字 §R6-1 命令（作者 scp-opt + va.env + dp4tp2.json + udmac1d1e3/udmac0d1e3 + 19090 段，eager），输出目录 `tmp/prefault-read-r11d`。
+- **过** ⇒ R10 失败与端口段/e2 设备/eid-probe-r1 json 相关；回传，蓝区差分。
+- **败** ⇒ 机器自 R9 后再漂移；回传 + 按 R8 模板补机器层取证。
+
+### 回传格式
+
+追加「§R11 交付」节：R11-0 三块原文 + 执行到哪个分支、各步 RC + 通过标准逐条 + 关键日志行/路径 + 执行起止时间。bench 通过的步按 §R10 通过标准第 3/4 条原文回传 metrics global 行与报告块。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

@@ -84,3 +84,7 @@
 **R9 判读**（蓝区）：阳性落袋，remote-offload 整网链路正式跑通。
 **蓝区开发**：bench 口径入库（commit 717c396fc）——VLLM_ASCEND_SMOKE_BENCH=1 定长 decode（min_tokens=max_tokens, ignore_eos）+ vllm bench serve 风格报告块 + 全局分位数（per_request 明细重算 p50/p90/p99）+ request_throughput_rps + tpot_under_50ms 验收判定。mock 全过。
 **R10 派单**：规范化 bench 首发：DP4/TP2/EP8、BS16/DP（64 请求）、40K 输入、定长 1024 输出、offload 开、graph+MTP graph。前置=占用取证+探针；LIM 命中则 BS 减半梯子（16→8→4）。判读预案写死。
+
+## §R10 规范化 bench 首发 — 交付（2026-10-30 07:24~07:43）
+
+**交付**（commit 待回填）：bench 首发失败 EI0006。前置核验全过（框架 0180ceb 含 717c396fc bench 口径；占用取证 8 卡空闲；探针 8/8 PASS；清场干净）。双 pool-a/b READY（POOL_ROI_POOL_READY groups=['a','b']，store 19080-19087/du 20000-20007），8 worker 全 DSA_EXECUTION_PLAN（权重装载 + MTP draft 加载成功），07:29:18 **8 worker 同时 EI0006**（Communication_Error_Get_Socket: Getting socket times out），栈 = 运行时 MoE 前向 `npu_dynamic_mx_quant → HcclAllGather`（EP8 all-gather）。工具 RC=0 但 summary 未生成、无 DRAIN_OK、无 metrics/results。EI0006 不在瞬时重跑白名单，按「其它新报错 → 回传」处置。日志：/home/fjj/a5-remote-offload-ops/tmp/r10-bench-bs16/ + /home/fjj/pp_r10_bench.log。

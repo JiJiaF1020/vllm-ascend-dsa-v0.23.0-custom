@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: R10 派单已发出（规范化 bench 首发：BS16×40K 定长 decode，bench 口径报告），等绿区回传。R9 已判读：**阳性落袋**——占用容器清理后探针 8/8 PASS、整网 RUN_OK（8 worker DRAIN_OK，put_pages=389376），机器层故障面清除。
+- Current owner: **绿区**。Status: §R10 交付已回传（bench 首发失败 EI0006，运行时 MoE 前向 EP8 all-gather 超时，8 worker 07:29:18 同时），等蓝区判读/下一手。R9 已判读：**阳性落袋**——占用容器清理后探针 8/8 PASS、整网 RUN_OK（8 worker DRAIN_OK，put_pages=389376），机器层故障面清除。
 
 ## 0. 目标与口径
 
@@ -717,6 +717,86 @@ echo "RC=$?"
 - **全中** ⇒ bench 基线落袋；下一轮 offload-off 对照（+20% 口径）与 100K 输入放大。
 - **BS 降级后过** ⇒ 落袋该 BS 的基线，LIM 约束记录为已知边界，蓝区评估修复。
 - **metrics 缺失/字段不全** ⇒ 说明绿区框架仓不是 717c396fc，回传 git log，重拉再跑。
+
+
+## §R10 交付：bench 首发失败 EI0006（绿区，2026-10-30 07:24~07:43）
+
+### 前置核验（逐项）
+
+1. **框架仓更新**：`git pull --ff-only` → Already up to date。`git log --oneline -3`：
+   ```
+   0180ceb docs(pingpong): R9 判读（阳性落袋）+ R10 派单规范化 bench 首发 BS16x40K
+   717c396 feat(examples): dsa_demo bench 口径：定长 decode + 官方 bench 风格报告
+   262d70a docs(pingpong): R9 交付 杀占用→探针8/8 PASS→R6整网RUN_OK
+   ```
+   ✓ 顶部 0180ceb，含 717c396fc bench 口径。
+2. **占用取证**：8 卡 Health 全 OK、Util 全 0%、无 vLLM/urma 业务进程；19080-19087/20000-20007 端口无占用（wzh 作业已自行退出）。无他人 NPU 作业，直接执行。
+3. **探针**：`bash /home/fjj/hccl_probe_8npu.sh` —— 8/8 PASS（R9 已坐实机器层恢复，本轮沿用）。
+4. **清场**：无 urma_pool_server/urma_mock_pool 残留；/dev/shm 已清理，384G。
+
+### 执行（07:24:19 起）
+
+命令逐字按派单（DP4/TP2/EP8、BS16、40K 输入、定长 1024 输出、offload 开、graph+MTP graph、`VLLM_ASCEND_SMOKE_BENCH=1`）。
+
+进度日志：`POOL_REMOTE_CONFIG source=.../eid-probe-r1/remote-shared.json effective=.../r10-bench-bs16/raw/remote-shared.json`；`POOL_STORE_ROUTE` 8 条全部就位（du 20000-20007 → store 19080-19087）；`POOL_ROI_POOL_READY groups=['a','b']`；`POOL_ROI_RUNNING model_pid=1264768`。双 pool-a/b 各自 `REMOTE_DU_OVERLAP enabled` + `HOST_PUSH_READY poll_threads=1 session=1` + `CPU_PLACEMENT`（pool-a numa0 tid=1270452、pool-b numa2 tid=1270042）。
+
+模型侧：8 worker 全部 `DSA_EXECUTION_PLAN`（权重装载 + 执行计划下发成功，07:24:40~07:27）；`[dsa-smoke]` 4 rank 行齐全（rank=0/1/2/3，mode=graph offload=True tp=2 bs=16 max_model_len=40960 mtp=True mtp_graph_enabled=True）；MTP draft 装载完成（07:26:39-45 `[spec_decode/base] Loading draft model: method=mtp` + `Detected MTP model. Sharing target model embedding weights`）。
+
+### 失败：EI0006（07:29:18，8 worker 同时）
+
+**工具 RC=0**（`profile_pool_inference.py` 自身退出码；模型实际 RUN_FAILED），**summary.txt 未生成**，`results/1p/` 不存在。
+
+`model.log` 首个报错点 = 第 1633 行起（DP3_TP0_EP6 pid=1266109，Device:0）。EI0006 共 20 条（8 worker × 2~3 条，全部 07:29:18 同一时刻）：
+
+```
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987] RuntimeError: The Inner error is reported as above. The process exits for this inner error, and the current working operator name is HcclAllGather.
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987] [PID: 1266109] 2026-10-30-07:29:18.226.964 Communication_Error_Get_Socket(EI0006): Getting socket times out. Reason: Connection fault detection has been disabled. 1. The remote end does not initiate a connection request. some NPUs in the cluster are abnormal. 2. The remote end does not initiate a connection request because the collective communication operator is started too late or is not started by some NPUs in the cluster. 3. The communication link is disconnected. (For example, the IP addresses are not on the same network segment or the TLS configurations are inconsistent.)
+```
+
+栈（首个报错点前 50 行内关键链）：`fused_moe_0_23_0.py:415 forward → moe_runner.py:637 → :134 _moe_forward_shared → fused_moe_0_23_0.py:122 forward_impl → :693 shared_forward_impl → :497 forward_impl → method_adapters.py:274 apply → w4a4_mxfp4.py:225 apply → moe_comm_method.py:156 fused_experts → :175 _apply_mlp → moe_mlp.py:527 unified_apply_mlp → :133 quant_apply_mlp → device_op.py:1318 npu_dynamic_quant → torch_npu.npu_dynamic_mx_quant(...) → **HcclAllGather**`。
+
+**关键定位**：这是**运行时 MoE 前向的 EP8 通信组 all-gather 超时**（`npu_dynamic_mx_quant` 内触发 HcclAllGather），发生在模型已装载成功、MTP draft 已加载、即将进入 decode 的首次请求推理阶段——**不是** R2/R3-A 的初始化建链超时，也**不是** R4/R5/R6/R8 的 EI0015（MoE comm 初始化）。与 R9 已坐实的机器层故障面（EI0015=rootinfo 空目录、EI0020=16666 端口占用）不同——**当前 rootinfo 合法（rank_count=8）、16666 已释放、探针 8/8 PASS**，但 EI0006 仍在运行时 EP8 all-gather 复现。
+
+**通过标准逐条**：
+1. RC=0 ✓（工具）但 summary.txt 无 RUN_OK、model.log 无生成文本 ✗；
+2. `DSA_SHARED_DRAIN_OK`（8 worker）✗（0 条）——模型未跑到 DRAIN；
+3. `[dsa-smoke][metrics][dp=N]` 行 / bench 报告块 / `results/1p/<run>.metrics.json` ✗（无）；
+4. metrics global 原文 ✗（无）。
+
+**结论**：bench 首发失败，EI0006 不在派单「瞬时重跑」白名单（RaGetDevEidInfoNum/EI0015/EI0020），按「其它新报错 → 回传首个报错点前后 50 行，不自行重试」处置，回传蓝区判读。日志：`/home/fjj/a5-remote-offload-ops/tmp/r10-bench-bs16/`（raw/model.log、pool-a/b.log）、`/home/fjj/pp_r10_bench.log`。执行起止：2026-10-30 07:24:19 ~ 07:43:43（模型 07:29:18 崩溃后进程树由绿区清理，profile_pool_inference 正常退出）。
+
+### 附：报错点上下文（首错 50 行内，DP3_TP0_EP6 与 DP1_TP1_EP3 同栈）
+
+```
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]   File "/home/fjj/vllm-ascend-remote-offload/vllm_ascend/ops/fused_moe/fused_moe_0_23_0.py", line 415, in forward
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]     return self.runner.forward(
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]   File "/vllm-workspace/vllm/vllm/model_executor/layers/fused_moe/runner/moe_runner.py", line 637, in forward
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]     result = self._forward_entry(
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]   File "/home/fjj/vllm-ascend-remote-offload/vllm_ascend/ops/fused_moe/fused_moe_0_23_0.py", line 122, in forward_impl
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]     result = layer.shared_forward_impl(hidden_states, router_logits)
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]   File "/home/fjj/vllm-ascend-remote-offload/vllm_ascend/ops/fused_moe/fused_moe_0_23_0.py", line 693, in shared_forward_impl
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]     fused_moe_results = self.forward_impl(
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]   File "/home/fjj/vllm-ascend-remote-offload/vllm_ascend/ops/fused_moe/fused_moe_0_23_0.py", line 497, in forward_impl
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]     fused_experts_results: FusedExpertsResult = self.quant_method.apply(
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]   File "/home/fjj/vllm-ascend-remote-offload/vllm_ascend/quantization/method_adapters.py", line 274, in apply
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]     return self.quant_method.apply(
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]   File "/home/fjj/vllm-ascend-remote-offload/vllm_ascend/quantization/methods/w4a4_mxfp4.py", line 225, in apply
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]     return moe_comm_method.fused_experts(
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]   File "/home/fjj/vllm-ascend-remote-offload/vllm_ascend/ops/fused_moe/moe_comm_method.py", line 156, in fused_experts
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]     mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]   File "/home/fjj/vllm-ascend-remote-offload/vllm_ascend/ops/fused_moe/moe_comm_method.py", line 175, in _apply_mlp
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]     return unified_apply_mlp(mlp_compute_input=mlp_compute_input)
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]   File "/home/fjj/vllm-ascend-remote-offload/vllm_ascend/ops/fused_moe/moe_mlp.py", line 527, in unified_apply_mlp
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]     return quant_apply_mlp(
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]   File "/home/fjj/vllm-ascend-remote-offload/vllm_ascend/ops/fused_moe/moe_mlp.py", line 133, in quant_apply_mlp
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]     hidden_states, pertoken_scale = DeviceOperator.npu_dynamic_quant(
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]   File "/home/fjj/vllm-ascend-remote-offload/vllm_ascend/device/device_op.py", line 1318, in npu_dynamic_quant
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]     hidden_states, dynamic_scale = torch_npu.npu_dynamic_mx_quant(hidden_states, dst_type=act_quant_type)
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_ops.py", line 1209, in __call__
+(Worker_DP3_TP0_EP6 pid=1266109) ERROR 10-30 07:29:18 [multiproc_executor.py:987]     return self._op(*args, **kwargs)
+```
+
+**8 worker EI0006 分布**（全部 07:29:18 同一时刻）：DP0_TP0_EP0/DP0_TP1_EP1/DP1_TP0_EP2/DP1_TP1_EP3/DP2_TP0_EP4/DP2_TP1_EP5/DP3_TP0_EP6/DP3_TP1_EP7 各 2~3 条。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

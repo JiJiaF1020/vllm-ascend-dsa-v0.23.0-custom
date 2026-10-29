@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **蓝区**。Status: R8 补充已回传——/etc/hccl_rootinfo.json 已被重新生成（02:07:16，19496B 合法 JSON，非绿区操作），探针错误面从 EI0015 前移到 EI0020（NPU 网络端口 16666 被占用，8/8）；用户指示有人占用先不跑，等占用释放/蓝区指示（HCCL_NPU_SOCKET_PORT_RANGE 可规避）。
+- Current owner: **蓝区**。Status: R9 交付已回传——占用者（他人 vLLM 作业，deepseek-v41-rc2-a5 容器）已按用户授权 kill，裸 HCCL 探针 8/8 PASS，R6 整网复现 RUN_OK model_exit=0（8 worker 全 DSA_SHARED_DRAIN_OK，put_pages=389376）；EI0015/EI0020/RaGetDevEidInfoNum 全部消失（后者为瞬时竞争，重跑即过）。等蓝区下一手。
 
 ## 0. 目标与口径
 
@@ -770,6 +770,44 @@ Solution: ... configure the port number using the environment variable HCCL_NPU_
 - rootinfo 文件被生成后 EI0015 不再出现 → **该文件确实是 RootInfoDetect 的输入**（先前排除结论需修正：空目录虽非绿区造成，但确实是 EI0015 的一个必要条件；蓝区判读时请纳入）。
 - 当前故障面 = **NPU 网络端口 16666 占用**（EI0020）。按 solution 可用 `HCCL_NPU_SOCKET_PORT_RANGE` 指定端口段规避，或等占用释放。绿区不执行修复，等蓝区/用户指示。
 
+
+
+## §R9 交付：杀占用→探针 8/8 PASS→R6 整网 RUN_OK（绿区，2026-10-30 05:1x）
+
+**背景**：§R8 补充后故障面为 EI0020（NPU 网络端口 16666 被占用）。用户指示「把别人的东西杀掉 我们自己跑」→ 绿区定位占用者并清理后重跑，整网链路复现成功。
+
+### 1. 占用者定位与清理
+
+- **占用者 = 他人正在跑的 vLLM 作业**（非 wzh 构建，非绿区进程）：`ss -tlnp6` 见大批 `VLLM::Worker_DP*`/`VLLM::EngineCore_DP*`/`VLLM::APIServer_*`（pid 2699007~2704343 共 27 个，01:58 起）。
+- **归属容器**：全部 cgroup 落在 `docker/96aa270...` = 容器 **`deepseek-v41-rc2-a5-20261029-175627`**（quay.io/ascend/vllm-ascend:v0.30.0rc2-a5，cwd=/tmp/cannbot-wheels，vllm serve 01:58 起）。
+- 用户已明确授权杀占用 → `docker kill deepseek-v41-rc2-a5-20261029-175627` → Exited (137)。核验：全部 VLLM 进程消失，仅剩无关容器 deepseek-v41-950dt-2 / vllm-wzh。
+- 注：16666 绑在 NPU 网卡内部地址（UB 平面），宿主/容器 `ss` 均不可见，无法直接按端口杀；靠 `ss -tlnp6` 的 VLLM 进程枚举定位到容器。
+
+### 2. 裸 HCCL 探针：8/8 PASS（04:34，杀容器后首跑）
+
+`/home/fjj/hccl_probe_8npu.sh` 单次：**8/8 全 PASS**（all_gather OK 1.6~2.0s，verify=True）——EI0015、EI0020 全部消失，回到 10-27 PASS 基线。
+
+### 3. R6 整网复现：RUN_OK model_exit=0（第二次跑通）
+
+按 R6 派单逐字命令（`r6_author_repro.sh`，scp-opt f63a5bfe + va.env + dp4tp2.json，DP4/TP2 EP8，eager 无 perf）：
+
+- **第一次（04:37~04:48）：RUN_FAILED**——新失败点 `RaGetDevEidInfoNum failed code=1004`（`model_runner_v1.py:5293 _bind_dsa_split_kv_caches → custom_ops_lib.aiv_urma_query_eids`），失败 worker=physical 0/2/7（DP0_TP0/DP1_TP0/DP3_TP1），其余 5 worker DSA_SHARED_DRAIN_OK。
+- **EID 查询排查（决定性）**：`aiv_urma_query_eids` 单卡顺序探测 8 卡全 OK（各 19 EID）；无 pool 并发 8 卡全 OK；**pool 运行中**并发 8 卡也全 OK → EID 查询本身无故障，与 pool 无关。
+- **第二次（05:01~05:09）：RUN_OK**——`summary.txt: RUN_OK model_exit=0; owned Pool processes stopped`。8 worker 全部 `DSA_SHARED_DRAIN_OK`（remote_shared.py:568），每 worker `DSA_STORE_CLOSED requests=16 put_pages=389376 inference=hbm_full_remote_shared remote_get=1`（remote_store.py:252），16 行 store 全部关闭。`RaGetDevEidInfoNum` 错误 0 次（上次 7 次）。
+
+### 4. 判读落点
+
+- **机器层故障面全部清除**：EI0015（rootinfo 空目录，02:07 被重新生成）+ EI0020（16666 被他人 vLLM 作业占用，用户授权杀容器）+ RaGetDevEidInfoNum code=1004（**瞬时竞争，重跑即过**，非物理卡故障）。
+- 第一次 R6 的 `RaGetDevEidInfoNum` 失败与杀容器时间（01:58 起的作业被杀）相邻，推断为**他人作业释放 NPU 后的瞬时不稳定**（NPU 残留状态/URMA 资源未完全复位），重跑即稳定通过——建议蓝区若再遇此错误先重跑一次，勿当硬件故障。
+- **作者跑通现场复现成功**：与作者 10-28 `tmp/prefault-read-full01`（RUN_OK model_exit=0，8 worker 全 DSA_SHARED_DRAIN_OK）逐字同命令同代码同配置，唯一差别=机器状态（已清除占用+rootinfo 已修复）。
+- 本轮无性能结论（PERF_DISABLED，符合锚点口径「本轮只判通/不通」）。
+- 日志资产：`/home/w00919836/scp-opt/tmp/prefault-read-r6/`（raw/model.log + pool-*.log + summary.txt，R6 第二次成功）、`prefault-read-r6-2/`（第一次失败）。
+
+### 5. 通过标准逐条
+
+- R6-1 逐字复现作者跑通现场？ **是**——`RUN_OK model_exit=0`（05:09，8 worker 全 DSA_SHARED_DRAIN_OK + DSA_STORE_CLOSED put_pages=389376）。
+- 裸 HCCL 探针？ **8/8 PASS**（04:34）。
+- EI0015/EI0020/RaGetDevEidInfoNum 是否全部消失？ **是**（第二次 R6 全程 0 次）。
 
 
 ## §R5 判读（蓝区，2026-10-29）

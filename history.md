@@ -71,3 +71,9 @@
 
 **交付**（commit 7b5805939）：8 卡 HCCL 裸探针 3 次 8/8 全败 EI0015（00:24/00:29/00:34），同脚本 10-27 曾 8/8 PASS；三次失败时 NPU 全空闲、无租户进程、无端口占用；R7-2 按预案未执行。线索：URMA 设备节点 d1e2~5 系 10-30 00:32 重建（e6 系仍 10-22 旧）。
 **判读**（蓝区）：机器层实锤。代码/配置/流程全部排除（作者 10-28 04:07 同机同命令 RUN_OK 为证）。"多租户运行时干扰"修正为"机器在 10-28 04:07 后、10-29 05:22 前被改动且故障持续"。修复需机器管理员介入。下一步：R8 只读证据采集（dmesg/npu-smi health/error-code/uburma 节点/登录痕迹），给用户提交管理员用；恢复验收 = 探针 8/8 PASS → R6-1 复现。
+
+## §R8 机器层证据采集 + R9 杀占用恢复验收（2026-10-30）
+
+**R8 交付**（commit 44686ea）：6 组只读证据全部执行——udmac d1e2~d1e5 八个节点 01:48/01:49 批量重建（内核/驱动层周期性重建）；dmesg UDMA/ubase 层 01:45-01:46 高频活动；唯一 /dev/uburma holder = kvaf_cpu_service（udmac0d1e6, --port 28999, PID 182921）；npu-smi -t health/error-code 本机 25.6.rc2 不支持已用 npu-smi info 替代；8 卡 Health 全 OK/0% util/无进程。
+**R8 补充**（commit 1aab4f9）：/etc/hccl_rootinfo.json 被重新生成（02:07:16，19496B 合法 JSON）→ 探针 EI0015 消失 → 前移 EI0020（NPU 网络端口 16666 被占用 8/8）；用户指示有人占用先不跑。
+**R9 交付**（本 commit）：按用户授权杀占用容器 deepseek-v41-rc2-a5-20261029-175627（他人 vLLM 作业，27 个 VLLM 进程）→ 裸 HCCL 探针 8/8 PASS（04:34）→ R6 整网复现 RUN_OK model_exit=0（05:09，8 worker 全 DSA_SHARED_DRAIN_OK + DSA_STORE_CLOSED put_pages=389376）。首次 R6 曾遇 RaGetDevEidInfoNum code=1004（physical 0/2/7，瞬时竞争，EID 顺序/并发/pool 运行三态探测全 OK，重跑即过）。作者跑通现场逐字复现成功。

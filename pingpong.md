@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: R8 派单已发出（机器层证据采集，给管理员用），等绿区回传。R7 已判读：**机器层实锤**——8 卡 HCCL 裸探针（无框架代码）10-27 PASS → 10-30 三次 8/8 全败 EI0015，且失败时 NPU 全空闲、无租户占用。代码/配置/流程全部排除，故障面在 HCCL 驱动/UB 平面，等机器层修复或独占窗口。
+- Current owner: **蓝区**。Status: R8 交付已回传（6 组只读证据 + udmac 节点批量重建/UDMA 高频活动/kvaf_cpu_service 持有 d1e6，npu-smi -t error-code 本机不支持已注明），附 /etc/hccl_rootinfo.json 空目录排查结论（排除为 EI0015 根因，MemFabric 专用非裸探针消费）。等蓝区整理管理员简报。
 
 ## 0. 目标与口径
 
@@ -680,6 +680,69 @@ ps aux | grep -iE 'urma|hccn|device_manage|ascend' | grep -v grep | head -20
 
 - 证据到手后蓝区整理成给机器管理员的简报；机器层修复/重启由用户协调，**绿区不执行任何修复动作**。
 - 修复后验收 = 重跑 `hccl_probe_8npu.sh` 8/8 PASS → 再跑一次 R6-1 复现命令确认整网。
+### R8 交付（绿区，2026-10-30 01:48~01:52）
+
+**执行时间**：2026-10-30 01:48:57 CST 起。命令全部执行（只读，未动任何状态、未重启任何服务）。`npu-smi info -t error-code` 与 `npu-smi info -t health` 在本机 npu-smi 25.6.rc2 上不支持（提示 `Error parameter of -t`，可用 type 列表见 usage，无 error-code/health 项），已用 `npu-smi info` 全量 + 其余命令替代，注明差异。
+
+**1. dmesg（urma/ub/hccl/npu/hccs 过滤，尾部）**：
+```text
+[Oct 30 01:45:42-01:46:05] ubase 00005/00007/00008/00009/0000a/0000c/0000e: UDMA: current mm released.  (高频循环)
+[Oct 30 01:45:42-01:46:05] ubase 0000a/00007/00009/0000c/0000e/00008/00005: UDMA: JFR sleep time = 1000 us. (高频循环)
+[Oct 30 01:45:43] ubase 00007/00009/0000c: UDMA: opt 14/15 no need to process
+```
+→ UDMA/ubase 层在取证窗口有持续高频活动（`current mm released` + `JFR sleep time` 每 ~100ms 循环）。未捕获 hccl/npu 报错关键字。
+
+**2. npu-smi 健康/错误码**：`-t health`/`-t error-code` 本机不支持（见上）。`npu-smi info` 全量：8 卡 **Health 全 OK**，NPU Util 全 0%，HBM 每卡 ~4.79GB/98304MB 常驻（无进程）。Process 表：8 卡全部 `No running processes found`。
+
+**3. /dev/uburma 设备节点现状**（关键，对照 R7 的 mtime 线索）：
+```text
+crw-rw-rw-. 509,0  udmac0d1e2  2026-10-30 01:49:50   <- 取证窗口内刚刷新
+crw-rw-rw-. 509,4  udmac0d1e3  2026-10-30 01:49:51
+crw-rw-rw-. 509,3  udmac0d1e4  2026-10-30 01:49:51
+crw-rw-rw-. 509,2  udmac0d1e5  2026-10-30 01:49:50
+crw-rw-rw-. 509,1  udmac0d1e6  2026-10-23 01:21  (旧节点，未刷新)
+crw-rw-rw-. 509,5  udmac1d1e2  2026-10-30 01:49:51
+crw-rw-rw-. 509,9  udmac1d1e3  2026-10-30 01:49:51
+crw-rw-rw-. 509,8  udmac1d1e4  2026-10-30 01:49:51
+crw-rw-rw-. 509,7  udmac1d1e5  2026-10-30 01:49:51
+crw-rw-rw-. 509,6  udmac1d1e6  2026-10-22 03:36  (旧节点，未刷新)
+```
+→ **d1e2~d1e5 八个节点（每 DIE 4 个）在 01:49:50-51 批量重新创建**（R7 时 00:32、R8 前 01:48:48 也刷新过）。3 秒间隔重查 mtime 未再变。d1e6 两个节点保持 10-22/10-23 旧 mtime（未参与刷新）。udev monitor（4s，subsystem=uburma）无事件输出；`grep urma /etc/udev/rules.d /lib/udev/rules.d` 无规则；模块：`ipourma 86016 0`、`uburma 188416 3`、`ubcore 638976 8 asdrv_dms,asdrv_ub,asdrv_trs,ubagg,ipourma,uburma,udma,asdrv_dpa`。
+
+**4. last/登录痕迹**：
+```text
+root pts/17 90.253.68.139  Oct 30 01:34-01:40
+root pts/16 90.253.68.215  Oct 29 20:14  still logged in
+root pts/15 90.253.68.215  Oct 29 20:13  still logged in
+root pts/14 90.253.68.215  Oct 29 19:35  still logged in
+root pts/13 90.253.68.215  Oct 29 19:23  still logged in
+root pts/12 90.255.30.183  Oct 29 19:22  still logged in
+root pts/11 90.255.26.67   Oct 29 19:09  still logged in
+root pts/7  90.253.68.139  Oct 29 04:25  still logged in
+root pts/6  90.255.129.35  Oct 29 02:17  still logged in
+... (另 pts/5,10 90.255.129.35; pts/9 90.255.26.67; pts/8 90.255.213.113 均 still logged in)
+```
+→ 多用户多会话（90.253.68.215 四路、90.255.129.35 三路、90.255.26.67 两路等）。`ls -lt /home/`：fjj(10-30 01:46)、lsj(10-29 19:55)、wzh(10-29 19:31)、w00919836(10-29 19:28)、lcg(10-29 19:27)、hbz(10-29 01:33)。
+
+**5. docker ps + npu 快照**：
+```text
+vllm-wzh Up 6h | deepseek-v41-rc2-a5-20261029-175627 Up 7h | deepseek-v41-950dt-2 Up 20h
+deepseek-v41-950dt Up 21h | dsa-full Up 6h | a5-nds-parameter Up 7h
+```
+npu-smi info 全量：8 卡 OK、0% util、无 running process（见 2）。
+
+**6. 驱动/服务进程**：
+```text
+root 182921  kvaf_cpu_service ./build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999 --ub-device udmac0d1e6 --eid-index 0   <- 持有 /dev/uburma（唯一 holder）
+root 1776834 docker run -it --name deepseek-v41-950dt-2 ... --device /dev/uburma ... quay.io/ascend/vllm-ascend:v0.30.0rc2-a5-openeuler bash  (pts/7, Oct29 起)
+内核线程: ubase_ae2~ae7(D 状态, Oct22 起) + ubase_ae3 + ubase_ae5 + ubase_ae6 + kworker ubcore-device-wq
+```
+→ 唯一 /dev/uburma holder = `kvaf_cpu_service`（udmac0d1e6，10-22 旧节点），宿主 PID 182921。deepseek-v41-950dt-2 容器持有 `--device /dev/uburma`（但容器内 ps 无业务进程，仅 bash+rsyslogd）。
+
+**补充：udmac 节点刷新源追查**：udmac d1e2~d1e5 节点在 01:48:48、01:49:50 连续两个时刻批量重建（R7 00:32 亦刷新），而 d1e6 旧节点（10-22/10-23）不受影响。刷新时无进程新建、udev 无事件、无规则文件 → 指向**内核/驱动层周期性重建 UDMA 设备节点**（ubcore/uburma 模块在跑），非用户态创建。与 EI0015 故障窗口（10-27→10-30）在时间上重叠，供机器管理员核查驱动 25.6.rc2 的 UDMA 节点管理行为。
+
+**回传判读落点**：6 组命令全部执行（2 组 npu-smi 子命令本机不支持已注明替代）；机器层证据（UDMA 高频活动 + udmac 节点批量重建 + kvaf_cpu_service 持有 d1e6）已采集，供蓝区整理管理员简报。绿区未执行任何修复动作（按派单预案）。
+
 
 ## §R5 判读（蓝区，2026-10-29）
 

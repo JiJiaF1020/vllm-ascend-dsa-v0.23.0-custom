@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **蓝区**。Status: **§R15 已交付**（R15-0：/home/models/..._99 不存在，两 ckpt 前提失效，实际全走 /data/model 同路径；R15-1：今日重放 R11-D 复现同签名=机器未劣化；R15-2：只留 MODEL_PATH 仍 EI0006×13 ⇒ MODEL_PATH 值排除，只剩 env 机制轴，等 R16）。R9 阳性落袋不变；bench 基线 0/8。
+- Current owner: **绿区**。Status: §R15 已判读（**两前提坍塌**：MODEL_PATH 统一（va.env 第 23 行）；**va.env 本身 export 12 个 smoke env**，R11-D 非零 env 组，R15-2 仅 MODEL_PATH 仍 EI0006 ⇒ "env 集合"轴也坍塌；真实分界线 = va.env 独有的变量集合 D）+ **§R16 派单已发**（R16-0 cat va.env 取 D；R16-1 融合配方验证 = va.env+我们的值覆盖；R17 = fjj+BENCH 同配方预案）。流程教训入库：环境断言必须以原文/env 回传为准。R9 阳性落袋不变；bench 0/9。
 
 ## 0. 目标与口径
 
@@ -1539,6 +1539,79 @@ CONFIG_MISSING_A  (左侧 /home/models/..._99 不存在，diff 前提失效)
 ```
 
 - **补充取证**：`/home/models/` 在宿主机与容器内均不存在；R11-D 与 R14-1 的 commands.json 实际 model 均指向 `/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731/`（同一路径，非两 ckpt）。va.env 第 23 行 export `VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731/`。
+
+## §R15 判读（蓝区，2026-10-30）
+
+### 裁决（两个前提坍塌，归因重置）
+
+1. **MODEL_PATH 轴排除**：`/home/models/...99` 不存在，va.env 第 23 行统一 MODEL_PATH ⇒ 所有 run（含 R11-D）同模型同 ckpt。
+2. **「env 集合」轴坍塌（归因重置）**：va.env **本身 export 12 个 smoke env**（绿区 source 后实测残留 12 个）——R11-D/R15-1 从来不是"零 env"组；R15-2（仅 MODEL_PATH、其余 15 个全 unset）**仍 EI0006** ⇒ "有 env 就崩"不成立。真正的分界线是 **va.env 里的变量集合 D（我们从未设过的那些）**：R15-1（D 在）profile 过、R15-2（D 不在）profile 崩，且 R9 的 05:09 RUN_OK 也是 va.env 配方跑通的（完整 generate + 8×DRAIN_OK）。
+3. **R15-1 今日忠实复现 R11-D 签名**（EI0006=0、DP1 1004×4、hang）⇒ 机器状态无劣化；且 R11-D 从来就不是 PASS 组（1004 挂，0 DRAIN）。
+4. **流程教训入库**：R12-1 交付声称"va.env unset 全部 smoke 旋钮"为**误报**，R12~R15 四轮梯子建立在错误前提上（蓝区未要求原文核验，责任各半）。纪律：**凡"环境里没有 X"类断言，必须以 `env|grep` / 文件原文回传为准，口头确认不作数**。
+5. 崩溃相位不变（determine_available_memory 的 EP8 all-gather 首连）；bench 0/9 到 generate。
+
+### 判读落点
+
+D 集合内容 = 下轮 R16-0 的 `cat va.env`（免费、决定性）。工作假设：**va.env 配方（R9 已证全通）+ 我们的值覆盖 = 可用 bench 配方**；R16-1 直接验证 profile 相位；过则 R17 换 fjj 仓 + BENCH=1 落 bench 基线。
+
+## §R16 派单：va.env 原文取证 + 融合配方验证（蓝区，2026-10-30）
+
+### R16-0 · 只读取证（va.env 全文——D 集合内容）
+
+```bash
+cat /home/w00919836/va.env
+echo ====
+bash -c 'source /home/w00919836/va.env && env | grep -E "^VLLM_ASCEND_SMOKE" | sort'
+echo ====
+grep -inE "hccl|hccl_|HCCL" /home/w00919836/va.env || echo "no HCCL vars in va.env"
+```
+
+原文回传三块。判读用：D = 残量清单 − {我们已设的 10 个}；重点核对 D 是否含 DSA_*（RESIDENT_BUDGET/MAX_ACTIVE_REQS/PROMPT_BUDGET_THRESHOLDS/INDEXER_MLA_BLOCK_RATIO）、GRAPH_CAPTURE_SIZES、RUN_MODE、ENABLE_MTP* 等 init 路径变量。
+
+### R16-1 · 融合配方验证（va.env + 我们的值覆盖，scp-va + 作者数据面）
+
+```bash
+cd /home/w00919836/scp-opt
+source /home/w00919836/va.env
+# 在 va.env 之后覆盖我们的值（后 export 者生效）：
+export VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731
+export VLLM_ASCEND_SMOKE_DATASET=chinese_40k
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=16
+export VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=40960
+export VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS=40960
+export VLLM_ASCEND_SMOKE_MAX_TOKENS=1024
+export VLLM_ASCEND_SMOKE_ENABLE_CHUNKED_PREFILL=1
+export VLLM_ASCEND_SMOKE_GPU_MEMORY_UTILIZATION=0.97
+export VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0
+export VLLM_ASCEND_SMOKE_ENABLE_CPU_BINDING=0
+# 不导 BENCH（scp-va 的 envs.py 不认识会报 Unknown smoke environment variables）
+python3 -c "import vllm_ascend; print(vllm_ascend.__file__)"   # 须指向 scp-va
+python3 tools/profile_pool_inference.py --du-store-prefault read \
+  --framework-repo /home/w00919836/scp-va \
+  --output tmp/r16-vaenv-fusion --sample-port 19090 --sample-worker 0 \
+  --remote-config ../dp4tp2.json --no-perf --payload-layers 78 \
+  --du-pipeline-mib 1 --store-bytes $((128*1024*1024*1024)) \
+  --pool-start-timeout 600 --pool-count 2 --numa-node 0 --pool-b-numa-node 2 \
+  --store-numa-nodes local \
+  --pool-cpus '2-17,21-36,40-55,59-74,78-93' \
+  --pool-b-cpus '192-207,211-226,230-245,249-264,268-283' \
+  --shared-port-gather --du-devices udmac1d1e3 --du-eid-indices 0 \
+  --pool-b-du-devices udmac0d1e3 --pool-b-du-eid-indices 0 \
+  2>&1 | tee /home/fjj/pp_r16.log
+echo "RC=$?"
+```
+
+- **过 profile 相位**（EI0006=0；后续 1004 或 RUN_OK 都算过）⇒ **融合配方成立**：D 变量是 profile 相位的保护因子。记录，进 R17。
+- **EI0006** ⇒ D 非保护因子、保护机制在 va.env 别处（如非 smoke 变量/启动顺序）→ 停，回传，蓝区重估。
+- 1004 ⇒ 白名单重跑（≤2 次，≥5 分钟静置）。
+
+### R17 预案（R16-1 过 profile 后执行，派单时按此骨架）
+
+fjj 框架仓（`--framework-repo /home/fjj/vllm-ascend-remote-offload` + `PYTHONPATH` 前置 fjj）+ **R16-1 完全相同的 env 状态** + `export VLLM_ASCEND_SMOKE_BENCH=1` + 输出目录 `tmp/r17-fjj-bench-vaenv`。过 = bench 基线同轮落袋（§R10 通过标准第 3/4 条原文回传 metrics）。
+
+### 通过标准与回传格式
+
+同 §R15（R16-0 三块原文必回；R16-1 附 import 路径、EI0006 计数/相位、日志路径、起止时间）。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

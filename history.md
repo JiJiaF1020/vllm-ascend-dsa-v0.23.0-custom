@@ -151,3 +151,9 @@
 **派单**（commit a2f2353）：R15-0 只读取证（两 ckpt config.json diff + 数据集 prompt 数）；R15-1 今日重放 R11-D（机器状态对照，EI0006=机器劣化转取证）；R15-2 R14-1 只留 MODEL_PATH（过=三 add-back 梯子；崩=依 R15-0 换 ckpt 路径一刀分）。白名单=1004（≤2 次重跑）。
 
 **交付**（commit a2f235346114c9a3b7ae59b7f1c5cc606fac1c4c）：R15-0：`/home/models/GLM-5.2-w4a4c8-mxfp4_99` 在本机/容器均不存在（CONFIG_MISSING_A），「两 ckpt 可能不同」前提失效；所有实际运行（R11-D/R14-1/R15-1/R15-2）经 va.env 覆盖为同一 `/data/model/...A5-0731/`；数据集 chinese_23k/40k 各仅 1 条超长 prompt。R15-1（va.env 全 env，EI0006=0）：DP1 专属 1004×4 + EngineCore patch_shm_broadcast 挂起，最终 Engine core initialization failed，与 R11-D 09:02 原跑（09:06:14 失败）签名一致 ⇒ 机器未劣化，R11-D 配方仍有效。R15-2（只留 MODEL_PATH，其余 15 个 smoke env 全 unset）：EI0006×13（13:16:09，HcclAllGather，worker.py:564，1004=0/RUN_OK=0）⇒ **MODEL_PATH 值排除（两轮同值仅 env 集不同）**，只剩 env 机制轴 → 蓝区定 R16。**执行要点**：蓝区称「va.env 已 unset 其余 9 个」不实，va.env 只 unset 4 项后 re-export 大部分（source 后残留 12 个 smoke env）；已显式 unset 全部 VLLM_ASCEND_SMOKE_* 兑现「只留 MODEL_PATH」。数据出处：/home/fjj/pp_r15a.log + pp_r15b.log + tmp/r15-r11d-replay/ + tmp/r15-only-modelpath/。
+
+## §R15 交付判读 + §R16 va.env 融合配方派单（2026-10-30）
+
+**R15 交付**（commit 84c304e45）：R15-0——/home/models/...99 不存在，va.env 第 23 行统一 MODEL_PATH=/data/model/...A5-0731 ⇒ 两 ckpt 前提失效；23k/40k 数据集各仅 1 条 prompt。R15-1——今日重放 R11-D 复现同签名（EI0006=0、DP1 1004×4、hang）=机器未劣化。R15-2——仅留 MODEL_PATH（source 后显式 unset 其余 15 个）仍 EI0006×13。
+**R15 判读**（蓝区）：两前提坍塌——MODEL_PATH 轴排除；**va.env 本身 export 12 个 smoke env**（R12-1"unset 全部"系误报）⇒ R11-D 非零 env 组，"env 集合"轴坍塌；真实分界线 = va.env 独有变量集合 D（R15-1 D 在→profile 过；R15-2 D 不在→profile 崩；R9 RUN_OK 同为 va.env 配方）。流程教训：环境断言必须以 env|grep/文件原文为准，口头确认不作数（R12~R15 四轮梯子的错误前提，蓝绿各半责）。
+**R16 派单**：R16-0 cat va.env 原文+残量清单+HCCL grep（D 集合内容，免费决定性）；R16-1 融合配方=source va.env 后覆盖我们 10 个值（scp-va+作者数据面），过 profile ⇒ 配方成立；R17 预案=fjj 仓+BENCH=1 同配方落 bench 基线。

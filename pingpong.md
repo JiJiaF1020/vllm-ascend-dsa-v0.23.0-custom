@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: R7 派单已发出（间歇性鉴别：HCCL 裸探针 + 机器占用取证 + 复现重试×3），等绿区回传。R6 已判读：作者现场逐字复现仍 EI0015，且时间线证明故障间歇性（绿区 10-27/10-28 败 → 作者 10-28 04:07 过 → 绿区 10-29 败），同机多租户干扰（他容器 v0.30 作业、他人 write-bench 占用我方 udmac1d1e3）为头号嫌疑。
+- Current owner: **蓝区**。Status: R7 交付已回传（8 卡 HCCL 裸探针 3 次 8/8 全败 EI0015，R2 时同脚本 8/8 PASS → 机器层实锤；取证期 NPU 全空闲排除租户当前占用；R7-2 按预案未执行）。等蓝区协调独占窗口/机器层修复。
 
 ## 0. 目标与口径
 
@@ -535,6 +535,68 @@ bash /home/fjj/hccl_probe_8npu.sh 2>&1 | tail -20
 - **任一过** ⇒ 阳性；成功/失败时刻的占用对照即根因证据；后续在独占窗口跑验收轮。
 - **探针败** ⇒ 机器层实锤；蓝区协调用户找机器管理员/错峰。
 - **探针全过 + 3 败** ⇒ 阴性；蓝区转向 vLLM EP 建链代码层（eager + ASCEND_LAUNCH_BLOCKING=1 抓精确栈作为下一轮）。
+
+## §R7 交付（绿区，2026-10-30 00:40）
+
+### 结论
+
+**机器层实锤（探针败）**：8 卡 HCCL 裸探针（`hccl_probe_8npu.sh`，无任何 vLLM/框架代码）**连续 3 次 8/8 全败 EI0015**（00:24 / 00:29 / 00:34），而**同一脚本在 R2 时（10-27）8/8 PASS**。按派单判读预案命中「**任一探针失败 ⇒ 机器层/租户干扰实锤，本轮停止，只回传 R7-0/R7-1**」——**R7-2 复现未执行**（探针败则不再烧模型装载）。
+
+### R7-0 占用取证（3 次尝试前均做，原文摘要）
+
+- **[a] 00:23:17**：docker 6 容器（vllm-wzh up5h、deepseek-v41-rc2-a5 up6h、deepseek-v41-950dt-2 up19h、deepseek-v41-950dt up20h、dsa-full up5h、a5-nds-parameter up5h）；npu-smi 8/8 NPU **0% util、HBM ~4.76G/卡 空闲常驻、No running processes found**；ps 无 urma/vllm/write-bench/mock_pool 业务进程（仅系统 python + docker 交互会话）；ss **无 19000-20099 端口监听**。
+- **[b] 00:28:57**：ps 同上（仅 deepseek-v41-950dt-2 的 docker run 交互会话 + vllm-wzh docker exec 会话）；ss 无 19000-20099 端口。
+- **[c] 00:34:37**：ps 同上；ss 无 19000-20099 端口。
+
+→ **三次取证期间 NPU 全部空闲、无租户进程占用、无端口占用**。排除「此刻被他人占用导致干扰」这一解释。
+
+### R7-1 8 卡 HCCL 裸探针（3 次，全 8/8 失败）
+
+脚本：`/home/fjj/hccl_probe_8npu.sh`（容器 dsa-full 内，8 进程各绑 1 卡，`dist.init_process_group("hccl")` + `dist.all_gather`）。
+
+- **probe1 00:24**（00:24:20 失败）：8/8 init_process_group OK（0.0-1.1s）；8/8 all_gather EI0015。
+- **probe2 00:29**（00:29:19 失败）：8/8 init OK（0.0s）；8/8 all_gather EI0015。
+- **probe3 00:34**（00:34:59 失败）：8/8 init OK（0.0-0.6s）；8/8 all_gather EI0015。
+
+**每 rank 失败签名**（rank0 为例，其余 7 个同构）：
+```
+[rank0] init_process_group OK in 0.6s
+[rank0]: RuntimeError: create_config:../torch_npu/csrc/distributed/HCCLUtils.cpp:140
+         HCCL function error: hcclCommInitRootInfoConfig(numRanks, &rootInfo, rank, config, &(comm->hcclComm_)), error code is 4
+[rank0]: [ERROR] ... ERR02200 DIST call hccl api failed.
+[rank0]: [PID: ...] ... Communication_Error_Ranktable_Detect(EI0015):
+         Failed to collect cluster information of the communicator based on rootInfo detection.
+         Reason: RootInfoDetect failed.
+         Solution: 1. Check whether all ranks in the communicator have delivered the communicator creation interface.
+         2. Check the connectivity between the host networks of all nodes and the server node.
+         3. Check whether the HCCL_SOCKET_IFNAME environment variable of all nodes is correctly configured.
+         4. Increase the timeout by configuring the HCCL_CONNECT_TIMEOUT environment variable.
+```
+
+**关键定位**：`init_process_group` 8/8 全 OK（TCP/网络层正常），失败点精确在 **all_gather 时 HCCL comm 建立（`hcclCommInitRootInfoConfig` error code 4 / RootInfoDetect）**——与模型侧 MoE 建链失败（R4-3/R5/R6 的 `token_dispatcher.py:472` → 同一 HCCLUtils.cpp:140 error 4）**完全同源**。
+
+**与 R2 对照（决定性）**：pingpong.md R2 交付（1253 行）留存同脚本实测：**8/8 PASS**，init 0.0-1.4s，all_gather 1.7-2.5s，verify=True。同一脚本 10-27 PASS → 10-30 全败。
+
+**探针日志**：`/home/fjj/r7_evidence/probe{1,2,3}/hccl_probe.rank{0-7}.log`（probe1/rank0 被后续探针覆盖，其余 23 份完整）。
+
+### 通过标准逐条
+
+- R7-1 8/8 PASS？ **否**（3 次均 8/8 失败 EI0015）。
+- R7-2 逐字复现？ **未执行**（按派单「任一探针失败 ⇒ 本轮停止，只回传 R7-0/R7-1」）。
+- 探针失败时机器占用状态？ **NPU 全空闲、无租户进程、无端口占用**（R7-0 三次取证）。
+
+### 判读落点
+
+- **机器层实锤**：裸 HCCL 探针（无框架代码）8/8 全败，且 3 次间隔 12 分钟持续失败 → **非瞬时抖动、非租户当前占用**（取证期间机器空闲）。
+- **故障从 10-27（PASS）到 10-30（全败）之间出现**。候选面：HCCL 驱动/RootInfoDetect 服务层、URMA 设备层、或 10-29 他人 v0.30 容器作业对机器做过的变更。
+- 附注：`/dev/uburma/` 下 udmac 设备节点 mtime 出现 10-30 00:32 刷新（`udmac0d1e2~5`、`udmac1d1e2~5` 等 9 个节点，而 `udmac0d1e6`/`udmac1d1e6` 为 10-22 旧节点）——URMA 设备节点近期有重新创建活动，作为机器层变更线索一并回传。
+- 下一步建议（供蓝区）：按预案「蓝区协调用户找机器管理员/错峰」——需在独占窗口或机器层修复后再跑验收轮。
+
+### 环境事实入库（后续轮次直接引用）
+
+- `hccl_probe_8npu.sh` 是有效机器层探针：10-27 PASS（R2 留存），10-30 3×全败 EI0015。
+- R7 日志资产：`/home/fjj/r7_evidence/`（r7_0_summary.txt + probe{1,2,3}/ 共 24 份 rank 日志）。
+- 驱动 25.6.rc2 / 固件 7.0.9.100.203 / Chip V120（10-30 当前值，与 R6 时一致——期间未变）。
 
 ## §R5 判读（蓝区，2026-10-29）
 

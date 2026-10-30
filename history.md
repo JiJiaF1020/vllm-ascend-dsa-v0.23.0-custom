@@ -117,3 +117,11 @@
 **R12 交付**（commit 309113df0/e70df42ea）：R12-0 取证——NPU 2/3 EID 健康（19 EID×2 轮）、udmac 节点 09:42 周期性重建、dmesg 无错误码。R12-1 主实验（fjj 框架+BENCH=1+作者数据面）EI0006 复现（10:02:15 齐射，0×1004，0 DRAIN）→ 数据面配置排除。
 **R12 判读**（蓝区）：第二次自我修正（数据面排除）；决定性矩阵收敛为 smoke env 集合 × 框架代码双变量。本地全量代码 diff（cac7e2c4e→HEAD）仅 bench 口径（simple_test.py +155/envs.py +4），不在 init 路径；**发现 enable_cpu_binding 默认 True**（simple_test.py:42/288→ascend_config.py:171→worker.py:786 bind_cpus→cpu_binding.py:792-798 线程绑核+NPU IRQ smp_affinity 机器级重定向），作者 scp-va 为 binding=none（R5-0），共享机争核致 HCCL 首连超时，机制吻合，升头号嫌疑。共享机纪律入库：fjj 仓 smoke 必须显式 ENABLE_CPU_BINDING=0。
 **R13 派单**：R13-1 = R12-1 逐字 + VLLM_ASCEND_SMOKE_ENABLE_CPU_BINDING=0（头号嫌疑直测，过则根因坐实+bench 基线同轮落袋，须回传绑核关闭 grep 核验）；R13-2 = env 集合二分（BENCH=0 其余保留）预案。
+
+## §R13 绑核嫌疑直测 + env 集合二分（2026-10-30）
+
+**派单**（commit b34e7a3）：R13-1 = R12-1 逐字 + 唯一变量 ENABLE_CPU_BINDING=0（头号嫌疑直测），过则 绑核根因坐实 + bench 基线落袋；EI0006 复现 则 R13-2 env 二分（BENCH=0）。白名单=1004。
+
+**交付**（commit 待回填）：R13-1 关绑核 EI0006 复现（10:54:05 齐射×20），绑核关闭核验通过（enable_cpu_binding=False 生效，无绑核执行痕迹）→ 绑核排除；R13-2 BENCH=0 仍 复现（11:03:16 ×20）→ bench env/代码路径排除，触发面在基础 env 集合或更底层。两轮均 0×1004，0 DRAIN，崩溃相位同签名（KV-cache init MoE 前向 HcclAllGather）。数据出处：/home/fjj/pp_r13.log + pp_r13b.log + tmp/r13-nobind-bench/ + tmp/r13-envbis-nobench/。
+
+**判读**（蓝区）：待定（给定下一轮 逐项 unset 二分表）。

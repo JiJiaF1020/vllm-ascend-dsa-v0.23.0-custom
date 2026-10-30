@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R12 已判读（数据面配置排除；蓝区本地核实代码差分仅 bench 口径且不在 init 路径，**头号嫌疑 = enable_cpu_binding 默认 True 致 worker 绑核 + NPU IRQ 重定向在共享机争核**，作者 binding=none）+ **§R13 派单已发**（R13-1 关绑核直测，过则根因坐实 + bench 基线同轮落袋；R13-2 env 二分预案）。R9 阳性落袋不变。共享机纪律：fjj 仓 smoke 必须显式 ENABLE_CPU_BINDING=0。
+- Current owner: **绿区**。Status: §R13 已交付（R13-1 关绑核 EI0006 仍复现，绑核排除（头号嫌疑证伪）；R13-2 BENCH=0 仍复现，触发面在基础 env 集合）。R9 阳性落袋不变；bench 基线仍未落袋。
 
 ## 0. 目标与口径
 
@@ -1179,6 +1179,61 @@ R13-1 逐字但 `VLLM_ASCEND_SMOKE_BENCH=0`（其余 env 全保留，ENABLE_CPU_
 ### 通过标准（同 §R10）与回传格式
 
 同 §R12 派单（含绑核核验 grep 输出、import 路径、metrics 原文若过、日志路径、起止时间）。
+
+## §R13 交付：R13-1 关绑核 EI0006 仍复现→绑核排除；R13-2 BENCH=0 仍复现→触发面在基础 env 集合（绿区，2026-10-30 10:49~11:10）
+
+### 结论(先行)
+
+- **R13-1 关绑核直测**(fjj 框架+BENCH=1+作者数据面+`VLLM_ASCEND_SMOKE_ENABLE_CPU_BINDING=0`):**EI0006 复现**(10:54:05 齐射×20,0×1004,0 DRAIN)。绑核关闭核验通过:`enable_cpu_binding=False` 生效(additional_config 原文),model.log **无** CpuAlloc/Bind cpus/sched_setaffinity/IRQ 绑核执行痕迹 → **绑核嫌疑排除**(R12 判读头号嫌疑证伪,第三次自我修正)。
+- **R13-2 env 集合二分**(R13-1 逐字但 `VLLM_ASCEND_SMOKE_BENCH=0`):**EI0006 复现**(11:03:16 齐射×20,0×1004,0 DRAIN) → **bench env/代码路径排除**,触发面在**基础 env 集合**(MAX_NUM_BATCHED_TOKENS/CHUNKED_PREFILL/GPU_MEM 等)或更底层(命中预案「复现 ⇒ 基础 env 集合,蓝区给下一轮逐项 unset 二分表」)。
+- 两轮崩溃相位全程一致:KV-cache init dummy run 的 MoE 前向 `HcclAllGather → EI0006`(worker.py:564 determine_available_memory,与 R10/R11-A/B/R12-1 完全同签名同相位)。
+- bench 基线仍未落袋(0/7 轮跑到 generate);无 metrics 可回传(§R13 通过标准第 3/4 条不适用)。
+
+### import 路径核验
+
+va.env 后 `vllm_ascend.__file__` 指向 scp-va → prepend `PYTHONPATH=/home/fjj/vllm-ascend-remote-offload` 后 = `/home/fjj/vllm-ascend-remote-offload/vllm_ascend/__init__.py`(fjj,**生效**,两轮均核验)。
+
+### 数据面配置核验(remote-shared.json 原文关键字段)
+
+作者数据面逐字:du 19090-19097、store 19080-19087、device EID=`...0001f8/...00f1f8`(作者 dp4tp2.json 值)、pool_eid=`...0a0bf8/...080bf8`、graph_capture=startup_pad、put_transport=urma_read、udmac1d1e3。
+
+### R13-1 · 关绑核直测(唯一变量 ENABLE_CPU_BINDING=0)——EI0006 复现
+
+- **绑核关闭核验**(派单要求 grep 原文):model.log `grep -inE "CpuAlloc|Bind cpus|bind_cpus|sched_setaffinity|SMP affinity|IRQ|msi"`(排除 config 行)**零命中**;additional_config 原文 `enable_cpu_binding': False`(×4 EngineCore 一致)→ 绑核确实关闭。
+- **执行起止**:DSA_EXECUTION_PLAN **10:50:16**(权重装载成功×8)→ **10:54:05-06 EI0006 齐射**。summary 未生成、无 metrics、无 DRAIN。
+- **EI0006 证据**:EI0006×20(8 worker×2 + 4 EngineCore×1),首个=DP1_TP0_EP2(pid 1514522)10:54:05.286;全部 10:54:05-06。**acl_graph 计数=16**(graph 模式);**0×1004**。
+- **崩溃栈**(model.log:1578-1688,首个 EI0006 前,DP1_TP0_EP2):`worker.py:564 determine_available_memory →`(EngineCore) `core.py:1195 _initialize_kv_caches → core.py:257 → abstract.py:147 collective_rpc` → Worker `npu_dynamic_mx_quant → HcclAllGather → EI0006`。
+
+### R13-2 · env 集合二分(唯一变量 BENCH=0,ENABLE_CPU_BINDING=0 保留)——EI0006 复现
+
+- **执行起止**:DSA_EXECUTION_PLAN **10:59:30**(权重装载成功×8)→ **11:03:16-17 EI0006 齐射**。summary 未生成、无 metrics、无 DRAIN。
+- **EI0006 证据**:EI0006×20,首个=DP3_TP0_EP6(pid 1528715)11:03:16.722;全部 11:03:16-17。**0×1004**,0 DRAIN。`enable_cpu_binding=False` 保留生效。
+- **崩溃相位**:与 R13-1 完全相同(worker.py:564 determine_available_memory 内 MoE 前向 HcclAllGather)。
+- **判读**:BENCH=0 后崩溃仍在 init 的 determine_available_memory(早于任何 bench 逻辑)→ **触发面不在 bench env/代码路径(min_tokens/ignore_eos/metrics)**,在基础 env 集合或更底层。
+
+### 各步 RC / summary
+
+| 步 | 结果 | EI0006 | 1004 | DRAIN_OK | summary/metrics |
+|----|------|--------|------|----------|-----------------|
+| R13-1 | EI0006 复现(绑核排除) | 20 | 0 | 0 | 未生成/无 |
+| R13-2 | EI0006 复现(BENCH=0 排除) | 20 | 0 | 0 | 未生成/无 |
+
+### 通过标准逐条
+
+- 第 1 条(工具 RC=0、summary RUN_OK、model.log 生成文本):**不满足**——RC 未出(profile_pool_inference 挂死轮询,清场 kill),summary 未生成。
+- 第 2 条(DSA_SHARED_DRAIN_OK ×8):**不满足**——0 DRAIN。
+- 第 3/4 条(metrics 与报告块):**不适用**——未到 generate,无 metrics。
+
+### 失败处置
+
+- EI0006 复现(R13-1/R13-2 均):按派单预案。R13-1 复现→执行 R13-2;R13-2 复现→**停,回传,蓝区给定下一轮逐项 unset 二分表**。EI0006 不在白名单(仅 1004),不重试。
+- 1004:两轮均 0 次。
+
+### 环境状态(交付时)
+
+- 清场完成:无残留 urma/VLLM/python 进程(PCP pmda 2 个系统守护除外);端口 19090-19097/20000-20007 空闲;/dev/shm 373G 可用。
+- 日志资产:`/home/fjj/pp_r13.log`(R13-1 tee)+ `pp_r13b.log`(R13-2 tee);`tmp/r13-nobind-bench/raw/model.log` + `tmp/r13-envbis-nobench/raw/model.log` + pool 日志。
+- 待蓝区判读:R13-1 绑核排除(头号嫌疑证伪);R13-2 触发面在基础 env 集合或更底层,蓝区给定下一轮逐项 unset 二分表。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

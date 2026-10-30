@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R22 已派单（2026-10-30）——蓝区完成 TTFT 时钟域修复（`first_token_latency` 优先，`first_token_ts` 路径降级为 fallback，本地 mock 全过）。R22 派单 = R22a offload-off 对照轮（+20% 自提升基线）+ R22b shm 广播块泄漏取证消化回执。R21 判读：bench 管道已验收（RUN_OK/8×DRAIN/metrics 全产出），TTFT 负值 = 统计链路 bug 非引擎问题；绿区时钟域证据链完整（源码行号 + 数学闭合 -1.7926e12 逐位吻合），蓝区采纳 `first_token_latency` 方案。
+- Current owner: **蓝区**。Status: §R22 已交付（2026-10-31）——R22-0 三块取证原文已回传（shm 写侧源码+停摆窗口+告警计数，支持 connect 后停摆嫌疑，DP2 为独立崩溃路径）；R22-1 offload-off 对照轮 RUN_OK+8/8 DRAIN+metrics 全产出，TTFT 修复验证通过（ttft avg=45337ms 全正，0<ttft<wallx1000 满足）；offload-off 相对 on 略快 -1.1s/-1.4% tps/tpot avg -2.5ms，判读=40K prefill 主导期 offload 无净收益分支，自提升口径本配方不成立，待蓝区裁决。
 
 ## 0. 目标与口径
 
@@ -2198,6 +2198,227 @@ echo "RC=$?"
 
 - R22-1 vs R20/R21 基线（wall=81.5s、tps=50.2、tpot avg≈135-136ms/min≈29ms）做同口径对比：offload-on 相对 offload-off 的吞吐/TPOT 变化即「自提升」口径分子分母；
 - 若 offload-off 反而更慢或持平，判读时区分「40K prefill 主导期 offload 无收益」与「decode 稳态收益」，不下一刀切结论。
+
+## §R22 交付：offload-off 对照轮 + TTFT 修复验证通过 + shm 挂起取证（绿区，2026-10-31 01:20~01:25）
+
+### R22-0 · 三块取证原文（只读）
+
+**块1 · shm_broadcast.py 结构与写侧源码**（vllm 容器内 /vllm-workspace/vllm/vllm/distributed/device_communicators/shm_broadcast.py，941 行）
+
+结构（grep -n '^class \|    def \|No available'）:
+```
+96:    "No available shared memory broadcast block found "
+104:class SpinCondition:
+121:    def __init__(
+173:    def record_read(self):
+176:    def cancel(self):
+183:    def wait(self, timeout_ms: int | None = None) -> None:
+210:    def notify(self):
+216:class ShmRingBuffer:
+317:    def handle(self):
+325:    def __reduce__(self):
+331:    def __del__(self):
+338:    def get_data(self, current_idx: int):
+346:    def get_metadata(self, current_idx: int):
+355:class Handle:
+365:class MessageQueue:
+366:    def __init__(
+457:    def export_handle(self) -> Handle:
+461:    def create_from_handle(handle: Handle, rank) -> "MessageQueue":
+508:    def wait_until_ready(self):
+541:    def shutdown(self):
+549:    def acquire_write(self, timeout: float | None = None):
+665:    def acquire_read(
+727:    def enqueue(self, obj, timeout: float | None = None):
+772:    def dequeue(
+800:    def recv(socket: zmq.Socket, timeout: float | None) -> Any:
+807:    def broadcast_object(self, obj=None):
+814:    def create_from_process_group_single_reader(
+860:    def create_from_process_group(
+```
+
+acquire_write（549-664）全文（写侧等所有 reader 读完才写新块）：
+```python
+    def acquire_write(self, timeout: float | None = None):
+        assert self._is_writer, "Only writers can acquire write"
+        start_time = time.monotonic()
+        n_warning = 1
+        while True:
+            with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
+                def check():
+                    memory_fence()
+                    read_count = sum(metadata_buffer[1:])
+                    written_flag = metadata_buffer[0]
+                    return not (written_flag and read_count != self.buffer.n_reader)
+                if SPINLOOP_EXT_ENABLED and not check():
+                    spinloop(metadata_buffer, check, timeout=SPINLOOP_TIMEOUT_SECONDS)
+                if not check():
+                    sched_yield()
+                    elapsed = time.monotonic() - start_time
+                    if timeout is not None and elapsed > timeout:
+                        raise TimeoutError
+                    if elapsed > VLLM_RINGBUFFER_WARNING_INTERVAL * n_warning:
+                        logger.info(LONG_WAIT_TIME_LOG_MSG, VLLM_RINGBUFFER_WARNING_INTERVAL)
+                        n_warning += 1
+                    continue
+                metadata_buffer[0] = 0
+                with self.buffer.get_data(self.current_idx) as buf:
+                    yield buf
+                for i in range(1, self.buffer.n_reader + 1):
+                    metadata_buffer[i] = 0
+                memory_fence()
+                metadata_buffer[0] = 1
+                memory_fence()
+                self.current_idx = (self.current_idx + 1) % self.buffer.max_chunks
+                break
+```
+
+acquire_read（665-726）核心推进逻辑（读侧等 written_flag 且未读）：
+```python
+    def acquire_read(self, timeout=None, indefinite=False):
+        assert self._is_local_reader, "Only readers can acquire read"
+        read_timeout = self.ReadTimeoutWithWarnings(timeout=timeout, should_warn=not indefinite)
+        with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
+            while True:
+                def check():
+                    memory_fence()
+                    read_flag = metadata_buffer[self.local_reader_rank + 1]
+                    written_flag = metadata_buffer[0]
+                    return not (not written_flag or read_flag)
+                if SPINLOOP_EXT_ENABLED and not check():
+                    spinloop(metadata_buffer[0 : self.local_reader_rank + 1], check, timeout=SPINLOOP_TIMEOUT_SECONDS)
+                if not check():
+                    self._spin_condition.wait(timeout_ms=read_timeout.timeout_ms())
+                    if self.shutting_down:
+                        raise RuntimeError("cancelled")
+                    if read_timeout.should_warn():
+                        logger.info(LONG_WAIT_TIME_LOG_MSG, VLLM_RINGBUFFER_WARNING_INTERVAL)
+                    continue
+                with self.buffer.get_data(self.current_idx) as buf:
+                    yield buf
+                metadata_buffer[self.local_reader_rank + 1] = 1
+                memory_fence()
+                self.current_idx = (self.current_idx + 1) % self.buffer.max_chunks
+                self._spin_condition.record_read()
+                break
+```
+
+dequeue（772-799）全文：
+```python
+    def dequeue(self, timeout=None, indefinite=False):
+        """Read from message queue with optional timeout (in seconds)"""
+        if self._is_local_reader:
+            with self.acquire_read(timeout, indefinite) as buf:
+                overflow = buf[0] == 1
+                if not overflow:
+                    offset = 3
+                    buf_count = from_bytes_big(buf[1:offset])
+                    all_buffers = []
+                    for i in range(buf_count):
+                        buf_offset = offset + 4
+                        buf_len = from_bytes_big(buf[offset:buf_offset])
+                        offset = buf_offset + buf_len
+                        all_buffers.append(buf[buf_offset:offset])
+                    obj = pickle.loads(all_buffers[0], buffers=all_buffers[1:])
+            if overflow:
+                obj = MessageQueue.recv(self.local_socket, timeout)
+        elif self._is_remote_reader:
+            obj = MessageQueue.recv(self.remote_socket, timeout)
+        else:
+            raise RuntimeError("Only readers can dequeue")
+        return obj
+```
+
+**块2 · R19-1 停摆窗口（17:46:09 CONNECT_OK → 17:47:28 首告警间 worker 输出）**
+
+日志 /home/w00919836/scp-opt/tmp/r19-bench-bs4/raw/model.log（515696 字节，17:53 落盘）
+
+17:46:00-06 全部 worker 持续正常推进 DSA_STORE_PUT_DONE（每步 pages+16 稳定递增）：
+```
+17:46:00 pages=[166] versions=[11]  x8 worker
+17:46:01 pages=[182] versions=[12]
+17:46:02 pages=[198] versions=[13]
+17:46:03 pages=[214] versions=[14]
+17:46:04 pages=[230] versions=[15]
+17:46:05 pages=[246] versions=[16]
+17:46:06 pages=[262] versions=[17]
+```
+17:46:09 全部 8 worker 完成 DSA_SHARED_CONNECT_BEGIN+OK（endpoint=127.0.0.1:19090-19097，wire=6 backend=real_store group_gather=full groups=21），之后立即打 MTP draft graph replay：
+```
+2622:(Worker_DP1_TP0_EP2) INFO 17:46:09 [acl_graph.py:284] Replaying aclgraph
+2623:(Worker_DP0_TP0_EP0) INFO 17:46:09 [llm_base_proposer.py:651] [GLM MTP graph] Replaying separate merged 3-step draft graph (with device preprocessing)
+2624:(Worker_DP2_TP0_EP4) INFO 17:46:09 [llm_base_proposer.py:651] ...
+2625:(Worker_DP3_TP0_EP6) INFO 17:46:09 [llm_base_proposer.py:651] ...
+2626:(Worker_DP1_TP0_EP2) INFO 17:46:09 [llm_base_proposer.py:651] ...
+```
+17:46:09 后挂起 worker（DP0/1/3）无任何后续输出（2627-3092 行无 Worker_DP[013] 行），直到 17:52:29 SIGTERM（multiproc_executor.py:790 Parent process exited）。DP2_TP0_EP4 (pid=1999194) 独立崩溃路径：17:46:26 WorkerProc hit an exception（multiproc_executor.py:987）→ 17:46:31 DP2 EngineCore SIGTERM。
+
+**块3 · 各挂起 EngineCore 告警总数与最后时间戳**（告警源 = patch_shm_broadcast.py:74，非 shm_broadcast.py）：
+```
+== EngineCore_DP0 == count: 6 | last: 17:52:28 [patch_shm_broadcast.py:74] No available shared memory broadcast block found in 60 seconds...
+== EngineCore_DP1 == count: 6 | last: 17:52:28 [patch_shm_broadcast.py:74] ...
+== EngineCore_DP3 == count: 6 | last: 17:52:28 [patch_shm_broadcast.py:74] ...
+（全部 18 条告警最后一条均 17:52:28；worker 侧 0 条 No available 告警）
+```
+
+R22-0 判读（供蓝区消化）：挂起 worker（DP0/1/3）在 17:46:09 DSA_SHARED_CONNECT_OK + MTP draft graph replay 打出后完全静默，写侧 acquire_write 的 60s 告警（patch_shm_broadcast.py:74）只是下游症状。支持蓝区「worker 在 DSA_SHARED_CONNECT_OK 之后同步点停摆（非块泄漏）」头号嫌疑；且 DP2 是独立异常崩溃路径（WorkerProc exception 17:46:26），与 DP0/1/3 静默挂起不同故障面。
+
+### R22-1 · offload-off 对照轮（ENABLE_OFFLOAD=0）
+
+前置门禁核验：本机业务进程 0 / 端口 19080-19097+20000-20007 全空 / NPU 8 卡全空闲 / shm 384G 可用 383G（清理本机 R21+R2 Pool 残留 256G+）。注意：wzh 的 URMA source 探针（run_urma_source_matrix.sh, host-device udmac0d1e3, 他人作业）在场，未 kill；NPU4 无业务进程，未冲突。
+
+env | grep SMOKE | sort 原文（唯一变量 ENABLE_OFFLOAD=0 生效）：
+```
+VLLM_ASCEND_SMOKE_BENCH=1
+VLLM_ASCEND_SMOKE_DATASET=chinese_40k
+VLLM_ASCEND_SMOKE_ENABLE_CHUNKED_PREFILL=1
+VLLM_ASCEND_SMOKE_ENABLE_CPU_BINDING=0
+VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=0
+VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0
+VLLM_ASCEND_SMOKE_GPU_MEMORY_UTILIZATION=0.97
+VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=40960
+VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS=2048
+VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=4
+VLLM_ASCEND_SMOKE_MAX_TOKENS=256
+VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731
+```
+import 核验：vllm_ascend=/home/fjj/vllm-ascend-remote-offload/vllm_ascend/__init__.py（fjj 仓优先）✓；启动 2026-10-31 01:20:28。
+
+通过标准逐条核验：
+
+1. RUN_OK + 8/8 DRAIN_OK：summary.txt=`RUN_OK model_exit=0; owned Pool processes stopped`；DRAIN_OK 8 条（select=2413-2489 gather_only=0 scatter_sfa=7239-7467 real_store=1）——offload-off 下仍 real_store=1 + 8x DSA_STORE_CLOSED（requests=4 put_pages=97344 inference=hbm_full_remote_shared remote_get=1）：ENABLE_OFFLOAD=0 关的是显式 offload 路径，remote shared store 链路本身仍走（shared KV 池仍启用）。
+2. 4 rank metrics + metrics.json：4x[dsa-smoke][metrics][dp=0..3] + [global] 全产出；metrics.json 实际路径 /home/fjj/vllm-ascend-remote-offload/results/1p/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared.metrics.json（PYTHONPATH 前置 fjj 仓，写框架仓 results/）。
+3. TTFT 修复验证通过：ttft_ms 全部分位数满足 0 < ttft < global_wall_sx1000（=80379ms）——avg=45337.078 / min=18556.319 / p50=45444.065 / p90=71814.133 / p99=71822.782 / max=71822.782，不再负值。40K chunked prefill 下 TTFT 数秒~数十秒符合预期（per_request 逐条 18556→71822 递增 = 4 请求顺序 prefill 肩叠）。
+4. 原文回传：
+```
+[dsa-smoke][metrics][global] {"dp_size": 4, "requests": 16, "output_tokens": 4096, "global_wall_s": 80.379, "request_throughput_rps": 0.199, "global_output_tps": 50.96, "ttft_ms": {"avg": 45337.078, "min": 18556.319, "p50": 45444.065, "p90": 71814.133, "p99": 71822.782, "max": 71822.782}, "tpot_ms": {"avg": 132.716, "min": 27.639, "p50": 132.335, "p90": 237.928, "p99": 238.159, "max": 238.159}, "tpot_under_50ms": false}
+============ DSA Smoke Benchmark Result (global, offline) ============
+Successful requests: 16
+Benchmark duration (s): 80.38
+Total generated tokens: 4096
+Request throughput (req/s): 0.199
+Output token throughput (tok/s): 50.96
+TTFT (ms): avg=45337.078ms p50=45444.065 p90=71814.133 p99=71822.782 max=71822.782
+TPOT (ms, excl. 1st token): avg=132.716ms p50=132.335 p90=237.928 p99=238.159 max=238.159
+========================================================================
+```
+
+同口径对比（offload-on vs offload-off）：
+
+| 指标 | R21 offload-on | R22-1 offload-off | 差 |
+|---|---|---|---|
+| global_wall_s | 81.481 | 80.379 | -1.10s |
+| output_tps | 50.27 | 50.96 | +0.69 |
+| tpot avg ms | 135.234 | 132.716 | -2.52 |
+| tpot p50 ms | 134.919 | 132.335 | -2.58 |
+| tpot min ms | 28.725 | 27.639 | -1.09 |
+| ttft avg ms | -1.79e12（坏） | 45337.078（修复验证通过） | - |
+| EI0006 / 1004 | 0 / 0（复跑后） | 0 / 0 | - |
+| patch_shm 挂起 | 0 | 0 | - |
+
+判读（命中预案分支）：offload-off 相对 offload-on 略快（wall -1.1s / tps +1.4% / tpot avg -2.5ms），差距约 1.4% 量级。按预案区分：本配方 40K prefill 主导期（TTFT约45s 占 wall 80s 过半），offload 在 prefill 主导期无净收益甚至微负——remote shared store 写路径（put_pages=97344 scatter_sfa=7239）仍有固定开销；decode 稳态（tpot min约28-29ms 干净 decode 步）两者基本持平。offload 自提升口径在本配方下不成立（-1.4%），需蓝区裁决：是否属「40K prefill 主导期 offload 无收益」分支（不下一刀切结论），或需 100K x 1K 长 decode 尾段配方测 decode 稳态收益。
+
+失败处置：无 TTFT 越界（修复已验证）、无 patch_shm 挂起复现（0 次）、无 1004/EI0006。机器已清场（owned Pool 已停止）。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

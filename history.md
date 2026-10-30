@@ -157,3 +157,11 @@
 **R15 交付**（commit 84c304e45）：R15-0——/home/models/...99 不存在，va.env 第 23 行统一 MODEL_PATH=/data/model/...A5-0731 ⇒ 两 ckpt 前提失效；23k/40k 数据集各仅 1 条 prompt。R15-1——今日重放 R11-D 复现同签名（EI0006=0、DP1 1004×4、hang）=机器未劣化。R15-2——仅留 MODEL_PATH（source 后显式 unset 其余 15 个）仍 EI0006×13。
 **R15 判读**（蓝区）：两前提坍塌——MODEL_PATH 轴排除；**va.env 本身 export 12 个 smoke env**（R12-1"unset 全部"系误报）⇒ R11-D 非零 env 组，"env 集合"轴坍塌；真实分界线 = va.env 独有变量集合 D（R15-1 D 在→profile 过；R15-2 D 不在→profile 崩；R9 RUN_OK 同为 va.env 配方）。流程教训：环境断言必须以 env|grep/文件原文为准，口头确认不作数（R12~R15 四轮梯子的错误前提，蓝绿各半责）。
 **R16 派单**：R16-0 cat va.env 原文+残量清单+HCCL grep（D 集合内容，免费决定性）；R16-1 融合配方=source va.env 后覆盖我们 10 个值（scp-va+作者数据面），过 profile ⇒ 配方成立；R17 预案=fjj 仓+BENCH=1 同配方落 bench 基线。
+
+## §R16 va.env 原文取证 + 融合配方验证（2026-10-30）
+
+**派单**（commit 02e7288）：R16-0 只读取证（va.env 全文/D 集合/HCCL grep）；R16-1 融合配方验证（source va.env + 我们的 10 值覆盖，scp-va+作者数据面）；R17 预案=fjj 仓+BENCH=1 同配方落 bench 基线。
+
+**R16-0**：va.env 原文——13 个 smoke env（RUN_MODE=graph、MTP 3/1/1、DP4/TP2、MAX_NUM_BATCHED_TOKENS=2048、MAX_TOKENS=256、MODEL_PATH 尾斜杠、ASCEND_RT_VISIBLE_DEVICES=0-7）；D 集合无 DSA_RESIDENT_BUDGET/MAX_ACTIVE_REQS/PROMPT_BUDGET_THRESHOLDS/INDEXER_MLA_BLOCK_RATIO/GRAPH_CAPTURE_SIZES；非 smoke 独有 `VLLM_ASCEND_DSA_HOST_MSTX=0`（DSA 前缀）；**无 HCCL 变量**。
+
+**R16-1**（交付 commit __PLACEHOLDER__）：**EI0006（配方不成立）**——容器内跑（宿主无 vllm 修正），8 worker 权重装载成功（13:51:20，389.88 GiB）后 13:54:49 DP1_TP1_EP3 HcclAllGather 超时 EI0006，model.log 20 处，1004=0，summary RUN_FAILED。命中预案「EI0006 ⇒ D 非保护因子、保护机制在 va.env 别处（非 smoke 变量/启动顺序）→ 停回传」。与 R14-1/R15-2 同签名（worker.py:564 HcclAllGather），但相位在权重装载后。执行修正 3 项：宿主 python3 无 vllm→容器内跑；残留输出目录 FileExistsError→清理；/dev/shm 268G 残留 backing→清理。数据：/home/fjj/pp_r16.log + tmp/r16-vaenv-fusion/。

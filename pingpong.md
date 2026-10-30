@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R15 已判读（**两前提坍塌**：MODEL_PATH 统一（va.env 第 23 行）；**va.env 本身 export 12 个 smoke env**，R11-D 非零 env 组，R15-2 仅 MODEL_PATH 仍 EI0006 ⇒ "env 集合"轴也坍塌；真实分界线 = va.env 独有的变量集合 D）+ **§R16 派单已发**（R16-0 cat va.env 取 D；R16-1 融合配方验证 = va.env+我们的值覆盖；R17 = fjj+BENCH 同配方预案）。流程教训入库：环境断言必须以原文/env 回传为准。R9 阳性落袋不变；bench 0/9。
+- Current owner: **蓝区**。Status: §R16-1 已交付（EI0006×20，RUN_FAILED——va.env+我们值覆盖仍崩，D 非保护因子，保护机制在 va.env 别处）
 
 ## 0. 目标与口径
 
@@ -1612,6 +1612,84 @@ fjj 框架仓（`--framework-repo /home/fjj/vllm-ascend-remote-offload` + `PYTHO
 ### 通过标准与回传格式
 
 同 §R15（R16-0 三块原文必回；R16-1 附 import 路径、EI0006 计数/相位、日志路径、起止时间）。
+
+## §R16 交付：va.env 原文取证 + 融合配方验证（绿区，2026-10-30）
+
+### R16-0 · va.env 原文（三块原文必回）
+
+**① va.env 全文**：
+```bash
+# /home/w00919836/va.env
+# --- PYTHONPATH / OPP ---
+export PYTHONPATH=/home/w00919836/scp-opt/torch_extension:$PWD/scp-va:$PYTHONPATH
+export KVCACHE_SCATTER_COPY_C8_INSTALL_OPP_PATH=/home/w00919836/scp-opt/opp_c8
+export KVCACHE_SCATTER_COPY_INSTALL_OPP_PATH=/home/w00919836/scp-opt/opp
+export ASCEND_CUSTOM_OPP_PATH="$KVCACHE_SCATTER_COPY_C8_INSTALL_OPP_PATH/vendors/customize:$KVCACHE_SCATTER_COPY_INSTALL_OPP_PATH/vendors/customize:${ASCEND_CUSTOM_OPP_PATH}"
+# --- unset 9 项 ---
+unset VLLM_ASCEND_SMOKE_ENABLE_PROFILE
+unset VLLM_ASCEND_SMOKE_PROFILE_DIR
+unset VLLM_ASCEND_SMOKE_RUN_MODE
+unset VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD
+unset VLLM_ASCEND_SMOKE_MAX_MODEL_LEN
+unset VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS
+unset VLLM_ASCEND_SMOKE_ENABLE_CHUNKED_PREFILL
+unset VLLM_LOGGING_LEVEL
+unset ASCEND_LAUNCH_BLOCKING
+# --- re-export ---
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# export VLLM_ASCEND_SMOKE_MODEL_PATH=/home/w00919836/GLM-5.2-w4a4c8-mxfp4-5-layer
+# export VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731/
+export VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731/
+export VLLM_ASCEND_SMOKE_DATA_PARALLEL_SIZE=4
+export VLLM_ASCEND_SMOKE_TENSOR_PARALLEL_SIZE=2
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=16
+# export VLLM_ASCEND_SMOKE_RUN_MODE=eager
+export VLLM_ASCEND_SMOKE_RUN_MODE=graph
+export VLLM_ASCEND_SMOKE_MTP_NUM_SPECULATIVE_TOKENS=3
+export VLLM_ASCEND_SMOKE_ENABLE_MTP_GRAPH=1
+export VLLM_ASCEND_SMOKE_ENABLE_MTP=1
+# important
+#export VLLM_ASCEND_SMOKE_ENABLE_PROFILE=1
+#export VLLM_ASCEND_SMOKE_PROFILE_DIR=./profiles/no_mtp
+export VLLM_ASCEND_DSA_HOST_MSTX=0
+export VLLM_ASCEND_SMOKE_DATASET=chinese_40k
+# export VLLM_ASCEND_SMOKE_DATASET=chinese_23k
+export VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=40960
+export VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS=$((2048))
+export VLLM_ASCEND_SMOKE_ENABLE_CHUNKED_PREFILL=1
+export VLLM_ASCEND_SMOKE_MAX_TOKENS=256
+```
+
+**② source 后 smoke env 全集（env | grep '^VLLM_ASCEND_SMOKE' | sort，共 13 个）**：
+```
+VLLM_ASCEND_SMOKE_DATA_PARALLEL_SIZE=4
+VLLM_ASCEND_SMOKE_DATASET=chinese_40k
+VLLM_ASCEND_SMOKE_ENABLE_CHUNKED_PREFILL=1
+VLLM_ASCEND_SMOKE_ENABLE_MTP=1
+VLLM_ASCEND_SMOKE_ENABLE_MTP_GRAPH=1
+VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=40960
+VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS=2048
+VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=16
+VLLM_ASCEND_SMOKE_MAX_TOKENS=256
+VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731/
+VLLM_ASCEND_SMOKE_MTP_NUM_SPECULATIVE_TOKENS=3
+VLLM_ASCEND_SMOKE_RUN_MODE=graph
+VLLM_ASCEND_SMOKE_TENSOR_PARALLEL_SIZE=2
+```
+**D 集合（va.env 独有、我们未设的）**：RUN_MODE=graph、MTP_NUM_SPECULATIVE_TOKENS=3、ENABLE_MTP_GRAPH=1、ENABLE_MTP=1、DATA_PARALLEL_SIZE=4、TENSOR_PARALLEL_SIZE=2、MAX_NUM_BATCHED_TOKENS=2048、MAX_TOKENS=256、MODEL_PATH 尾斜杠、ASCEND_RT_VISIBLE_DEVICES=0-7；非 smoke 独有：`VLLM_ASCEND_DSA_HOST_MSTX=0`（DSA 前缀）、VLLM_LOGGING_LEVEL/ASCEND_LAUNCH_BLOCKING 被 unset。**不含 DSA_RESIDENT_BUDGET/MAX_ACTIVE_REQS/PROMPT_BUDGET_THRESHOLDS/INDEXER_MLA_BLOCK_RATIO/GRAPH_CAPTURE_SIZES。**
+
+**③ HCCL grep**：`no HCCL vars in va.env`（va.env 无任何 hccl 变量，作者 va.env 无 HCCL 调优）。
+
+### R16-1 · 融合配方验证结果：EI0006（配方不成立）
+
+- **命令**：派单逐字（容器 dsa-full 内，cd /home/w00919836/scp-opt → source va.env → 覆盖我们 10 值 → python3 tools/profile_pool_inference.py ... --no-perf --output tmp/r16-vaenv-fusion）。**执行环境修正**：宿主 /usr/bin/python3 无 vllm（ModuleNotFoundError），必须在 dsa-full 容器内跑（容器 /vllm-workspace/vllm 有）。
+- **import 核验**：vllm=`/vllm-workspace/vllm/vllm/__init__.py`；vllm_ascend=`/home/w00919836/scp-va/vllm_ascend/__init__.py`（scp-va ✓）。
+- **时间线**：13:50:16 8 worker 启动 → 13:51:20 权重装载开始（checkpoint 389.88 GiB，EXT4，auto-prefetch 关）→ 13:54:49 **EI0006**（DP1_TP1_EP3 pid=1731115，HcclAllGather 超时，`Communication_Error_Get_Socket: Getting socket times out`）→ 主进程挂起等 Pool 收尾，绿区 kill（signal 15）触发 POOL_ROI_REPORT。
+- **summary.txt**：`RUN_FAILED`（KeyboardInterrupt: signal 15），PERF_DISABLED。
+- **EI0006 计数**：model.log 中 20 处（8 worker 崩溃 + 栈回溯重复引用）；**1004=0**（RaGetDevEidInfoNum 未命中）。
+- **判读**：命中派单预案 **EI0006 ⇒ D 非保护因子、保护机制在 va.env 别处（非 smoke 变量/启动顺序）→ 停，回传，蓝区重估**。融合配方（va.env 全集+我们的值覆盖）仍崩，与 R14-1/R15-2 同签名（worker.py:564 HcclAllGather）。注意：R16-1 的 EI0006 相位在**权重装载后**（13:51:20 起 loading，13:54:49 崩），非 init 早期。
+- **日志**：/home/fjj/pp_r16.log；raw/model.log；raw/summary.txt（/home/w00919836/scp-opt/tmp/r16-vaenv-fusion/）。
+- **清场**：shm 已清（372G 可用），端口 19080-19087/19090-19097/20000-20007 全空闲，无残留进程。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

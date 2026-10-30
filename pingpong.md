@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R17+R18 已判读（**EI0006 根因闭环：batched2048+chunked1；bench 数据面已真跑通 64 请求满 decode**；新阻塞=收尾 shm 广播写侧块耗尽挂起，泄漏∝请求数×decode 步数假设）+ **§R19 派单已发**（R19-0 挂起上下文只读；R19-1 BS4 止血基线 [R9 包线内]；R19-2/3 递减预案；根修走代码线）。bench 0/11。
+- Current owner: **蓝区**。Status: §R19 交付已回传（R19-0 挂起取证；R19-1 BS4×1024 **patch_shm 挂起复现** DRAIN=2/8、泄漏∝decode 步数坐实；R19-2 BS4×256 **8/8 DRAIN_OK + 挂起 0 次**——短 decode 彻底消除收尾挂起，但撞框架仓收尾统计 bug `simple_test.py:451 first_token_time AttributeError`(vLLM 已改名 first_token_ts, 717c396 新代码) → metrics 未产出、基线仍未落袋；修复该属性名即可收 baseline）。bench 0/11。
 
 ## 0. 目标与口径
 
@@ -1860,6 +1860,43 @@ R19-1 逐字但 `export VLLM_ASCEND_SMOKE_MAX_TOKENS=256`（R9 同长度），�
 ### 原则与回传格式
 
 止血线每轮含完整清场（R18 挂起后进程树需人工核净）；通过标准同 §R10 第 3/4 条（metrics 原文必回）；附 env 核验/import 路径/日志路径/起止时间。
+
+## §R19 交付：BS4 止血线两档——挂起复现坐实泄漏∝步数 + 短 decode 8/8 DRAIN 消除挂起（绿区，2026-10-30 17:41~18:02）
+
+### R19-0 · 只读取证（挂起上下文，r18-fjj-bench/raw/model.log）
+
+**1) 挂起报文前后文**：首个挂起 15:17:55，DP1/DP2/DP3 三 EngineCore（pid 1821824/1821830/1821836）60s 循环至 15:23:57 SIGTERM；报文前 5119-5121 行有 `RuntimeError: offline DP rank failed: dsa-dp-0=1`（simple_test.py:730 run_node_dp）。
+**2) 各 DP 组 store 关闭顺序**：仅 DP0 两 worker 15:16:54 `DSA_SHARED_DRAIN_OK` + `DSA_STORE_CLOSED requests=16 put_pages=389376 remote_get=1`；无 POOL.*CLOSE/shutting_down。
+**3) 挂起 worker 最后活动**：DP1/2/3 六 worker 全停在 15:16:32 `DSA_SHARED_CONNECT_OK groups=21` 后 `acl_graph.py:284 Replaying aclgraph` + `llm_base_proposer.py:651 Replaying MTP draft graph`，之后完全静默——卡在 graph replay 后同步点。
+
+### R19-1 · BS4×1024（tmp/r19-bench-bs4，日志 pp_r19.log）
+
+R18 逐字仅 BS16→BS4（MAX_NUM_SEQS=4）。**patch_shm 挂起复现**（命中预案「泄漏∝decode 步数而非请求数」→ 转 R19-2）：
+- EI0006=0 / code=1004=0（命中组合稳定）
+- **DRAIN_OK 仅 2/8（DP2 两 worker）** 17:46:27，`DSA_STORE_CLOSED requests=4 put_pages=97344 inference=hbm_full_remote_shared remote_get=1`
+- 挂起 EngineCore = **DP0/DP1/DP3**（R18 是 DP1/2/3 挂、DP0 正常 → 挂起组不对称且轮次间漂移，支持蓝区「某 reader 不再消费→块不回收」机制假设）
+- 首个挂起 17:47:28（DRAIN 后 61s），60s 循环 ×4；主进程 POOL_ROI_RUNNING 未收尾，人工清理
+- **BS4 全局 16 请求（R9 包线内）仍挂** → 泄漏∝decode 步数（1024）而非请求数（16）坐实
+
+### R19-2 · BS4×256（tmp/r19-bench-bs4-mt256，日志 pp_r19.log 被覆盖为 R19-2）
+
+**短 decode 消除挂起 + 撞框架仓收尾统计 bug**：
+- EI0006=0 / code=1004=0
+- **8/8 worker 全 DSA_SHARED_DRAIN_OK + DSA_STORE_CLOSED**（18:01:51，8 worker 全部 `requests=4 put_pages=97344 inference=hbm_full_remote_shared remote_get=1`，select≈2413-2527 scatter_sfa≈7239-7581）——**remote-offload 整网首次 8 worker 全 DRAIN 无挂起**
+- **patch_shm_broadcast 挂起 = 0 次**（短 decode 256 tokens 彻底消除收尾挂起，坐实泄漏∝步数）
+- overlap CSV 8 端口各 7239-7581 行，classify_union_mean_us ≈ 38.3-39.4µs
+- **但主进程 RUN_FAILED**：推理全部完成后 4 DP 在 `summarize_request_metrics`（simple_test.py:451）崩 `AttributeError: 'RequestStateStats' object has no attribute 'first_token_time'. Did you mean: 'first_token_ts'?` → summary.txt RUN_FAILED、`[dsa-smoke][metrics]`/metrics.json 未产出
+
+### 关键判定
+
+1. **收尾 shm 广播挂起 = 泄漏∝decode 步数，短 decode（256）可消除**：R19-1（1024）挂、R19-2（256）8/8 DRAIN 无挂起。蓝区「某 reader 不再消费→块不回收→写侧永久等」机制假设成立；泄漏量∝步数而非请求数。
+2. **新阻塞点 = 框架仓收尾统计代码 bug（蓝区修）**：`simple_test.py:451/454/455` 引用 `metrics.first_token_time`/`last_token_time`，但 vLLM 0.23.0 `RequestStateStats`（vllm/v1/metrics/stats.py:208-209）字段为 `first_token_ts`/`last_token_ts`。该函数由框架仓 R10 bench 口径新提交 `717c396`/`e6fd53b` 引入（作者 scp-va 仓 simple_test.py 无此函数，grep 无匹配）→ **代码 bug 而非环境问题**，改字段名即可收 baseline。
+3. R19-3（BS1×64）**不执行**：挂起已消除（非挂起问题），剩余为统计代码 bug。
+4. 通过标准逐条：①工具 RC 非 0（统计 bug）；②DRAIN 8/8（R19-2 达成）；③metrics 未产出（bug 阻断）；④metrics 原文无。
+
+**日志资产**：`/home/fjj/pp_r19.log`（R19-2 主日志，含 POOL_ROI/REPORT 原文）、`/home/w00919836/scp-opt/tmp/r19-bench-bs4/raw/model.log`（R19-1）、`/home/w00919836/scp-opt/tmp/r19-bench-bs4-mt256/raw/model.log`（R19-2 860KB 全链）、`summary.txt`/`run-status.json`（RUN_FAILED + graceful:true）、`raw/overlap-19*.csv`（8 端口满数据）。R19-1 残留 backing 已清（urma_mock DU 持 deleted FD 致 shm 269G→清后 373G）。
+
+**起止时间**：R19-1 17:41~17:53（人工清理收尾）、R19-2 17:57~18:02（自然结束）。机器已清场（进程 0、NPU 8 卡空闲、shm 373G）。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

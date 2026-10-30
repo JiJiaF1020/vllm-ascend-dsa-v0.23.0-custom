@@ -183,3 +183,8 @@
 **R18 交付**（fjj+BENCH=1 完整配方）：**整网数据面真跑通**——64 请求满 decode(~957 tok)、PUT/GET 真实（put_pages=389376、remote_get=1）、DRAIN_OK×2(DP0)、overlap CSV 14992 行(mean≈75µs)；但 3/4 EngineCore 收尾 `patch_shm_broadcast` 挂起 → metrics 未产出，基线未落袋（0/11）。
 **R18 判读**（蓝区）：本地读 patch_shm_broadcast.py——系 vllm shm_broadcast **读侧**补丁（5s 防 lost-notify），挂起为 **enqueue 写侧 60s 无空闲块**=某 reader 停消费→块不回收→写侧死等。泄漏∝请求数×decode 步数（R9 16req/256tok 净 / R18 64req/957tok 挂 / R17-2 teardown 挂）。止血优先：退回 R9 包线（BS4×DP4=16 请求）跑 BENCH=1 先落基线；块泄漏根修走代码线。
 **R19 派单**：R19-0 挂起上下文只读三块；R19-1 BS4 止血基线（过=基线落袋 BS4 口径）；R19-2 BS4+MT256（挂=泄漏∝步数）；R19-3 BS1+MT64（R9 精确包线）；全挂→代码线修 shm 块生命周期。
+
+## §R19 止血线两档：BS4×1024 挂起复现 + BS4×256 8/8 DRAIN 消除挂起（2026-10-30）
+
+**R19-1（BS4×1024，R18 逐字仅 BS16→BS4）**：EI0006=0/1004=0，DRAIN 仅 2/8（DP2），patch_shm_broadcast 挂起复现（DP0/1/3，首挂 17:47:28），泄漏∝decode 步数（1024）而非请求数（16）坐实。
+**R19-2（BS4×256）**：EI0006=0/1004=0，**8/8 worker 全 DRAIN_OK + STORE_CLOSED（requests=4 put_pages=97344 remote_get=1）+ patch_shm 挂起 0 次**——短 decode 彻底消除收尾挂起，坐实泄漏∝步数；overlap CSV 8 端口 7239-7581 行（classify_union_mean≈38-39µs）。**但收尾撞框架仓统计 bug**：simple_test.py:451 `first_token_time` AttributeError（vLLM 0.23.0 已改名 `first_token_ts`，stats.py:208），4 DP 全崩 → metrics 未产出、基线未落袋。该函数是框架仓 R10 bench 口径新提交 717c396/e6fd53b 引入（作者 va 仓无），改字段名即可收 baseline。R19-3（BS1×64）不执行（挂起已消除，非挂起问题）。

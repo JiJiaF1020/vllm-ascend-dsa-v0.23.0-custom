@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R10 已判读（EI0006=有 rank 未到达 EP8 all-gather 的超时齐射；主嫌疑=graph+MTP graph 首次上机，次嫌疑=数据面 e2/20000 段/eid json 差分）+ **§R11 派单已发**（隔离梯子：R11-0 取证 → A 原样重跑 → B eager 隔离 → C graph 去 MTP graph → D 回作者逐字配置）。R9 阳性落袋不变：整网 eager RUN_OK、机器层故障面清除。
+- Current owner: **绿区**。Status: §R11 已交付（隔离梯子全执行：R11-A 原样重跑 EI0006 稳定复现→非瞬时；R11-B eager EI0006 仍复现（acl_graph计数=0）→graph 非触发面；R11-D 作者配置 2 跑 EI0006=0 但前移 DP1 专属 RaGetDevEidInfoNum code=1004（KV-cache 绑定阶段，非瞬时））。等蓝区判读。R9 阳性落袋不变。
 
 ## 0. 目标与口径
 
@@ -866,6 +866,83 @@ R10 命令改两处：`export VLLM_ASCEND_SMOKE_RUN_MODE=graph`（保持默认�
 ### 回传格式
 
 追加「§R11 交付」节：R11-0 三块原文 + 执行到哪个分支、各步 RC + 通过标准逐条 + 关键日志行/路径 + 执行起止时间。bench 通过的步按 §R10 通过标准第 3/4 条原文回传 metrics global 行与报告块。
+
+## §R11 交付：隔离梯子全执行——EI0006 稳定复现(graph/eager 同崩),作者配置下 EI0006 消失但前移 DP1 专属 1004(绿区,2026-10-30 08:10~09:10)
+
+### 结论(先行)
+
+- **R11-A**(R10 原样重跑):EI0006 **稳定复现**(8 worker 08:26:50 齐射,EI0006×20)→ **瞬时排除**。
+- **R11-B**(`RUN_MODE=eager` 隔离 graph):EI0006 **仍复现**(8 worker 08:44:26 齐射,EI0006×20,**acl_graph 计数=0**,栈无 acl_graph.py)→ **graph 非触发面铁证**,跳过 R11-C。
+- **R11-D**(作者 scp-opt/va.env/dp4tp2.json/udmac1d1e3/19090 段,eager,跑 2 次):**EI0006=0(两跑均未出现)**——作者配置下 EI0006 消失;但前移为 **DP1 专属 `RaGetDevEidInfoNum failed code=1004`**(首跑 08:51 EngineCore_DP1×4;重跑 09:02 Worker_DP1_TP0×2+EngineCore_DP1×1),两跑均 0 DRAIN。
+- **梯子执行路径**:R11-0 → R11-A(复现)→ R11-B(复现)→ **R11-C 跳过**(B 复现)→ R11-D(两跑,均 1004 失败)。
+- **白名单处置**:EI0006 在 R11-A 一次性重跑内用尽(复现);R11-D 的 1004 属白名单,已重跑 1 次仍复现(非瞬时),按纪律不再无限重跑,停,回传证据。
+
+### R11-0 · 只读取证(三块原文摘要)
+
+对 `/home/fjj/a5-remote-offload-ops/tmp/r10-bench-bs16/raw/model.log`。
+
+**块1 每个 Worker_DP 07:26:45~07:29:18 最后行**:8 个 worker(DP0_TP0/DP0_TP1/DP1_TP0/DP1_TP1/DP2_TP0/DP2_TP1/DP3_TP0/DP3_TP1)最后日志行**全部**是 `10-30 07:29:18` 齐射 `Communication_Error_Get_Socket(EI0006): Getting socket times out...`(各 rank 时间 07:29:18.226~.330)。无 rank 例外。
+
+**块2 capture/warmup/acl_graph 标记**:配置确认 graph 路径(`speculative_config: {'method': 'mtp', 'num_speculative_tokens': 3, ...}`,`cudagraph_mode: FULL_DECODE_ONLY`,`graph_capture: 'startup_pad'`,`put_transport: urma_read`);8 个 worker 错误栈**全部**经 `/home/fjj/vllm-ascend-remote-offload/vllm_ascend/compilation/acl_graph.py:163 in __call__`。
+
+**块3 URMA/DSA 行**:8 个 store 全部 `DSA_STORE_OPEN_BEGIN` 正常(07:26:48~07:27:14);DP3_TP0 完整栈显示崩溃在 `profile_run → _dummy_run → _model_forward → acl_graph.__call__ → fused_moe → moe_comm_method → moe_mlp → npu_dynamic_quant(device_op.py:1318)` 处 EI0006。
+
+**判读落点**:无 rank 停在 URMA/DSA 数据面(数据面 OPEN 后全部进入 profile dummy run)→ 变量 2 不升主嫌疑;全体整齐走 graph 执行路径的 MoE EP8 all-gather 后齐射超时 → **变量 1(graph 路径)倾向坐实**——但 R11-B 证明 graph 非根因(见下),实际变量 1 仅「graph 首次上机」被证伪,根因在更底层 EP8 all-gather 建连本身。
+
+### R11-A · R10 原样重跑(瞬时排除)——EI0006 复现
+
+- 命令:逐字 §R10 执行命令,输出目录 `tmp/r11a-bench-bs16`,日志 `/home/fjj/pp_r11a.log`。
+- 前置:NPU 8/8 空闲无进程;端口 19080-19087/20000-20007 空闲;探针 `hccl_probe_8npu.sh` **8/8 PASS**(init 0.0s,all_gather 1.6-2.6s verify=True);清场(R10 残留 pool 进程+shm backing 全清)。
+- 执行起止:08:22:13(engine init)→ **08:26:50 EI0006 齐射**;summary `RUN_FAILED`(08:37,崩溃后 pool 轮询器被清场 kill 时写入 KeyboardInterrupt)。
+- **结果:8 worker 全部 08:26:50 齐射 EI0006(EI0006×20),与 R10 07:29:18 完全同签名同崩溃点**(MoE 前向 `npu_dynamic_quant`→HcclAllGather,经 acl_graph.py:163)。**EI0006 非瞬时,稳定复现**。
+- 日志:pp_r11a.log(08:22~08:37)、tmp/r11a-bench-bs16/raw/model.log。
+
+### R11-B · eager 隔离 graph(A 复现后)——EI0006 仍复现,graph 非触发面
+
+- 命令:R10 命令仅改 `export VLLM_ASCEND_SMOKE_RUN_MODE=eager`,输出 `tmp/r11b-bench-bs16-eager`,日志 `pp_r11b.log`。
+- 执行起止:08:39:55(engine init)→ **08:44:26 EI0006 齐射**;summary 未生成(崩溃后清场)。
+- **结果:8 worker 全部 08:44:26 齐射 EI0006(EI0006×20)**;栈 = `npu_dynamic_quant(device_op.py:1318)` 直接崩(经 torch._ops.__call__),**model.log 中 `acl_graph` 计数=0**(eager 无 graph 层)→ **graph(含 MTP graph)不是触发面,铁证**。
+- 由此 **R11-C(graph 去 MTP graph)跳过**(B 复现即进 D,派单分支)。
+
+### R11-D · 回作者逐字配置(B 也败后)——EI0006 消失,前移 DP1 专属 1004(两跑)
+
+- 命令:逐字 §R6-1(作者 `/home/w00919836/scp-opt` + `va.env` + `dp4tp2.json` + `udmac1d1e3/udmac0d1e3` + **19090 段** + `--du-store-prefault read` + `--pool-cpus/--pool-b-cpus`,eager),输出 `tmp/prefault-read-r11d`,日志 `/home/fjj/pp_r11d.log`。va.env 确认:PYTHONPATH=scp-opt/torch_extension+scp-va,ASCEND_RT_VISIBLE_DEVICES=0-7,unset 全部 smoke 旋钮。
+- **首跑(EI0006=0)**:`RaGetDevEidInfoNum failed code=1004`(08:51:33,EngineCore_DP1 崩,**1004×4**,全部集中在 **DP1**;DP1_TP1 有 1 个 `DSA_SHARED_DRAIN_OK`,其余 0)。1004 在白名单,清场后重跑。
+- **重跑(09:02:12 崩):EI0006=0**,`code=1004`(Worker_DP1_TP0_EP2×2 + EngineCore_DP1×1,**1004×3**,仍全集中 **DP1**),0 DRAIN。
+- **重跑 1004 完整栈**(model.log:1748-1806):
+  ```
+  initialize_kv_cache (model_runner_v1.py:4808)
+    → initialize_kv_cache_tensors (4894)
+      → _bind_dsa_split_kv_caches (5293)
+        → custom_ops_lib.aiv_urma_query_eids(str(self.device))
+          → RuntimeError: RaGetDevEidInfoNum failed code=1004
+  ```
+- **关键含义**:作者配置(19090 段/e2 设备/eid json)下 EI0006 **不出现**——R10 的 20000 段/udmac1d1e2/eid-probe-r1 json 配置差异与 EI0006 相关(印证蓝区次嫌疑「数据面 e2/20000 段/eid json 差分」);但前移到 **DP1 专属 KV-cache 绑定阶段 aiv_urma_query_eids 1004**(非瞬时,两跑复现),0 DRAIN,未到 generate。
+- pool 侧:双 Pool READY(`POOL_ROI_POOL_READY groups=['a','b']`),pool-a 正常收尾(tasks=0,因模型未到数据面即崩)。
+- 日志:pp_r11d.log、tmp/prefault-read-r11d/raw/model.log。
+
+### 各步 RC / summary
+
+| 步 | RC | summary | EI0006 计数 | 1004 计数 | DRAIN_OK |
+|----|----|---------|------------|-----------|----------|
+| R11-A | 1(脚本尾标,崩溃后清场写入) | RUN_FAILED | 20 | 0 | 0 |
+| R11-B | (崩溃后清场,无尾标) | 未生成 | 20 | 0 | 0 |
+| R11-D 首跑 | (崩溃后清场,无尾标) | 未生成 | 0 | 4(全 DP1) | 1(DP1_TP1) |
+| R11-D 重跑 | (崩溃后清场,无尾标) | 未生成 | 0 | 3(全 DP1) | 0 |
+
+### 通过标准逐条
+
+- R11-A「过⇒EI0006 瞬时落袋」:**不满足**(复现)→ 进 B。
+- R11-B「过⇒eager 基线落袋+坐实 graph 面」:**不满足**(复现)→ 进 D。
+- R11-C 未执行(B 复现,分支跳过)。
+- R11-D「过⇒与端口段/e2 设备/eid json 相关」:**部分命中**——EI0006 消失证明配置差异相关,但被 1004(DP1 专属,两跑复现)阻断未到 generate,不满足「RUN_OK + DRAIN_OK + metrics」完整通过。
+- 无任一 bench 通过步,故无 metrics global 行/报告块可回传(§R10 通过标准第 3/4 条不适用)。
+
+### 环境状态(交付时)
+
+- 清场完成:无残留 python/vllm/urma_pool 进程;NPU 8/8 空闲;端口段空闲;/dev/shm 373G 可用。
+- 日志资产:pp_r11a.log、pp_r11b.log、pp_r11d.log;tmp/r11a-bench-bs16/raw/、tmp/r11b-bench-bs16-eager/raw/、/home/w00919836/scp-opt/tmp/prefault-read-r11d/raw/。
+- 待蓝区判读:R11-D 的 DP1 专属 1004(`aiv_urma_query_eids` 在 KV-cache 绑定阶段)与作者 R6-1 时点的差异;或按 R8 模板补机器层取证(若判定 1004 为机器/驱动层问题)。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

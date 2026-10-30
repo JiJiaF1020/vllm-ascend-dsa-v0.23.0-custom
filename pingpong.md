@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R25 已交付（2026-10-31）——R25-1 BS16×1024 offload-on 解锁 R18 失败点（R25A_RC=0，8/8 DRAIN+挂起0，tps=126.81），R25-2 baseline 反超 +24.3%（tps 157.6 vs 126.81，tpot avg 184.6 vs 347.5ms）——offload-on 此配方=纯开销第二数据点，OOM 未触发，容量价值待 R26 100K×1K 验收配方验证。
+- Current owner: **绿区**。Status: §R25 已交付 + §R26 已排队（2026-10-31）——R25：BS16×1024 双轮对照，R25-1 offload-on 解锁 R18 失败点（8/8 DRAIN+挂起0，tps=126.81），R25-2 baseline 反超 +24.3%（tps 157.6，tpot avg 184.6 vs 347.5ms），OOM 未触发。**规格变更（用户定）：100K 取消，统一 40K×1K**。R26（紧接执行）= 在线 serving 拉齐 KVAF 负载形态：R26-0 取证工具 pool-only + remote-shared json；R26-1 `vllm serve` bring-up（DP4TP2EP8 + MTP3 graph + remote_shared 内联，serve 参数已从 build_llm_kwargs 精确生成）；R26-2 `vllm bench serve` 40K×1K 并发 16/64 两档（KVAF 同口径 JSON）。
 
 ## 0. 目标与口径
 
@@ -2607,6 +2607,88 @@ export VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=0
 | TTFT avg ms | 152579 | 163220 | +10641（+7.0%） |
 
 **判读（绿区按数据陈述，裁决交蓝区）**：BS16×1024 decode 主导口径下 **baseline 反超 offload-on +24.3%**（tps），tpot avg −46.9%——与 R23（BS4×256 prefill 主导）baseline 反超 +7.7% 同号且幅度更大，**offload-on 在此配方=纯开销坐实第二数据点**；「+20% 自提升」预期在 decode 主导口径下不成立且差距反号更大。offload 容量价值（R25 派单预案：R25-2 OOM 即直接证据）**未触发**——baseline 无 OOM 正常跑完（BS16×1024 ML43008 每卡可装下，8 worker 各 60.96GB），容量维度未到 HBM 上限，offload 容量收益待 100K×1K 或更大 BS 配方验证。TTFT baseline 略高（+7.0%）因 baseline 无 remote 预取/调度差异，属 prefill 肩相位噪声。R26 预案（100K×1K 验收配方：chinese_104k + ML≥105K + MT1024）方向不变，offload 收益预期收敛于容量维度（100K 长上下文 KV 超 HBM 时 offload 不可替代）。机器已清场。
+
+## §R26 派单：在线 serving 拉齐 KVAF 负载形态（40K×1K）（蓝区，2026-10-31）——**§R25 交付完成后执行**
+
+**规格变更（用户定）**：100K×1K 取消（八卡跑不了），验收/对照统一 **40K×1K**。R25 已覆盖离线 40K×1K；R26 把负载形态换成 KVAF 同款（在线 serving + `vllm bench serve`）。
+
+### R26-0 · 只读取证（先做，免费）
+
+```bash
+cd /home/w00919836/scp-opt
+# 块1 · 工具有没有 pool-only（只起 Pool 不跑推理）模式
+python3 tools/profile_pool_inference.py --help 2>&1 | head -100
+grep -nE "no.infer|pool.only|skip.*infer|serve|launch_model|run_inference" tools/profile_pool_inference.py | head -20
+# 块2 · R24 跑轮生成的 remote-shared json 路径与内容（serve 的 remote_shared 字段要用它）
+find /home/w00919836/scp-opt/tmp/r24-bench-bs4-mt1024-ml43008 -name '*.json' 2>/dev/null | head -10
+find /home/w00919836/scp-opt -maxdepth 2 -name '*remote*shared*.json' -o -maxdepth 2 -name 'dp4tp2*.json' 2>/dev/null | head
+cat <找到的 json>   # 原文回传
+```
+
+### R26-1 · 在线服务 bring-up（offload-on，容器内）
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /home/w00919836/va.env
+export PYTHONPATH=/home/fjj/vllm-ascend-remote-offload:$PYTHONPATH
+python3 -c "import vllm_ascend; print(vllm_ascend.__file__)"   # 须指向 fjj 仓
+
+# 1) 起 Pool（用 R26-0 块1 结论的 pool-only 命令；Pool 常驻、不跑推理）
+# 2) 起服务——remote_shared 字段内联 R26-0 块2 的 json 内容（替换 <REMOTE_SHARED_JSON_INLINE>）
+nohup vllm serve /data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731 \
+  --served-model-name glm52-dsa --host 0.0.0.0 --port 8000 \
+  --tensor-parallel-size 2 --pipeline-parallel-size 1 --data-parallel-size 4 \
+  --quantization ascend --seed 1024 --enable-expert-parallel \
+  --max-num-seqs 16 --max-model-len 43008 --max-num-batched-tokens 2048 \
+  --trust-remote-code --no-enable-prefix-caching --enable-chunked-prefill \
+  --gpu-memory-utilization 0.97 --block-size 128 --no-async-scheduling \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3,"draft_tensor_parallel_size":2,"enforce_eager":false}' \
+  --compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4,8,16,32,64],"pass_config":{"enable_sp":false}}' \
+  --additional-config '{"enable_cpu_binding":false,"dp_allreduce_on_npu":true,"enable_sparse_sfa_c8":true,"enable_sparse_li_c8":true,"dsa_sparse_config":{"enabled":true,"split_indexer_cache":true,"indexer_mla_block_ratio":3,"sparse_activation_tokens":8192,"prompt_budget_thresholds":[32768,65536],"resident_budget_tokens":[8192,12288,12288],"max_active_reqs":256,"hot_cpu_block_multiple":1.0,"enable_row_mode_decode_graph":true,"trace_points":{"enabled":false,"points":["first_sample"],"ranks":[0]},"placement":"hbm_full_remote_shared","remote_shared":<REMOTE_SHARED_JSON_INLINE>}}' \
+  > /home/fjj/pp_r26_serve.log 2>&1 &
+
+# 3) 等健康（最长 20 分钟）
+for i in $(seq 1 600); do curl -s localhost:8000/health && break || sleep 2; done
+curl -s localhost:8000/v1/models
+```
+
+**蓝区提醒**：仓内 `serve_dsa.sh` 有「DP>1 + MTP3 需 eager」的脚本级限制，但离线 DP4+MTP3+graph 已实证可跑——先试上面的 graph 档；起不来则回退 eager 档（`--enforce-eager`、speculative-config 加 `"enforce_eager":true`、去掉 `--compilation-config`），两档报错都原文回传。`max_model_len=43008` 纪律保持（40K+1024 不 clamp）。
+
+### R26-2 · 官方 bench 打流（KVAF 同口径）
+
+```bash
+mkdir -p /home/fjj/r26_serving
+# 档1 · 并发 16（对齐离线 BS16 齐射口径）
+vllm bench serve --model glm52-dsa --host localhost --port 8000 \
+  --dataset-name random --random-input-len 40000 --random-output-len 1024 --ignore-eos \
+  --num-prompts 16 --request-rate inf --max-concurrency 16 \
+  --save-result --result-dir /home/fjj/r26_serving --result-filename r26_c16.json 2>&1 | tee /home/fjj/pp_r26_bench_c16.log
+# 档2 · 并发 64（大 batch 压测）
+vllm bench serve --model glm52-dsa --host localhost --port 8000 \
+  --dataset-name random --random-input-len 40000 --random-output-len 1024 --ignore-eos \
+  --num-prompts 64 --request-rate inf --max-concurrency 64 \
+  --save-result --result-dir /home/fjj/r26_serving --result-filename r26_c64.json 2>&1 | tee /home/fjj/pp_r26_bench_c64.log
+# 收尾：kill serve 进程 + 停 Pool + 清场（同既有纪律）
+```
+
+### 通过标准
+
+1. serve 健康（/health 200 + /v1/models 含 glm52-dsa）；serve 日志出现 `DSA_SHARED_CONNECT_OK`/`DSA_STORE` 行（serving 模式 remote 建链证据）；
+2. 档1 bench 完成，结果 JSON + 控制台报告（TTFT/TPOT/ITL 分位数、throughput）原文回传；
+3. 档2 完成或报错原文回传。
+
+### 失败处置
+
+- serve 起不来 ⇒ eager 档重试一次；仍败 ⇒ 报错末 50 行原文，停（serving 模式 remote 链路缺口，蓝区出代码线）；
+- bench 中途服务挂 ⇒ serve 日志末 50 行 + bench 输出原文；
+- Q=4 断言不应出现（43008 余量足）；出现即带新断言上下文回传。
+
+### 判读预案（派单时写死）
+
+- 档1（并发16齐射）TPOT/吞吐 vs R25-1 离线 BS16 同配方 → 离线/在线口径差定量；
+- 档2（并发64）= KVAF 形态大 batch 数据点；全过后验收叙事 = 离线（R25）+ 在线（R26）双口径 40K×1K。
+
+
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 
 ### 目标

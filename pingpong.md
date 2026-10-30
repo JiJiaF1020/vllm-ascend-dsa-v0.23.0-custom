@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **蓝区**。Status: §R21 已交付（2026-10-30 23:42~23:53）——R21-1 TTFT 复跑 RUN_OK/8/8 DRAIN/metrics 全产出，但 **TTFT 仍负（-1.79e12）**，失败处置命中：stats 源码原文回传。**根因=时钟域错配坐实**：`first_token_ts`=engine-core `time.monotonic()`（engine/__init__.py:231），`arrival_time`=wall-clock `time.time()`（async_llm.py:742），跨时钟域相减必然无意义；15d4610 的 arrival_s 归一只修了量级未修时钟域。**建议修复=改用 `metrics.first_token_latency`**（stats.py:369-371 官方同域 wall-clock TTFT，随 RequestOutput 透出）×1000 即 ms。R21-0 三块取证原文已回传（stats.py 时钟域注释 + arrival_time 全链 grep + R19-1 挂起上下文）。R22 预案：offload-off 对照 + shm 泄漏代码线。
+- Current owner: **绿区**。Status: §R22 已派单（2026-10-30）——蓝区完成 TTFT 时钟域修复（`first_token_latency` 优先，`first_token_ts` 路径降级为 fallback，本地 mock 全过）。R22 派单 = R22a offload-off 对照轮（+20% 自提升基线）+ R22b shm 广播块泄漏取证消化回执。R21 判读：bench 管道已验收（RUN_OK/8×DRAIN/metrics 全产出），TTFT 负值 = 统计链路 bug 非引擎问题；绿区时钟域证据链完整（源码行号 + 数学闭合 -1.7926e12 逐位吻合），蓝区采纳 `first_token_latency` 方案。
 
 ## 0. 目标与口径
 
@@ -2107,6 +2107,97 @@ DP2 组已 DRAIN+STORE_CLOSED（requests=4 put_pages=97344 remote_get=1）
 **日志资产**：`/home/fjj/pp_r21.log`、`/home/w00919836/scp-opt/tmp/r21-bench-bs4-mt256/raw/model.log`、`summary.txt`（RUN_OK）、`run-status.json`（graceful:true）、`results/1p/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared.metrics.json`（23:51 复跑版本）。机器已清场（进程 0、NPU 8 卡空闲、shm 372G）。
 
 **起止时间**：23:42~23:53（含 1004 重跑）。**bench 基线保持 R20 值（TTFT 待蓝区按真实时钟域修后复取）**。
+
+## §R21 判读（蓝区，2026-10-30）
+
+### 裁决
+
+1. **bench 管道本身已验收**：RUN_OK model_exit=0、8/8 DRAIN_OK + 8×STORE_CLOSED（put_pages=97344 remote_get=1）、EI0006=0/1004=0（复跑后）/patch_shm 挂起 0 次、4×`[metrics][dp=N]` + `[global]` + metrics.json 全字段。TTFT 负值是**统计链路 bug，不是引擎问题**——不污染 R20 已落袋的吞吐/TPOT 基线。
+2. **TTFT 根因闭环，蓝区认错并采纳绿区方案**：15d461035 只修了量级（arrival_time µs→s），方向错误；绿区证据链完整——`engine/__init__.py:231` `first_token_ts = time.monotonic()` vs `async_llm.py:742` `arrival_time = time.time()`，跨时钟域相减无意义，且数学逐位闭合（764077 − 1793375411 = −1792611334，×1000 = −1.7926e12 与实测吻合）。**已按绿区建议修复**：`summarize_request_metrics` 优先取 `metrics.first_token_latency`（stats.py:369-371，官方同域 wall-clock，单位秒 ×1000），不存在或 ≤0 才回退旧 first_token_ts 路径；本地 mock 三用例全过（ftl 优先 / None 回退 / 0 回退）。
+3. **shm 挂起机制认知更新（R21-0 块3）**：R19-1 挂起 worker 最后活动 = TP1 `DSA_STORE_PUT_DONE → DSA_SHARED_CONNECT_BEGIN/OK`（17:46:09）后静默，TP0 停在 acl_graph/MTP draft replay；EngineCore 侧 60s「no available block」是**下游症状**——worker 停在 connect/replay 同步点不再消费广播块 → 写侧耗尽。**头号嫌疑从"块泄漏"修正为"worker 在 DSA_SHARED_CONNECT_OK 之后的同步点停摆"**，shm 写侧等待只是表象。R22b 取证按此方向收口。
+4. 1004 瞬时竞争本轮落 DP3（首跑崩、清场重跑过），白名单逻辑有效；1004 根修仍挂账（机器层，R8 证据已交用户线）。
+
+## §R22 派单：offload-off 对照轮 + shm 挂起取证收口（蓝区，2026-10-30）
+
+### R22-0 · 只读取证（shm 写侧源码 + R19-1 停摆窗口，免费，先做）
+
+```bash
+# 块1 · shm_broadcast.py 结构与写侧函数（vllm 容器内版本，须精确）
+F=/vllm-workspace/vllm/vllm/distributed/device_communicators/shm_broadcast.py
+wc -l $F
+grep -n "^class \|    def \|No available" $F
+# 按上面 grep 到的行号，sed 出 acquire_write 全文与 dequeue/reader 推进段（例：sed -n 'A,Bp'），原文回传
+
+# 块2 · R19-1 停摆窗口（17:46:09 CONNECT_OK → 17:47:28 首个 60s 告警之间，挂起 worker 有没有任何输出）
+L=/home/w00919836/scp-opt/tmp/r19-bench-bs4/raw/model.log
+grep -nE "Worker_DP[013]_TP[01]" $L | awk -F: '$1>0' | grep -E "17:4[6-9]|17:5[0-2]" | head -40
+# 块3 · 各挂起 EngineCore 告警总数与最后一条时间戳
+for dp in 0 1 3; do echo "== EngineCore_DP$dp =="; grep -c "EngineCore_DP$dp.*No available shared memory" $L; grep "EngineCore_DP$dp.*No available shared memory" $L | tail -1; done
+```
+
+三块原文回传。块1 供蓝区出 shm 修复 commit；块2/3 判定 worker 停摆点后移还是 connect 内死等。
+
+### R22-1 · offload-off 对照轮（+20% 自提升基线，同时验证 TTFT 修复）
+
+```bash
+cd /home/fjj/vllm-ascend-remote-offload && git -c http.proxy=http://90.255.129.35:3128 pull --ff-only && git log --oneline -2
+# 顶部应含 TTFT first_token_latency 修复提交；grep 核验：
+grep -n "first_token_latency" examples/dsa_demo/simple_test.py | head -5
+```
+
+然后 R13-1 命令骨架逐字，env 如下（相对 R20/R21 唯一变量 = **ENABLE_OFFLOAD=0**，其余全同 R21 复跑配方）：
+
+```bash
+cd /home/w00919836/scp-opt
+source /home/w00919836/va.env
+export VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731
+export VLLM_ASCEND_SMOKE_DATASET=chinese_40k
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=4
+export VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=40960
+export VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS=2048
+export VLLM_ASCEND_SMOKE_MAX_TOKENS=256
+export VLLM_ASCEND_SMOKE_ENABLE_CHUNKED_PREFILL=1
+export VLLM_ASCEND_SMOKE_GPU_MEMORY_UTILIZATION=0.97
+export VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0
+export VLLM_ASCEND_SMOKE_BENCH=1
+export VLLM_ASCEND_SMOKE_ENABLE_CPU_BINDING=0
+export VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=0   # ← 本轮唯一变量（offload-off 对照）
+export PYTHONPATH=/home/fjj/vllm-ascend-remote-offload:$PYTHONPATH
+python3 -c "import vllm_ascend; print(vllm_ascend.__file__)"   # 须指向 fjj 仓
+python3 tools/profile_pool_inference.py --du-store-prefault read \
+  --framework-repo /home/fjj/vllm-ascend-remote-offload \
+  --output tmp/r22a-bench-bs4-mt256-nooffload --sample-port 19090 --sample-worker 0 \
+  --remote-config ../dp4tp2.json --no-perf --payload-layers 78 \
+  --du-pipeline-mib 1 --store-bytes $((128*1024*1024*1024)) \
+  --pool-start-timeout 600 --pool-count 2 --numa-node 0 --pool-b-numa-node 2 \
+  --store-numa-nodes local \
+  --pool-cpus '2-17,21-36,40-55,59-74,78-93' \
+  --pool-b-cpus '192-207,211-226,230-245,249-264,268-283' \
+  --shared-port-gather --du-devices udmac1d1e3 --du-eid-indices 0 \
+  --pool-b-du-devices udmac0d1e3 --pool-b-du-eid-indices 0 \
+  2>&1 | tee /home/fjj/pp_r22a.log
+echo "RC=$?"
+```
+
+前置门禁同 R21：进程 0 / NPU 8 卡全空闲 / shm ≥370G。白名单不变（1004 ≤2 次重跑，≥5min 静置 + 完整清场）。
+
+### 通过标准
+
+1. RUN_OK + 8/8 DRAIN_OK（offload-off 下无 STORE_CLOSED 属预期，回传实际 DRAIN/模式行原文）；
+2. 4 rank 各打出 `[dsa-smoke][metrics][dp=N]` + metrics.json 存在（路径若因 offload-off 变名，回传实际路径）；
+3. **TTFT 修复验证**：`ttft_ms` 全部分位数满足 `0 < ttft_ms < global_wall_s×1000`（预期数秒~数十秒，40K chunked prefill 本就大）；
+4. 原文回传 `[dsa-smoke][metrics][global]` 行 + 全局报告块全文 + `env | grep SMOKE | sort` 原文。
+
+### 失败处置
+
+- TTFT 仍越界 ⇒ 回传 `metrics.json` 中 per_request 明细前 3 条 + `grep -n "first_token_latency" /vllm-workspace/vllm/vllm/v1/metrics/stats.py` 原文，蓝区再修；
+- patch_shm 挂起复现 ⇒ 回传挂起计数/上下文（256 步包线内不应发生）；
+- 1004 ⇒ 白名单；EI0006 ⇒ 配方回归检查（不应发生）；其它新报错停。
+
+### 判读预案（派单时写死）
+
+- R22-1 vs R20/R21 基线（wall=81.5s、tps=50.2、tpot avg≈135-136ms/min≈29ms）做同口径对比：offload-on 相对 offload-off 的吞吐/TPOT 变化即「自提升」口径分子分母；
+- 若 offload-off 反而更慢或持平，判读时区分「40K prefill 主导期 offload 无收益」与「decode 稳态收益」，不下一刀切结论。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

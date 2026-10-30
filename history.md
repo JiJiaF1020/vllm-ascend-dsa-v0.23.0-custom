@@ -253,3 +253,7 @@ pull 15db763（TTFT 改 first_token_latency 优先 + R22 派单）后执行：R2
 ## §R26 派单：规格改 40K×1K + 在线 serving 拉齐 KVAF 负载形态（2026-10-31）
 
 **规格变更（用户定）**：100K×1K 取消（八卡跑不了），验收/对照统一 40K×1K；离线部分 R25 已覆盖（BS16×1024）。R26 = 在线 serving 拉齐：仓内已有 serve_dsa.sh 入口（vllm serve + --additional-config dsa_sparse_config，但无 remote_shared 字段需内联补）；serve 参数由蓝区本地用 build_llm_kwargs 按 R24/R25 配方精确生成（TP2/DP4/EP8、ML43008、batched2048、MTP3 graph、capture [4,8,16,32,64]、placement=hbm_full_remote_shared + remote_shared 内联工具生成 json）。R26-0 取证工具 pool-only 模式 + remote-shared json 内容；R26-1 serve bring-up（graph 档优先，eager 档兜底）；R26-2 vllm bench serve --dataset-name random --random-input-len 40000 --random-output-len 1024 --ignore-eos 并发 16/64 两档（KVAF 同口径 JSON）。排队在 R25 交付后执行。
+
+## §R25 判读：offload 纯开销第二数据点（+24.3%），容量价值在八卡 40K 规格内不成立（2026-10-31）
+
+R18 失败点解锁坐实（BS16×1024+ML43008 全净，clamp 理论二次实证）。对照：BS4×256 baseline 反超 7.7% → BS16×1024 反超 24.3%（tps 157.6 vs 126.81）、tpot avg −46.9%（184.6 vs 347.5ms）——offload 开销∝decode 步数，decode 主导口径放大，同号两连可下结论「40K 规格 HBM 装得下时 offload-on 恒为净开销」。R25-2 baseline 无 OOM（8×60.96GB）+ 100K 规格已取消 ⇒ 当前可测规格内无 offload 容量场景，「+20% 自提升」在八卡 40K 口径无成立路径，验收收口方式待用户裁决。R26（在线 serving 拉齐）不变。

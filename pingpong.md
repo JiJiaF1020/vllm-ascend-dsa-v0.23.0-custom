@@ -2608,6 +2608,14 @@ export VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=0
 
 **判读（绿区按数据陈述，裁决交蓝区）**：BS16×1024 decode 主导口径下 **baseline 反超 offload-on +24.3%**（tps），tpot avg −46.9%——与 R23（BS4×256 prefill 主导）baseline 反超 +7.7% 同号且幅度更大，**offload-on 在此配方=纯开销坐实第二数据点**；「+20% 自提升」预期在 decode 主导口径下不成立且差距反号更大。offload 容量价值（R25 派单预案：R25-2 OOM 即直接证据）**未触发**——baseline 无 OOM 正常跑完（BS16×1024 ML43008 每卡可装下，8 worker 各 60.96GB），容量维度未到 HBM 上限，offload 容量收益待 100K×1K 或更大 BS 配方验证。TTFT baseline 略高（+7.0%）因 baseline 无 remote 预取/调度差异，属 prefill 肩相位噪声。R26 预案（100K×1K 验收配方：chinese_104k + ML≥105K + MT1024）方向不变，offload 收益预期收敛于容量维度（100K 长上下文 KV 超 HBM 时 offload 不可替代）。机器已清场。
 
+## §R25 判读（蓝区，2026-10-31）
+
+1. **R18 失败点解锁坐实（clamp 理论第二次实证）**：BS16×1024 + ML43008 全净（8/8 DRAIN、挂起 0、1004/EI0006=0、自然收尾）——R18 同配方当年崩+挂，唯一变量 max_model_len。理论可判终审。
+2. **offload 纯开销第二数据点，且随 decode 占比放大**：BS4×256（prefill 主导）baseline 反超 7.7% → BS16×1024（decode 主导）反超 **24.3%**（tps）、tpot avg −46.9%。机制自洽：offload 的 PUT/status/connect 开销∝decode 步数，prefill 占比越低越盖不住。**同号两连，可下结论：在 40K 规格、HBM 装得下的 batch 内，offload-on 恒为净开销**。
+3. **容量价值在八卡 40K 规格内不成立（重要，需与用户对齐）**：R25-2 baseline 无 OOM（8 worker 各 60.96GB），BS16×40K×1K 远未到 HBM 上限；而 100K 规格已被用户取消（八卡跑不了）。**即：当前可测规格内不存在「offload 解锁容量」的场景，「+20% 自提升」在八卡 40K 口径下无成立路径**——offload 的正面叙事只在大规格（100K+ 或 HBM 打满的更大 BS）才出现。验收口径如何收口（降规格验收 / 换机器 / 以功能正确性+在线口径验收）需用户裁决，蓝区不替用户选。
+4. TTFT 第三轮验证通过（两轮全正）；TTFT baseline 略高 7% 属 prefill 肩相位噪声，不解读。
+5. R26 不变（在线 serving 拉齐 KVAF 口径）——它的价值现在更明确：验收材料里在线口径的 TPOT/ITL 是必交项，与 offload 损益结论无关。
+
 ## §R26 派单：在线 serving 拉齐 KVAF 负载形态（40K×1K）（蓝区，2026-10-31）——**§R25 交付完成后执行**
 
 **规格变更（用户定）**：100K×1K 取消（八卡跑不了），验收/对照统一 **40K×1K**。R25 已覆盖离线 40K×1K；R26 把负载形态换成 KVAF 同款（在线 serving + `vllm bench serve`）。

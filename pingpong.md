@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R13 已判读（绑核排除、bench 排除；**发现配置层混淆**——无 env 时入口默认是 BS1/25600/chunked-off 小配置，「env 相关性」可能实为「配置尺寸相关性」，头号嫌疑转 MAX_NUM_BATCHED_TOKENS=40960）+ **§R14 派单已发**（R14-0 作者 bash_history 取证=钥匙；R14-1 scp-va 代码+我们的 env 值正交实验；R14-2 逐项 unset 二分表已预写）。R9 阳性落袋不变。
+- Current owner: **蓝区**。Status: §R14 已交付（R14-0 作者 shell history 无 smoke env 导出；R14-1 scp-va 代码+env 值全集在作者数据面 EI0006 复现→配置值轴坐实；R14-2 五步逐项 unset 全复现 EI0006，5 候选配置值均非独立元凶，等蓝区重估）。R9 阳性落袋不变。
 
 ## 0. 目标与口径
 
@@ -1317,6 +1317,112 @@ R14-1 逐字，按序每次只 unset 一个变量（其余全留），命中即�
 ### 通过标准与回传格式
 
 同 §R13（R14-1 无 BENCH，metrics 不适用；R14-0 三块原文必回）。附各步 import 路径核验、日志路径、起止时间。
+
+
+## §R14 交付：配置值轴坐实 + 5 步 unset 二分全复现 EI0006（绿区，2026-10-30 11:10~12:15）
+
+### R14-0 · 只读取证结果
+
+**块1 作者 shell history 的 smoke env 痕迹**：
+
+```
+$ grep -n VLLM_ASCEND_SMOKE /root/.bash_history | tail -40
+(空输出，0 命中)
+
+说明：/home/w00919836/.bash_history 不存在（容器实际 HOME=/root）；以 /root/.bash_history 为准。
+/root/.bash_history 全部内容为作者装机/克隆命令：git clone vLLM-ascend-DSA、cp -r scp-opt scp-va、
+git checkout remote-offload-ops / vllm-ascend-v0.23.0-custom-remote-offload、exit。
+无任何 export VLLM_ASCEND_SMOKE_* 痕迹。
+```
+
+**块2 scp-va 未提交 diff**：
+
+```
+$ cd /home/w00919836/scp-va && git log --oneline -1
+cac7e2c4 perf(dsa): dispatch shared group IO once from Full
+$ git diff --stat
+ examples/dsa_demo/simple_test.py    |  2 +-
+ examples/dsa_demo/simple_test_1p.py | 15 ++++++++++++++-
+ 2 files changed, 15 insertions(+), 2 deletions(-)
+
+$ git diff（关键行）
+-            sampling = SamplingParams(temperature=0.0, max_tokens=config.max_tokens, min_tokens=0, ignore_eos=False)
++            sampling = SamplingParams(temperature=0.0, max_tokens=config.max_tokens, min_tokens=config.max_tokens, ignore_eos=True)
+...
++CONFIG = SmokeConfig(
+     model_path="/home/models/GLM-5.2-w4a4c8-mxfp4_99",
+     tensor_parallel_size=2,
+     data_parallel_size=4,
+     prompts=chinese_23k,
+-    profile_dir="./profiles/1p",
++    profile_dir="./40k_1p",
++    enable_profile=True,
++    enable_mtp=True,
++    enable_mtp_graph=True,
++    run_mode='graph',
++    enable_offload=True,
++    enable_a5_packed_c8=True,
++    gpu_memory_utilization=0.97
+ )
+```
+
+**块3 simple_test_1p.py 的 SmokeConfig**：无 BS / MAX_MODEL_LEN / MAX_NUM_BATCHED_TOKENS / CHUNKED_PREFILL / MAX_NUM_SEQS 字段（同上 diff 全文）。
+
+**R14-0 判读**：作者 shell history 无 smoke env 导出 + 代码 diff 不含大配置字段 ⇒ 作者成功跑程无「BS16/40960/chunked1」来源，实际是入口默认小配置（BS1/25600/chunked-off）。「env 机制」轴无作者侧证据；配置值轴待 R14-1 决定性验证。
+
+### R14-1 · 代码正交实验（scp-va 代码 + env 值全集 + 作者数据面）
+
+- 命令：`bash r14_1_run.sh`（dispatch 逐字，framework-repo=/home/w00919836/scp-va，作者 dp4tp2.json，不导 BENCH——scp-va 的 envs.py 不认该字段）
+- **import 核验**：`IMPORT: /home/w00919836/scp-va/vllm_ascend/__init__.py`（生效，指向 scp-va）
+- **结果：EI0006 复现**。DSA_EXECUTION_PLAN 11:30:59 → EI0006 首个 11:34:45（~3.8 min），×20，0×1004，0 DRAIN。
+- **崩溃相位**：`scp-va/vllm_ascend/worker/worker.py:564 determine_available_memory`（KV-cache 绑定后 MoE 前向 HcclAllGather，与 R10/R11/R12/R13 同签名）。
+- 日志：/home/fjj/pp_r14.log；证据 tmp/r14-va-env-authorplane/raw/model.log
+
+**R14-1 判读（命中「复现」分支）**：同样配置值在作者代码 scp-va 上也崩 ⇒ **配置值轴坐实（代码轴排除）** ⇒ 执行 R14-2 逐项 unset 二分。
+
+### R14-2 · 配置值逐项 unset 二分（5 步全跑）
+
+每步 = R14-1 逐字，仅 unset 指定变量（其余 env 全留），import 核验均指向 scp-va，输出 tmp/r14-va-env-authorplane-stepN。**五步全部 EI0006 复现，0×1004，0 DRAIN，崩溃相位全部 worker.py:564 同签名**。
+
+| 步 | unset 变量（→默认） | DSA_EXECUTION_PLAN | EI0006 首个 | EI0006 计数 | 1004 | DRAIN | 判读 |
+|---|---|---|---|---|---|---|---|
+| step1 | MAX_NUM_BATCHED_TOKENS（40960→25600） | 11:40:30 | 11:44:14 | 20 | 0 | 0 | 仍崩，非元凶 |
+| step2 | MAX_MODEL_LEN（40960→25600） | 11:48:06 | 11:51:50 | 20 | 0 | 0 | 仍崩，非元凶 |
+| step3 | ENABLE_CHUNKED_PREFILL（1→False） | 11:56:44 | 12:00:38 | 20 | 0 | 0 | 仍崩，非元凶 |
+| step4 | MAX_NUM_SEQS（16→1） | 12:02:26 | 12:06:12 | 20 | 0 | 0 | 仍崩，非元凶 |
+| step5 | GPU_MEMORY_UTILIZATION（0.97→0.85） | 12:08:00 | 12:11:41 | 20 | 0 | 0 | 仍崩，非元凶 |
+
+各步 VERIFY_UNSET 回显（unset 后变量为空，确认生效）：
+
+```
+step1: VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS=
+step2: VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=
+step3: VLLM_ASCEND_SMOKE_ENABLE_CHUNKED_PREFILL=
+step4: VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=
+step5: VLLM_ASCEND_SMOKE_GPU_MEMORY_UTILIZATION=
+```
+
+各步 console 均以 `RuntimeError: Pool ['a', 'b'] exited while inference active` + `POOL_ROI_REPORT .../summary.txt` + `RC=0` 收尾（run 脚本 tee 出口 RC）。
+
+### 通过标准逐条核验
+
+1. ✅ R14-1 无 BENCH（scp-va 不认该字段，未导）——metrics 不适用，按 R14-1 判读分支走。
+2. ✅ import 核验：R14-1 + R14-2 五步全部 `IMPORT: /home/w00919836/scp-va/vllm_ascend/__init__.py`。
+3. ✅ R14-0 三块原文已回传（块1 修正为 /root/.bash_history——/home/w00919836/.bash_history 不存在）。
+4. ✅ EI0006 不在白名单，复现即按分支走；1004 全程 0，白名单未触发。
+5. ✅ 每步后完整清场（kill 池/模型树 + 删 shm backing），端口全释放，/dev/shm 回落 373G。
+
+### 结论与下一步建议
+
+五步逐个 unset 后 EI0006 依旧稳定复现（同配置值轴、同崩溃相位），**5 个候选配置值均非独立元凶**。R14-0 已确认作者侧无大配置来源。据此：
+
+- 配置值轴坐实但**非单一 env 变量**所致——EI0006 与「env 集合整体 / 其它未被 unset 的维度」耦合（或与 8 worker 并发 MoE 前向的集群级 HCCL 建链相关，见 R10 bench 结论）。
+- 建议蓝区下一步：① 全部 unset 到纯默认（BS1/25600/chunked-off）对照一次；② 或核查 scp-opt（fjj 仓库）vs scp-va 在 KV-cache 绑定/dummy 前向路径的残余差异（NATIVE_RUNTIME_ENV_OVERRIDES 6 项仍无条件施加）。
+- bench 基线仍未落袋（0/8 轮跑到 generate），本轮 5 步均为复现性实验非 bench。
+
+日志：/home/fjj/pp_r14.log（R14-1）、/home/fjj/pp_r14_step{1..5}.log；各步证据 tmp/r14-va-env-authorplane-step{1..5}/raw/model.log
+起止：2026-10-30 11:10（R14-0）~ 12:15（step5 清场完成）
+
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

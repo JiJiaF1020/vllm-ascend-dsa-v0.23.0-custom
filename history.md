@@ -131,3 +131,11 @@
 **R13 交付**（commit 34a2b10d5）：R13-1 关绑核（核验干净：additional_config False+无执行痕迹）EI0006 仍复现→绑核排除（第三次自我修正）；R13-2 BENCH=0 仍复现→bench env/代码排除；崩溃相位恒为 determine_available_memory 的 MoE EP8 all-gather 首连。0/7 轮到 generate。
 **R13 判读**（蓝区）：发现配置层混淆——入口 simple_test_1p.py 无 env 时默认 BS1/23k/25600/chunked-off/0.85，而作者 diff 只加 7 开关不含 BS16/40960/chunked1；R5-0 记录的作者大参数只能来自其 shell 导出（bash_history）。「env 相关性」可能实为「配置尺寸相关性」；头号嫌疑转 MAX_NUM_BATCHED_TOKENS=40960（profile run 直接输入）。NATIVE_RUNTIME_ENV_OVERRIDES 无条件施加，非差分。
 **R14 派单**：R14-0 只读（作者 bash_history smoke env 痕迹+scp-va 现状 diff+1p 脚本原文——判定 env 机制 vs 配置值的钥匙）；R14-1 正交实验=scp-va 代码+我们 env 值全集+作者数据面（禁导 BENCH，作者 envs.py 不认识会报错），崩=配置值轴/过 profile=代码轴；R14-2 预写五步逐项 unset 二分（batched_tokens→model_len→chunked→bs→gpu_mem）。
+
+## §R14 env机制 vs 配置值正交拆解 + 逐项 unset 二分（2026-10-30）
+
+**派单**（commit 3c4018f）：R14-0 只读取证（作者 bash_history 的 smoke env 导出痕迹=判定 env 机制 vs 配置值的钥匙）；R14-1 代码正交实验（scp-va 代码+我们 env 值全集+作者数据面），崩=配置值轴，过=代码轴；R14-2 五步逐项 unset 二分表预写，命中即停。EI0006 不在白名单。
+
+**交付**（commit ①待回填）：R14-0 ：/home/w00919836/.bash_history 不存在，实际 HOME=/root，/root/.bash_history 含 VLLM_ASCEND_SMOKE=0 命中（全部为装机/克隆命令），作者无 smoke env 导出痕迹；scp-va 未提交 diff=只加 profile_dir/7开关/gpu_mem0.97，不含 BS16/40960/chunked1。R14-1（scp-va+env 值全集+作者数据面）：EI0006 复现（11:34:45 齐射×20，0×1004，崩在 worker.py:564 determine_available_memory MoE 前向）→ 配置值轴坐实（代码轴排除）。R14-2 五步逐项 unset（batched_tokens→model_len→chunked→seqs→gpu_mem）全部 EI0006 复现（各×20，0×1004，同崩相位），5 候选配置值均非独立元凶。数据出处：/home/fjj/pp_r14.log + pp_r14_step{1..5}.log + tmp/r14-va-env-authorplane-step{1..5}/raw/model.log。
+
+**判读**（蓝区）：待定（配置值轴坐实但非单一 env 变量，建议全部 unset 到纯默认对照或核查 scp-opt vs scp-va 残余差异）。

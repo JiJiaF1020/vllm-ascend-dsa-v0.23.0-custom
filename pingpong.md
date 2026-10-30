@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R19 已判读 + **统计 bug 已本地修复**（first_token_time→first_token_ts ×3，mock 全过，随本 commit 推送）+ **§R20 派单已发**（pull 修复后逐字重跑 R19-2 = BS4×256 BENCH=1，过标准=§R10 第 3/4 条 metrics 原文）。挂起包线结论：decode ≤256 步可用，1024 步待 shm 块泄漏根修。bench 0/11。
+- Current owner: **蓝区**。Status: §R20 交付已回传（BS4×256 BENCH=1 逐字重跑，**statistics bug 修复生效，bench 基线首次落袋**：summary RUN_OK model_exit=0、8/8 DRAIN_OK+STORE_CLOSED(requests=4 put_pages=97344 remote_get=1)、patch_shm 挂起 0 次、4×[dsa-smoke][metrics][dp=N]+[global] 行、results/1p/<run>.metrics.json global 全字段；tpot_ms avg=136.055/request_throughput=0.196rps/global_output_tps=50.23/tpot_under_50ms=false）。⚠️ 数据质量待蓝区修：ttft_ms 为巨大负值(first_token_ts 与 arrival_time 时钟基准不一致，tpot 正常)。bench 1/11。
 
 ## 0. 目标与口径
 
@@ -1931,6 +1931,42 @@ cd /home/fjj/vllm-ascend-remote-offload && git -c http.proxy=http://90.255.129.3
 - AttributeError 复现 ⇒ pull 未生效，回传 `git log --oneline -2`；
 - patch_shm 挂起复现 ⇒ 泄漏非确定性，回传挂起计数/上下文，蓝区重估包线；
 - 1004 ⇒ 白名单重跑；EI0006 ⇒ 配方回归检查（不应发生）；其它新报错停。
+
+## §R20 交付：统计 bug 修复生效，bench 基线首次落袋（绿区，2026-10-30 23:10~23:16）
+
+### 执行核验
+
+- pull 到 c461a78（`git log --oneline -2` 顶部=first_token_ts 修复提交），simple_test.py:451/454/455 已改 `first_token_time→first_token_ts` ×3（grep 核验落地）。
+- R19-2 命令逐字重跑（fjj 仓 + BENCH=1 + batched2048/chunked1 + BS4 + MAX_TOKENS=256 + 作者数据面全不变），输出 `tmp/r20-bench-bs4-mt256`，日志 `/home/fjj/pp_r20.log`。
+- 启动前置门禁：进程 0 / NPU 8 卡全空闲 / shm 373G。23:11:09 双 Pool READY（groups=['a','b']，store 19080-19087/du 19090-19097 路由正确）→ 23:16 自然收尾。
+
+### 结果（通过标准逐条，§R10 第 3/4 条核心）
+
+1. **8/8 DRAIN_OK + 8×STORE_CLOSED**（23:15:34-36，8 worker 全 `requests=4 put_pages=97344 inference=hbm_full_remote_shared remote_get=1`，DP0-3 各 TP0/TP1）——R19-2 防回归达成。
+2. **4 rank 各打出 `[dsa-smoke][metrics][dp=N]` 行**（dp=0/1/2/3，各 requests=4 output_tokens=1024）。
+3. **`results/1p/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared.metrics.json` 存在**（框架仓 results/ 下，model.log:2780 有写入确认），global 含 requests/分位数/吞吐/tpot_under_50ms 全字段。
+4. **`[dsa-smoke][metrics][global]` 原文回传**（见下）。
+
+**summary.txt = RUN_OK model_exit=0**（首次整网干净收尾）；run-status.json graceful=true errors=[]；EI0006=0 / code=1004=0 / **patch_shm_broadcast 挂起 = 0 次**。
+
+### `[dsa-smoke][metrics][global]` 原文
+
+```
+{"dp_size": 4, "requests": 16, "output_tokens": 4096, "global_wall_s": 81.54, "request_throughput_rps": 0.196, "global_output_tps": 50.23, "ttft_ms": {"avg": -1792611307115.808, "min": -1792611334035.134, "p50": -1792611307029.019, "p90": -1792611280436.494, "p99": -1792611280413.981, "max": -1792611280413.981}, "tpot_ms": {"avg": 136.055, "min": 29.899, "p50": 135.997, "p90": 241.908, "p99": 242.134, "max": 242.134}, "tpot_under_50ms": false}
+```
+
+### ⚠️ 数据质量告警（交蓝区判读，不阻塞落袋）
+
+**ttft_ms 为巨大负值**（global avg=-1.79e12 ms，各 rank/per_request 同）：`ttft_ms = (metrics.first_token_ts - metrics.arrival_time) * 1000`——first_token_ts 与 arrival_time **时钟基准/单位不一致**（first_token_ts 是 epoch 秒级，arrival_time 疑似另一套），相减得巨负。**tpot_ms = (last_token_ts - first_token_ts)/(n-1) 因同基准相减而正常**（avg=136.055）。其余字段（requests/output_tokens/global_wall_s/request_throughput/global_output_tps）均正常。建议蓝区核 vLLM 0.23 `RequestStateStats.arrival_time` 与 `first_token_ts` 单位是否需换算（如 arrival_time 是单调时钟/相对秒）。
+
+### 附带资产
+
+- overlap CSV 8 端口各 7239-7581 行（总计 59394 行），`classify_union_mean_us` 各端口均值 ≈ **12.7-13.0µs**（19090=12.955/19091=12.865/19092=12.823/19093=12.840/19094=13.011/19095=13.022/19096=12.692/19097=12.680）。
+- non-default args 原文：`max_model_len=40960, tensor_parallel_size=2, enable_expert_parallel=True, block_size=128, gpu_memory_utilization=0.97, max_num_batched_tokens=2048, max_num_seqs=4, quantization=ascend, enable_chunked_prefill=True, speculative_config=mtp(3)`, compilation FULL_DECODE_ONLY capture_sizes=[4,8,16]。
+
+**日志资产**：`/home/fjj/pp_r20.log`、`/home/w00919836/scp-opt/tmp/r20-bench-bs4-mt256/raw/model.log`（514KB 全链）、`summary.txt`（RUN_OK）、`run-status.json`（graceful:true）、`raw/overlap-*.csv`（8 端口满数据）、`results/1p/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared.metrics.json`。机器已清场（进程 0、NPU 8 卡空闲、shm 373G）。
+
+**起止时间**：23:10~23:16（自然结束）。**bench 基线 1/11 落袋**。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

@@ -198,3 +198,7 @@
 **R19 判读**（蓝区）：R19-1（BS4×1024）挂起复现、R19-2（BS4×256）8/8 DRAIN + 挂起 0 次 ⇒ **shm 块泄漏∝decode 步数坐实**（与请求数无关），当前可用包线 decode ≤256 步。新阻塞 = 蓝区 bench 代码 bug：`simple_test.py:451/454/455` 引用 vLLM 旧字段 `first_token_time/last_token_time`，0.23.0 已改名 `first_token_ts/last_token_ts`（绿区 model.log 定位）。
 **蓝区修复**（本 commit）：3 处字段改名；mock（/tmp/test_smoke_metrics.py）同步改并全过。
 **R20 派单**：绿区 pull 修复后逐字重跑 R19-2（BS4×256+BENCH=1），过 = §R10 第 3/4 条 metrics 基线落袋。
+
+## §R20 统计 bug 修复生效，bench 基线首次落袋（2026-10-30）
+
+pull c461a78（first_token_time→first_token_ts ×3，simple_test.py:451/454/455）后逐字重跑 R19-2（BS4×256 BENCH=1，tmp/r20-bench-bs4-mt256）。**summary RUN_OK model_exit=0（首次整网干净收尾）**、8/8 DRAIN_OK+STORE_CLOSED（requests=4 put_pages=97344 remote_get=1）、patch_shm 挂起 0 次、EI0006=0/1004=0；4×[dsa-smoke][metrics][dp=N]+[global] 行全产出，results/1p/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared.metrics.json 存在（global 含 requests/分位数/吞吐/tpot_under_50ms 全字段）。global 原文：requests=16/output_tokens=4096/global_wall_s=81.54/request_throughput_rps=0.196/global_output_tps=50.23/tpot_ms avg=136.055/tpot_under_50ms=false。overlap CSV 8 端口 59394 行 classify_union_mean_us≈12.7-13.0µs。**通过标准 4 条全满足 → bench 基线 1/11 落袋**。⚠️ 数据质量告警：ttft_ms 巨大负值（first_token_ts 与 arrival_time 时钟基准不一致，tpot 正常）交蓝区修口径。bench 1/11。

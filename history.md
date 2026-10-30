@@ -261,3 +261,8 @@ R18 失败点解锁坐实（BS16×1024+ML43008 全净，clamp 理论二次实证
 ## §R26 交付：在线 serving 失败——remote_shared 单种群限制（并发2 成功，4/16 崩溃）（2026-10-31）
 
 **R26-0**：工具无 pool-only（仅 remote/local/baseline + preflight-only），Pool 用 urma_pool_server 直接起；R24 remote-shared json 已取。**R26-1**：serve bring-up 成功（健康 + /v1/models glm52-dsa ML43008 + DSA_SHARED_CONNECT_OK/DSA_STORE=24 + ERROR=0）。**R26-2**：bench 默认 temperature=1.0 与 DSA+MTP3 greedy 约束冲突（scheduler.py:70 ValueError）→ 加 --temperature 0.0 后：并发2 成功（2/2, TTFT=19213ms/TPOT=15.08ms/ITL=46.62ms/output_tps=54.34/acceptance=69.9%），并发4 崩溃（4/4），并发16 崩溃（16/16）——根因 remote_shared.py:124-127 validate_requests 单种群限制：BIND 后新 request_id 拒绝（config.py:484 BS1..32 one offline cohort），触发边界 2~4。架构级限制，非参数可调；在线打流失败但单请求/并发2 数据点有效。机器已清场。
+
+## §R26 判读 + §R27 派单：serving 建链跑通，remote_shared 单 cohort 架构限制实锤（2026-10-31）
+
+**判读**：①serving 模式 remote 建链首次跑通（健康+CONNECT/STORE 24 行，graph 档一把过，serve_dsa.sh 的 DP+MTP3 eager 限制对本配置不适用）；②**架构级发现：remote_shared=单离线 cohort 设计**（remote_shared.py:124-127 validate_requests + config.py:484：BIND 后拒新 request_id、retired row 不复用）——40K prefill 分批完成，先 decode 者触发 BIND 后其余成「BIND 后新请求」被拒，并发 2 同窗口存活/并发 4+ 必崩；现阶段 remote 方案不能上生产 serving，验收只能走离线口径或 ≤2 并发在线口径；多种群/row 轮转=需求级改动挂作者线。③并发 2 在线数据点有效：TPOT 15.08ms（低于用户经验 26.7ms）、ITL 46.62ms、acceptance 69.9%（MTP3 生效）、output_tps 54.34、total_tps 2177。④纪律入库：bench serve 打 DSA 必须 --temperature 0.0（scheduler.py:70 greedy 约束）。
+**派单**：R27-1 并发 1（8 条）/并发 2（16 条滚动，预期崩则改单 cohort 2 条重打）正式档；R27-2 并发 3 边界探测（256 输出只判存活）——定 cohort 边界是固定 2 还是「同 prefill 窗口」。

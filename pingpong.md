@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R26 已交付（2026-10-31）——在线 serving 拉齐失败：R26-1 serve bring-up 成功（健康+DSA_CONNECT=24），R26-2 bench 两档崩溃根因=remote_shared 单种群限制（remote_shared.py:124 validate_requests，BIND 后新 request_id 拒绝，触发边界并发2成功/4崩溃）——架构级限制非参数可调，单请求/并发2 在线数据点有效（TPOT=15ms/ITL=46ms/acceptance=69.9%），等蓝区裁决在线 serving 路线。
+- Current owner: **绿区**。Status: §R27 已派单（2026-10-31）——R26 判读：①serving 模式 remote 建链首次跑通（健康+CONNECT/STORE 24 行，graph 档一把过）；②**架构级发现：remote_shared 单离线 cohort 设计**（BIND 后拒新 request_id、retired row 不复用），在线滚动打流必崩，边界并发2成/4崩——现阶段 remote 方案不能上生产 serving，多种群支持=需求级改动挂作者线；③并发2 在线数据点有效：TPOT 15.08ms/ITL 46.62ms/acceptance 69.9%。R27 = 并发1/2 正式档（--temperature 0.0 纪律入库）+ 档B 滚动16条验证「同窗口 cohort」假设 + 并发3 边界探测。
 
 ## 0. 目标与口径
 
@@ -2710,6 +2710,60 @@ vllm bench serve --model glm52-dsa --host localhost --port 8000 \
 - 代码级证据：remote_shared.py:124-127 `validate_requests`：`if row in self.retired or (self.real_bound and self.request_ids.get(row) != request_id): raise ValueError(...)`；config.py:484 `remote_shared requires BS1..32 per DP; one offline cohort, no request-row reuse`。并发2 时两请求映射同 row 0 同一 cohort（DSA_SHARED_CONNECT_BEGIN active_rows=[0] bound_rows=[0]），完成后 DSA_SHARED_RETIRED row=0 row_reusable=0；并发4/16 时多请求跨多批/新 request_id 在 BIND 后到达，validate_requests 拒绝→ worker 崩溃→ 整个 serve 进程组关停。
 
 **判读（绿区按数据陈述，裁决交蓝区）**：remote_shared（hbm_full_remote_shared）的**在线 serving 只支持单 cohort（单批 BIND），不支持 vllm bench serve 的多请求并发打流**——这是架构级限制（设计时即确认 BS1..32 但单种群无多请求），非参数可调。R26-1 的 serve 上线本身成功（健康+建链证据全齐），但在线打流碰到 remote_shared 单种群限制。**单请求/并发2 下的 TPOT=15ms、ITL=46ms、acceptance=69.9%（MTP3 draft 生效）是有效的在线 serving 数据点**；但 R26-2 两档（并发16/64）未能完成，KVAF 同口径大批次数据点缺失。建议蓝区判断：①是否需要为在线 serving 修改 remote_shared 支持多种群/多请求轮转（解除 real_bound 后的新 request_id 拒绝）；②或认可单种群限制，将在线 serving 回退到并发2以内或将 R26 改为单请求循环走丁量；③或在线 serving 路线放弃、回归离线路线（R25 已覆盖 40K×1K 离线）。机器已清场。
+
+## §R26 判读（蓝区，2026-10-31）
+
+1. **serving 模式 remote 建链首次跑通（验收级进展）**：serve 健康 + Pool A/B 就绪 + `DSA_SHARED_CONNECT_OK/STORE` 24 行——remote-offload 在 AsyncLLM/在线模式链路本身可用，graph 档一把过（serve_dsa.sh 的「DP+MTP3 需 eager」限制对本配置不适用）。
+2. **架构级发现：remote_shared 是「单离线 cohort」设计（remote_shared.py:124-127 + config.py:484 实锤）**：BIND 后不接受新 request_id、retired row 不复用——在线打流请求滚动进出必然崩溃（并发 4/16 全中）。机制自洽：40K prefill 分批完成，先 decode 的请求触发 BIND 后，仍在 prefill 的请求成为「BIND 后新请求」被拒；并发 2 两个请求同窗口建链=同 cohort 故存活。**这不是参数问题，是 remote-offload 当前只支持离线固定种群的架构事实**——对项目含义重大：现阶段 remote 方案不能上生产 serving，验收只能走离线口径或≤2 并发在线口径。多种群/row 轮转支持 = 需求级改动，提交给作者线评估（蓝区不擅自开工）。
+3. **并发 2 在线数据点有效且质量好**：TPOT avg=15.08ms、ITL avg=46.62ms、acceptance=69.9%（MTP3 生效证据）、output_tps=54.34、total_tps=2177（含 prefill token）。**TPOT 15ms 低于用户经验值 26.7ms（80ms ITL÷3），ITL 46.6ms 在同口径量级内偏优**——首批 KVAF 同口径（官方 bench serve JSON）数字落袋。
+4. bench serve 打 DSA 必须 `--temperature 0.0`（scheduler.py:70 greedy 约束），已验证，入库纪律。
+5. R27 = 在线小并发补齐（并发 1/2 正式档）+ 边界探测（并发 3）；大并发在线路线挂账，等作者对多种群支持的答复。
+
+## §R27 派单：在线小并发正式档 + cohort 边界探测（蓝区，2026-10-31）
+
+### 前置
+
+R26-1 的 serve 起法逐字（graph 档 + remote_shared 内联 + Pool 直起），健康核验同 R26-1 通过标准 1。**bench 全部带 `--temperature 0.0`**。
+
+### R27-1 · 并发 1/2 正式档（KVAF 同口径 JSON）
+
+```bash
+# 档A · 并发 1（单请求延迟下限，8 条求稳态统计）
+vllm bench serve --model glm52-dsa --host localhost --port 8000 \
+  --dataset-name random --random-input-len 40000 --random-output-len 1024 --ignore-eos \
+  --temperature 0.0 --num-prompts 8 --request-rate inf --max-concurrency 1 \
+  --save-result --result-dir /home/fjj/r27_serving --result-filename r27_c1.json 2>&1 | tee /home/fjj/pp_r27_c1.log
+# 档B · 并发 2（R26 已验证可行的上限，16 条滚动）
+vllm bench serve --model glm52-dsa --host localhost --port 8000 \
+  --dataset-name random --random-input-len 40000 --random-output-len 1024 --ignore-eos \
+  --temperature 0.0 --num-prompts 16 --request-rate inf --max-concurrency 2 \
+  --save-result --result-dir /home/fjj/r27_serving --result-filename r27_c2.json 2>&1 | tee /home/fjj/pp_r27_c2.log
+```
+
+注意：档B 滚动 16 条时后续请求是「BIND 后新请求」，**预期会崩**——若崩，改为 `--num-prompts 2`（单 cohort 两条）重打一次，两个结果都回传。
+
+### R27-2 · 边界探测：并发 3（确认 cohort 边界是 2 还是"同窗口即可"）
+
+```bash
+vllm bench serve --model glm52-dsa --host localhost --port 8000 \
+  --dataset-name random --random-input-len 40000 --random-output-len 256 --ignore-eos \
+  --temperature 0.0 --num-prompts 3 --request-rate inf --max-concurrency 3 \
+  --save-result --result-dir /home/fjj/r27_serving --result-filename r27_c3.json 2>&1 | tee /home/fjj/pp_r27_c3.log
+```
+
+（输出降到 256 省时间，只判存活不要性能数。）
+
+### 通过标准
+
+1. 档A 完成：JSON + 控制台报告原文（TTFT/TPOT/ITL/吞吐/acceptance）；
+2. 档B：两种结局（滚动崩 + 单 cohort 2 条成）的原文都回传；
+3. 档3：存活与否 + 报错原文（若崩）。
+
+### 判读预案（派单时写死）
+
+- 档A/B 成 → 在线口径数据包 = 并发 1/2 两档，验收材料可用；
+- 档3 成 ⇒ cohort 边界不是固定 2 而是「同 prefill 窗口可同行」，蓝区重新建模 BIND 时机；崩 ⇒ 边界=2 坐实；
+- 大并发在线（并发≥4）= 多种群需求，挂作者线，不在绿区排期。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

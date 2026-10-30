@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R23 已派单（2026-10-31）——R22 判读：①TTFT 修复验证通过（first_token_latency 方案闭环，avg=45.3s 符合 40K prefill 物理图像）；②**R22-1 非真对照**：ENABLE_OFFLOAD=0 被 scp-opt 工具吞掉（run 名仍含 offload、put_pages=97344 逐位相同、real_store=1），±1.4% 只是同构噪声，+20% 对照基线未落袋；③shm 停摆收敛：worker 在 CONNECT_OK→MTP draft graph replay 后静默（非块泄漏），DP2 为独立崩溃面。R23 = R23-0 三块只读取证（工具 env 传递/draft replay 源码/DP2 exception 原文）+ R23-1 真 baseline 轮（绕过工具直跑 simple_test_1p.py，ENABLE_OFFLOAD=0 硬证据三条）。
+- Current owner: **绿区**。Status: §R23 已交付（2026-10-31）——R23-0 工具吞 env 源码实锤（profile_pool_inference.py:414 无条件覆盖 ENABLE_OFFLOAD）+ draft replay/DP2 崩溃源码；R23-1 真 baseline 落袋（绕工具直跑容器内，ENABLE_OFFLOAD=0 硬证据三选全中）：**baseline 不降反升**（tps +7.7%/wall −7.2%/tpot −9.4% vs R21 offload-on），+20% 分子分母全错，offload 收益预期在 decode 稳态/容量维度。
 
 ## 0. 目标与口径
 
@@ -3530,3 +3530,186 @@ R3 派单（1ee1faa）三阶段实验中仅 R3-A（offload 关闭对照实验）
 - 失败根因：profile_run → _dummy_run → deepseek_v2 MoE 前向；4 个 EngineCore 均报 `No available shared memory broadcast block found in 60 seconds`（patch_shm_broadcast.py:74，01:11-01:12）；底层为 **HCCL dispatch timeout**（Process group work ALLGATHER/REDUCE_SCATTER/ALLREDUCE ... dispatch timeout. device 1: EmptyQueue）。
 - 关键含义：offload 关闭时 EP8 也崩 → 问题在 HCCL/EP 通信层而非 remote-offload 引入；裸探针 8/8 PASS 与 vLLM 多进程树差异仍在。
 - 运行起止：2026-10-28 01:07:47 → 01:12+ 失败（R3-A 报错点前后行号 767-774 见 pp_r3a_run.log）。
+
+## §R23 交付：工具吞 env 源码实锤 + 真 baseline 落袋（offload-off 反超 +7.7%）（绿区，2026-10-31 02:15~02:20）
+
+### R23-0 · 三块只读取证原文
+
+**块1 · 工具吞 env 实锤（profile_pool_inference.py 的 env 传递）**
+
+`/home/w00919836/scp-opt/tools/profile_pool_inference.py`：
+
+```
+165:    p.add_argument("--mode", choices=("remote", "local", "baseline"), default="remote", ...)
+412:def model_environment(a):
+413:    env = os.environ.copy()
+414:    env["VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD"] = "0" if a.mode == "baseline" else "1"
+415:    if a.node_rank is not None:
+416:        for name in ("node_rank", "master_addr", "master_port", "sync_port"):
+417:            env["VLLM_ASCEND_SMOKE_"+name.upper()] = str(getattr(a, name))
+418:    return env
+...
+745:    stderr=subprocess.STDOUT, env=model_env, start_new_session=True
+```
+
+**实锤机制**：`model_environment(a)` 无条件 `env["VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD"] = "0" if a.mode == "baseline" else "1"`——外部 `export VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=0` 被该行强制覆盖。R22-1 用默认 `--mode=remote`（L165 default），故工具把 offload 写回 `"1"`，R22-1 的 ENABLE_OFFLOAD=0 从未到达框架子进程（subprocess.Popen env=model_env 用覆盖后环境）。±1.4% 差=同构重跑噪声坐实。
+
+**块2a · draft replay 上下文（llm_base_proposer.py:620-700）**
+
+`/vllm-workspace/vllm/vllm/v1/spec_decode/llm_base_proposer.py`（L651 `[GLM MTP graph] Replaying separate merged 3-step draft graph` 所在）：
+
+```python
+            inputs_embeds = self.inputs_embeds[:input_batch_size]
+            input_ids = self.input_ids[:input_batch_size]
+            inputs_embeds = None
+            # Run the model.
+            model_kwargs = {
+                "input_ids": input_ids,
+                "positions": self._get_positions(input_batch_size),
+                "inputs_embeds": inputs_embeds,
+            }
+            if self.pass_hidden_states_to_model:
+                model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
+            with set_forward_context(
+                per_layer_attn_metadata, self.vllm_config,
+                num_tokens=input_batch_size,
+                num_tokens_across_dp=batch_size_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                slot_mapping=self._get_slot_mapping(input_batch_size),
+            ):
+                ret_hidden_states = self.model(**model_kwargs)
+                ...
+            hidden_states = hidden_states[:batch_size]
+            draft_token_ids, draft_probs = self._sample_draft_tokens(
+                last_hidden_states[:batch_size], sampling_metadata
+            )
+```
+
+后续 `_update_positions_dependent_metadata`（620-700 段）：`eagle_step_update_slot_mapping_and_metadata(...)` 更新 positions/slot mapping/seq metadata 供下一步 draft，`common_attn_metadata.slot_mapping = self._slot_mapping_buffer[:batch_size]`。**该段纯 draft 内部状态更新，无 remote_shared/connect 交互**——与 R22 判读「worker 在 connect→draft replay 同步区间静默」的调用链上下文吻合。
+
+**块2b · acl_graph.py:270-300（Replaying aclgraph 逻辑）**
+
+`/home/fjj/vllm-ascend-remote-offload/vllm_ascend/compilation/acl_graph.py`：
+
+```python
+            # important: we need to return the output, rather than
+            # the weak ref of the output, so that pytorch can correctly
+            # manage the memory during acl graph capture
+            return output
+        if self.is_debugging_mode:
+            new_input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
+            assert new_input_addresses == entry.input_addresses, (...)
+        logger.info_once("Replaying aclgraph")
+        # In async scheduling or multi-threaded (MT) scenarios, ... CPU record event
+        # (from update_attn_params) for iteration i may complete before graph replay of i-1.
+        # must synchronize here before replaying, so update_attn_params only executes after
+        # previous graph replay fully completed.
+        is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
+        need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
+        if remote is not None:
+            logger.debug("DSA_SHARED_GRAPH_REPLAY_BEGIN %s epoch=%s pre_sync=%s batch=%s", ...)
+        if not self.enable_enpu and need_sync:
+            with (remote.host_range("graph_replay_pre_sync", batch_descriptor.num_reqs)
+```
+
+graph replay 前有 `need_sync` 屏障（FULL 模式下非 merge-eagle 需同步），remote 非 None 时打 `DSA_SHARED_GRAPH_REPLAY_BEGIN` debug 日志。**若 worker 在此 pre_sync/同步点停摆，恰对应 R22-0 观测的 CONNECT_OK 后 draft replay 区间静默**（DSA_SHARED_GRAPH_REPLAY_BEGIN 为 debug 级，常规日志不可见，需 DSA_ 级 debug 开关才可见）。
+
+**块3 · DP2 独立崩溃 exception 原文（r19-bench-bs4/raw/model.log:2635-2715）**
+
+```
+(Worker_DP2_TP0_EP4 pid=1999194) ERROR 10-30 17:46:26 [multiproc_executor.py:987] WorkerProc hit an exception.
+...
+  File "/vllm-workspace/vllm/vllm/v1/executor/multiproc_executor.py", line 982, in worker_busy_loop
+  File "/vllm-workspace/vllm/vllm/v1/worker/worker_base.py", line 345, in execute_model
+  File "/home/fjj/vllm-ascend-remote-offload/vllm_ascend/worker/worker.py", line 650, in execute_model
+  File ".../site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+  File "/home/fjj/vllm-ascend-remote-offload/vllm_ascend/worker/model_runner_v1.py", line 3002, in execute_model
+    hidden_states = self._model_forward(
+  File ".../model_runner_v1.py", line 3558, in _model_forward
+    hidden_states = run_model()
+  File ".../vllm_ascend/compilation/acl_graph.py", line 163, in __call__
+    return self.runnable(*args, **kwargs)
+  ... (module forward chain)
+  File "/vllm-workspace/vllm/vllm/model_executor/models/deepseek_v2.py", line 1713, in forward
+  File ".../model_executor/models/deepseek_v2.py", line 1330, in forward
+  File ".../model_executor/models/deepseek_v2.py", line 1189, in forward
+    hidden_states = self.self_attn(**attn_kwargs)
+  File ".../model_executor/models/deepseek_v2.py", line 1082, in forward
+    return self.mla_attn(positions, hidden_states, llama_4_scaling)
+  File "/home/fjj/vllm-ascend-remote-offload/vllm_ascend/ops/mla.py", line 188, in forward
+    torch.ops.vllm.mla_forward(hidden_states, need_gather_q_kv, output, self.prefix)
+  File ".../ops/mla.py", line 206, in mla_forward
+    self.mla_attn.impl.forward(
+  File ".../vllm_ascend/attention/sfa_v1.py", line 2348, in forward
+    topk_indices = self.indexer_select_post_process(
+  File ".../attention/sfa_v1.py", line 1731, in indexer_select_post_process
+    return dsa_context.execute_decode_selection(
+  File ".../vllm_ascend/dsa_offload/runtime.py", line 980, in execute_decode_selection
+    return self.runtime.remote_shared.select(
+  File ".../vllm_ascend/dsa_offload/remote_shared.py", line 464, in select
+    raise ValueError("remote shared decode requires fixed MTP3 Q=4 capacity B=1..32")
+ValueError: remote shared decode requires fixed MTP3 Q=4 capacity B=1..32
+```
+
+**DP2 崩溃定性**：`remote_shared.py:464 select` 对 MTP3/Q=4/capacity B=1..32 的容量前提断言（`ValueError: remote shared decode requires fixed MTP3 Q=4 capacity B=1..32`）——是 **remote-shared decode 容量配置断言失败**，与「挂起组（DP0/1/3 静默）」不同故障面：DP2 是显式异常崩溃，其余组是静默停摆，印证 R22 判读「DP2 为独立崩溃面」。
+
+### R23-1 · 真 baseline 轮（不经工具、不起 Pool，ENABLE_OFFLOAD=0 生效）
+
+**执行方式修正**：派单命令为宿主 shell 风格，但本机宿主 python3.11 无 vllm/vllm_ascend（R16-1 已修正），R18-R22 全部在容器 dsa-full 内执行（python3.12.13）。R23-1 在容器内执行：`source /usr/local/Ascend/ascend-toolkit/set_env.sh` + `source va.env` + `export PYTHONPATH=/home/fjj/vllm-ascend-remote-offload:$PYTHONPATH`（**使 `import vllm_ascend` 指向 fjj 仓**，派单硬性要求）+ 派单全部 SMOKE 变量 + `VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=0`。**不传 `--remote-shared-config`、不起 Pool**。
+
+- 启动：2026-10-31 02:15:10；结束：02:19:53（R23A_RC=0 干净收尾）。
+- env 核验（`env | grep SMOKE | sort` 原文）：`VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=0`、`BENCH=1`、`MAX_NUM_SEQS=4`、`MAX_MODEL_LEN=40960`、`MAX_NUM_BATCHED_TOKENS=2048`、`MAX_TOKENS=256`、`ENABLE_CHUNKED_PREFILL=1`、`GPU_MEMORY_UTILIZATION=0.97`、`ENABLE_PROFILE=0`、`ENABLE_CPU_BINDING=0`、`RESULT_DIR=/home/fjj/vllm-ascend-remote-offload/results/1p` 全就位。
+- import 核验：`python3 -c "import vllm_ascend; print(vllm_ascend.__file__)"` → `/home/fjj/vllm-ascend-remote-offload/vllm_ascend/__init__.py`（**指向 fjj 仓 ✓**）。
+- 启动行：`[dsa-smoke] baseline MTP graph is not supported; using MTP eager, target mode unchanged`；rank 启动行 `mode=graph offload=False model=... tp=2 bs=4 max_model_len=40960 mtp=True mtp_graph_enabled=False`（4 rank 全 offload=False，`mtp_graph_enabled=False` 与 offload-on 的 True 对照，符合 baseline 预期）。
+
+**通过标准逐条核验**
+
+1. **offload-off 真生效硬证据（三选全中）**：
+   - run 名含 baseline：metrics.json 路径 = `results/1p/dp4_tp2_baseline_graph_mtp_eager.metrics.json`（**不含 offload** ✓）；
+   - 日志无 STORE/connect 行：`DSA_STORE_CLOSED=0` / `DSA_SHARED_CONNECT=0` / `remote_shared=0` / `offload=True=0` ✓（baseline 无 remote 链路，DRAIN/STORE 概念不存在，DRAIN=0 符合预期）；
+   - 启动行 `offload=False` ✓（上条）。
+2. **RUN_OK + 4 rank metrics + metrics.json**：`R23A_RC=0`；4×`[dsa-smoke][metrics][dp=N]`（dp=0/1/2/3，各 requests=4 output_tokens=1024）；metrics.json baseline 路径存在，global + ranks（含 per_request 数组）全字段 ✓。
+3. **`[dsa-smoke][metrics][global]` 原文 + 全局报告块**（见下）。
+
+**`[dsa-smoke][metrics][global]` 原文**
+
+```
+{"dp_size": 4, "requests": 16, "output_tokens": 4096, "global_wall_s": 75.649, "request_throughput_rps": 0.212, "global_output_tps": 54.15, "ttft_ms": {"avg": 41585.292, "min": 16762.825, "p50": 41691.552, "p90": 66177.375, "p99": 66206.019, "max": 66206.019}, "tpot_ms": {"avg": 122.569, "min": 29.806, "p50": 121.828, "p90": 215.03, "p99": 215.038, "max": 215.038}, "tpot_under_50ms": false}
+```
+
+**全局报告块原文**
+
+```
+============ DSA Smoke Benchmark Result (global, offline) ============
+Successful requests: 16
+Benchmark duration (s): 75.65
+Total generated tokens: 4096
+Request throughput (req/s): 0.212
+Output token throughput (tok/s): 54.15
+TTFT (ms): avg=41585.292ms p50=41691.552 p90=66177.375 p99=66206.019 max=66206.019
+TPOT (ms, excl. 1st token): avg=122.569ms p50=121.828 p90=215.03 p99=215.038 max=215.038
+========================================================================
+```
+
+**健康计数**：patch_shm_broadcast 挂起 = 0；EI0006/HcclAllGather = 0；code=1004 = 0。TTFT 全正且 `0 < ttft(41585ms) < global_wall_s×1000(75649ms)` ✓（修复验证再次通过）。
+
+### 判读预案命中：baseline 不降反升，+20% 分子分母全错
+
+**R23-1（真 baseline）vs R21（offload-on）同口径对比**：
+
+| 指标 | R21 offload-on | R23-1 baseline | 变化 |
+|---|---|---|---|
+| global_wall_s | 81.481 | 75.649 | **−7.2%** |
+| output_tps | 50.27 | 54.15 | **+7.7%** |
+| tpot avg (ms) | 135.234 | 122.569 | **−9.4%** |
+| tpot p50 (ms) | 134.919 | 121.828 | **−9.7%** |
+| tpot min (ms) | 28.725 | 29.806 | +3.8%（同量级，干净 decode 步） |
+
+**结论**：真 baseline（offload 完全关闭、无 remote_shared 链路）相对 offload-on **不降反升**（tps +7.7%、wall −7.2%、tpot −9.4%）。这坐实：
+- R22-1 的 ±1.4% 差 = 同构噪声（工具吞 env，offload 实际仍开着）；
+- **「+20% 自提升」的分子分母全错**——在此配方（BS4×256 + 40K chunked-prefill 主导）下 offload-on 反而是纯开销（remote_shared PUT/status checks 全在 decode 路径外但仍有 connect/select 开销），baseline 更快；
+- 命中 R23 判读预案「若差距 <5% 按 40K prefill 主导期解释」的加强版：**差距不仅 <5% 且反号（+7.7%）**——offload 收益预期在 decode 稳态/容量维度，不在此配方，需 100K×1K 长 decode 尾段（待 shm 泄漏根修后）才能兑现。
+
+**R23-0 后续**：块1 实锤 → 蓝区可决定是否给工具加 `--no-offload` 透传参数（代码线）；块2/3 → 停摆根修方案（R24 代码线）输入已齐。
+
+**日志/产物路径**：容器内 `/home/fjj/pp_r23a.log`（tee 全量）、`/home/fjj/r23a_wrapper.log`（env+import+RC 标记）、`/home/fjj/vllm-ascend-remote-offload/results/1p/dp4_tp2_baseline_graph_mtp_eager.metrics.json`。运行后机器已自然收尾（EngineCore 全 SIGTERM 退出、worker 队列终止）。

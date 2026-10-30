@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R24 已交付（2026-10-31）——clamp 理论实证坐实：R19-1 逐字唯一改 MAX_MODEL_LEN=43008（BS4×1024），R24_RC=0 干净收尾，8/8 DRAIN_OK + 8×STORE_CLOSED + patch_shm 挂起=0（**1024 步 decode 首次无挂起**），output_tps=164.26 / tpot avg=48.32ms / TTFT avg=45382ms 全正；1024 步解锁，R25 进 BS16×1024 + 100K×1K 验收配方，非 uniform 路由根治转代码线挂账。
+- Current owner: **绿区**。Status: §R25 已派单（2026-10-31）——R24 判读：clamp 统一理论实证坐实（唯一变量 ML43008 从崩+挂→全净），纪律入库「max_model_len > max(prompt)+max_tokens+MTP 余量」；1024 步首个 decode 主导 bench 点：tps=164.26、tpot avg=48.32/min=21.55ms。R25 = R25-1 BS16×1024 offload-on（R18 原始失败点复测）+ R25-2 同配方 baseline（绕工具直跑）对照，给 +20% 口径 decode 主导数据点；R25-2 若 OOM 即 offload 容量价值直接证据。R26 预案 = 100K×1K 验收配方。
 
 ## 0. 目标与口径
 
@@ -2533,6 +2533,62 @@ export VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=43008   # 原 40960；+2048 余量覆盖 
 - **过** ⇒ clamp 理论坐实：1024 步 decode 解锁，R25 进 BS16×1024 + 100K×1K 验收配方；非 uniform 路由根治（eager 分支正确处理 Q≠4）转代码线挂账（生产健壮性，不阻塞验收）。
 - **崩（新 ValueError 带上下文）** ⇒ actual_q/row_modes 原文即非 uniform 步类型证据，蓝区直接出根治 commit；
 - **挂（无崩溃、60s 告警复现）** ⇒ clamp 理论证伪，回传挂起 worker 最后 30 行 + 各 EngineCore 告警计数，蓝区转 Pool native 闸口方向。
+
+## §R24 判读（蓝区，2026-10-31）
+
+### 裁决
+
+1. **clamp 统一理论实证坐实（本轮最重要结论）**：唯一变量 MAX_MODEL_LEN=40960→43008，同 BS4×1024 配方从「崩+挂全中」变为「8/8 DRAIN + 挂起 0 + 崩溃 0 + 自然收尾」。R18/R19-1 挂起、DP2 ValueError、shm 60s 告警全链路根因闭环：**max_model_len 装不下 prompt+output → decode 尾部 clamp 出非 uniform 步 → eager 回退仍进 remote select → Q=4 断言**。纪律入库：**任何 bench/验收配方必须满足 max_model_len > max(prompt) + max_tokens + MTP 余量**；非 uniform 步的 eager 路由根治转代码线挂账（生产健壮性，不阻塞验收）。
+2. **1024 步 decode 解锁 + 首个 decode 主导口径 bench 点落袋**：BS4×1024（16 请求 × 1024 token）wall=99.74s、**output_tps=164.26**、**tpot avg=48.32ms / p50=48.26 / p90=77.48 / min=21.55ms**、TTFT avg=45.4s。decode 占比从 256 步的 ~19% 升到 ~55%，tpot avg 从 135ms 降到 48.3ms——污染稀释效应与口径预期一致；min=21.55ms 为目前最干净单步。注意 p99=77.6ms 仍含 prefill 交错段，TPOT<50ms 验收需稳态口径（长 decode 尾段），100K×1K 配方下 decode 占比 >90% 时 avg 即逼近稳态。
+3. offload-on 1024 步 vs baseline 256 步不可直接比（不同配方）；R25 安排同配方对照。
+
+## §R25 派单：BS16 放大轮 + 同配方 baseline 对照（蓝区，2026-10-31）
+
+### 目标
+
+①验证 BS16（全局 64 请求，R18 原始失败点）在 ML43008 下解锁；②同配方（BS16×1024、decode 主导）落 offload-on vs baseline 对照，给 +20% 口径第二个数据点。
+
+### R25-1 · BS16×1024 offload-on（经工具）
+
+R24 命令逐字（作者数据面 + BENCH=1 + batched2048/chunked1 + MAX_TOKENS=1024 + MAX_MODEL_LEN=43008），唯一变量：
+
+```bash
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=16   # BS4→BS16，全局 64 请求
+```
+
+输出 `tmp/r25-bench-bs16-mt1024-ml43008`，日志 `/home/fjj/pp_r25a.log`。前置门禁/1004 白名单不变。
+
+### R25-2 · BS16×1024 baseline（绕工具直跑，R23-1 模式）
+
+R23-1 命令逐字（容器内 + source va.env + PYTHONPATH 前置 fjj + 不起 Pool + 不传 remote-shared-config），env 取 R25-1 同值 + `VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=0`：
+
+```bash
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=16
+export VLLM_ASCEND_SMOKE_MAX_TOKENS=1024
+export VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=43008
+export VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=0
+# 其余同 R23-1（BENCH=1/DATASET=chinese_40k/batched2048/chunked1/GPU_MEM=0.97/PROFILE=0/CPU_BINDING=0/RESULT_DIR 绝对路径）
+```
+
+日志 `/home/fjj/pp_r25b.log`。
+
+### 通过标准
+
+- R25-1：8/8 DRAIN + STORE_CLOSED + 挂起 0 + metrics 全产出 + TTFT 全正；
+- R25-2：offload=False 硬证据三条（run 名 baseline / 无 STORE 行 / 启动行）+ RUN_OK + metrics 全产出；
+- 两轮原文回传 `[global]` 行 + 报告块。
+
+### 失败处置
+
+- R25-1 挂起/崩溃复现 ⇒ clamp 理论边界外还有第二触发源，新断言上下文 + 挂起上下文原文回传；
+- R25-2 OOM（BS16×43K HBM 超限可能）⇒ 回传 OOM 原文，这本身是「offload 容量价值」的直接证据，不算失败；
+- 1004 ⇒ 白名单；EI0006 ⇒ 回传 env 核验。
+
+### 判读预案（派单时写死）
+
+- R25-1 vs R25-2 同配方对照 → decode 主导口径的 offload 损益第二个数据点；
+- 若 R25-2 OOM 而 R25-1 过 ⇒ offload 容量价值直接成立，验收叙事改为「offload 解锁 baseline 跑不了的规格」；
+- 之后 R26 = 100K×1K 验收配方（chinese_104k + MAX_MODEL_LEN≥105K + MAX_TOKENS=1024，offload-on vs baseline 同口径）。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

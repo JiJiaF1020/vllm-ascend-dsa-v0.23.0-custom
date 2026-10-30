@@ -241,3 +241,8 @@ pull 15db763（TTFT 改 first_token_latency 优先 + R22 派单）后执行：R2
 ## §R24 交付：clamp 理论实证坐实——1024 步 decode 首次无挂起（BS4×1024 + ML43008）（2026-10-31）
 
 **R24 过（三标准全命中）**：R19-1 配方逐字唯一改 MAX_MODEL_LEN=40960→43008（BS4×1024 经工具 offload-on，作者数据面 dp4tp2.json）：R24_RC=0 干净收尾（R19-1 需人工清理），8/8 DRAIN_OK + 8×STORE_CLOSED（put_pages=97344×8 real_store=1）+ **patch_shm 挂起=0**（1024 步首次无挂起）+ 4 rank metrics + metrics.json + `[global]` 原文：requests=16/output_tokens=16384/global_wall_s=99.743/rps=0.16/output_tps=164.26/ttft avg=45382ms（全正 0<ttft<wall×1000）/tpot avg=48.32 p50=48.263 min=21.551/tpot_under_50ms=false。ValueError/EI0006/1004 全 0。**唯一变量 ML 40960→43008 消除 clamp → clamp 统一理论实证坐实**（max_model_len 不足→尾部非 uniform 步→eager 仍进 remote select→Q=4 断言），1024 步 decode 解锁，R25 进 BS16×1024+100K×1K 验收配方；非 uniform 路由根治转代码线挂账。数据点=1024 步口径首个 bench 点（output_tps=164.26、tpot avg=48.32ms）。
+
+## §R24 判读 + §R25 派单：clamp 理论实证坐实，1024 步解锁，BS16 放大轮（2026-10-31）
+
+**判读**：唯一变量 MAX_MODEL_LEN=40960→43008，同 BS4×1024 从「崩+挂全中」变「8/8 DRAIN + 挂起 0 + 自然收尾」——clamp 统一理论实证坐实（max_model_len 装不下 prompt+output → decode 尾部 clamp 非 uniform 步 → eager 仍进 remote select → Q=4 断言；同步区内炸=静默挂、区外炸=ValueError、shm 告警=下游）。纪律入库：max_model_len > max(prompt)+max_tokens+MTP 余量。首个 decode 主导 bench 点（BS4×1024×16 请求）：wall=99.74s、output_tps=164.26、tpot avg=48.32/p50=48.26/p90=77.48/min=21.55ms、TTFT avg=45.4s 全正。非 uniform 路由根治转代码线挂账。
+**派单**：R25-1 BS16×1024 offload-on（R24 逐字唯一改 MAX_NUM_SEQS=16，R18 原始失败点复测）+ R25-2 同配方 baseline（绕工具直跑 ENABLE_OFFLOAD=0），decode 主导口径 +20% 对照第二数据点；R25-2 OOM 即 offload 容量价值直接证据。R26 预案=100K×1K 验收配方（chinese_104k + ML≥105K + MT1024）。

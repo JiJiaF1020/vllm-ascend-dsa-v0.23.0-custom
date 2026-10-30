@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **蓝区**。Status: §R22 已交付（2026-10-31）——R22-0 三块取证原文已回传（shm 写侧源码+停摆窗口+告警计数，支持 connect 后停摆嫌疑，DP2 为独立崩溃路径）；R22-1 offload-off 对照轮 RUN_OK+8/8 DRAIN+metrics 全产出，TTFT 修复验证通过（ttft avg=45337ms 全正，0<ttft<wallx1000 满足）；offload-off 相对 on 略快 -1.1s/-1.4% tps/tpot avg -2.5ms，判读=40K prefill 主导期 offload 无净收益分支，自提升口径本配方不成立，待蓝区裁决。
+- Current owner: **绿区**。Status: §R23 已派单（2026-10-31）——R22 判读：①TTFT 修复验证通过（first_token_latency 方案闭环，avg=45.3s 符合 40K prefill 物理图像）；②**R22-1 非真对照**：ENABLE_OFFLOAD=0 被 scp-opt 工具吞掉（run 名仍含 offload、put_pages=97344 逐位相同、real_store=1），±1.4% 只是同构噪声，+20% 对照基线未落袋；③shm 停摆收敛：worker 在 CONNECT_OK→MTP draft graph replay 后静默（非块泄漏），DP2 为独立崩溃面。R23 = R23-0 三块只读取证（工具 env 传递/draft replay 源码/DP2 exception 原文）+ R23-1 真 baseline 轮（绕过工具直跑 simple_test_1p.py，ENABLE_OFFLOAD=0 硬证据三条）。
 
 ## 0. 目标与口径
 
@@ -2419,6 +2419,80 @@ TPOT (ms, excl. 1st token): avg=132.716ms p50=132.335 p90=237.928 p99=238.159 ma
 判读（命中预案分支）：offload-off 相对 offload-on 略快（wall -1.1s / tps +1.4% / tpot avg -2.5ms），差距约 1.4% 量级。按预案区分：本配方 40K prefill 主导期（TTFT约45s 占 wall 80s 过半），offload 在 prefill 主导期无净收益甚至微负——remote shared store 写路径（put_pages=97344 scatter_sfa=7239）仍有固定开销；decode 稳态（tpot min约28-29ms 干净 decode 步）两者基本持平。offload 自提升口径在本配方下不成立（-1.4%），需蓝区裁决：是否属「40K prefill 主导期 offload 无收益」分支（不下一刀切结论），或需 100K x 1K 长 decode 尾段配方测 decode 稳态收益。
 
 失败处置：无 TTFT 越界（修复已验证）、无 patch_shm 挂起复现（0 次）、无 1004/EI0006。机器已清场（owned Pool 已停止）。
+
+## §R22 判读（蓝区，2026-10-31）
+
+### 裁决
+
+1. **TTFT 修复验证通过（验收级证据）**：offload-off 轮 `ttft_ms avg=45337/min=18556/p99=71823`，全部落在 `0 < ttft < wall×1000` 区间；per_request 18556→71822 递增 = 4 请求/rank 顺序 prefill 肩叠加，与 40K chunked prefill 物理图像一致。`first_token_latency` 方案闭环，TTFT 统计链从此可用。
+2. **R22-1 不是真对照——ENABLE_OFFLOAD=0 被工具层吞掉（重大发现）**：绿区实测 offload-off 轮仍 `real_store=1` + `put_pages=97344`（与 offload-on 逐位相同）+ run 名仍含 `offload`（`dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared`，run 名由 simple_test.py:77 按 `config.enable_offload` 生成）。蓝区代码链已核：`VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=0` → `enable_offload=False` → `build_llm_kwargs`（simple_test.py:298）跳过整个 `dsa_sparse_config` → 不应有任何 STORE 行。实测相反 ⇒ **`profile_pool_inference.py`（scp-opt 工具）在拉起框架子进程时强制/覆盖了 offload 配置**，smoke env 未穿透。因此 R22-1 的 ±1.4% 差只是同构重跑噪声，**「+20% 自提升」对照基线仍未落袋**。
+3. **shm 停摆机制收敛（R22-0 取证消化）**：① acquire_write 源码证实写侧等 `read_count==n_reader` 才复用块，60s 告警 = 有 reader 停消费（与既有判断一致）；②停摆窗口决定性证据：17:46:09 全部 8 worker `DSA_SHARED_CONNECT_OK` + TP0 打 `llm_base_proposer.py:651 MTP draft graph replay` 后，**DP0/1/3 完全静默至 SIGTERM**——停摆点在「connect 完成 → draft graph replay」这一同步区间；③**DP2 是独立故障面**（17:46:26 WorkerProc exception → EngineCore SIGTERM），不是静默挂起，两轮（R18 挂 DP1/2/3、R19-1 挂 DP0/1/3）挂起组漂移 = 静默挂起有竞态成分。修复方向：查 draft graph replay 与 remote store group_gather=full（21 组）的交互，不是 shm 块生命周期本身。
+4. 基线数据保持 R20/R21（offload-on）：wall=81.5s、output_tps=50.3、tpot avg=135.2/min=28.7ms。TTFT 基线 = 本轮 45.3s（avg，offload 开关对 TTFT 无物理影响，同配方可互用）。
+
+## §R23 派单：真 baseline 对照轮 + 工具吞 env 取证 + draft replay 停摆源码（蓝区，2026-10-31）
+
+### R23-0 · 只读取证（免费，先做）
+
+```bash
+# 块1 · 工具吞 env 实锤：profile_pool_inference.py 如何传 env 给框架子进程
+grep -n "OFFLOAD\|offload\|env\b\|environ" /home/w00919836/scp-opt/tools/profile_pool_inference.py | head -40
+# 块2 · 停摆点源码：draft graph replay 上下文 + connect 之后的调用链
+sed -n '620,700p' /vllm-workspace/vllm/vllm/v1/spec_decode/llm_base_proposer.py 2>/dev/null || \
+  grep -rn "Replaying separate merged" /vllm-workspace/vllm/vllm/ | head -5
+sed -n '270,300p' /home/fjj/vllm-ascend-remote-offload/vllm_ascend/compilation/acl_graph.py
+# 块3 · DP2 独立崩溃的 exception 原文（R19-1，17:46:26 前后 30 行）
+grep -n -A25 "Worker_DP2_TP0_EP4.*WorkerProc hit an exception" /home/w00919836/scp-opt/tmp/r19-bench-bs4/raw/model.log | head -40
+```
+
+三块原文回传。
+
+### R23-1 · 真 baseline 轮（不经工具、不起 Pool，ENABLE_OFFLOAD=0 必须生效）
+
+工具会吞 offload 开关（R22 判读 2），本轮**绕过工具直跑框架入口**（baseline 不需要远端 Pool）：
+
+```bash
+cd /home/fjj/vllm-ascend-remote-offload && git -c http.proxy=http://90.255.129.35:3128 pull --ff-only && git log --oneline -2
+source /home/w00919836/va.env
+export VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731
+export VLLM_ASCEND_SMOKE_DATASET=chinese_40k
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=4
+export VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=40960
+export VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS=2048
+export VLLM_ASCEND_SMOKE_MAX_TOKENS=256
+export VLLM_ASCEND_SMOKE_ENABLE_CHUNKED_PREFILL=1
+export VLLM_ASCEND_SMOKE_GPU_MEMORY_UTILIZATION=0.97
+export VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0
+export VLLM_ASCEND_SMOKE_BENCH=1
+export VLLM_ASCEND_SMOKE_ENABLE_CPU_BINDING=0
+export VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=0
+export VLLM_ASCEND_SMOKE_RESULT_DIR=/home/fjj/vllm-ascend-remote-offload/results/1p
+cd /home/fjj/vllm-ascend-remote-offload/examples/dsa_demo
+env | grep SMOKE | sort   # 原文回传
+python3 -c "import vllm_ascend; print(vllm_ascend.__file__)"   # 须指向 fjj 仓
+python3 simple_test_1p.py 2>&1 | tee /home/fjj/pp_r23a.log
+echo "RC=$?"
+```
+
+前置门禁：进程 0 / NPU 8 卡全空闲 / shm ≥370G（不碰他人作业）。**不传 `--remote-shared-config`，不起 Pool**。
+
+### 通过标准
+
+1. **offload-off 真生效的硬证据**（三选全中）：run 名含 `baseline`（results/1p 下 metrics.json 路径不含 `offload`）；日志**无** `DSA_STORE_CLOSED/DSA_SHARED_CONNECT` 行；启动行 `[dsa-smoke] ... offload=False`。
+2. RUN_OK + 4 rank `[dsa-smoke][metrics][dp=N]` + metrics.json（baseline 路径）全字段。
+3. 原文回传 `[dsa-smoke][metrics][global]` 行 + 全局报告块全文。
+
+### 失败处置
+
+- run 名仍含 offload / 仍有 STORE 行 ⇒ env 仍未生效，回传 `grep -n "enable_offload" examples/dsa_demo/simple_test.py | head` + 启动行原文，停；
+- EI0006 ⇒ 配方回归检查（baseline 无 remote 链路，理论上触发面更小；发生即回传 env 核验）；
+- 挂起 ⇒ 回传挂起点最后 30 行（baseline 无 store connect，若仍挂 = 嫌疑从 connect 交互转向纯 draft replay）；
+- 1004 ⇒ 白名单（≤2，≥5min 静置 + 清场）。
+
+### 判读预案（派单时写死）
+
+- R23-1（真 baseline）vs R21（offload-on）同口径对比 → 「+20% 自提升」分子分母落袋；若差距仍 <5%，判读时按 40K prefill 主导期解释（offload 收益预期在 decode 稳态/容量维度，不在此配方），并明确写进给用户的结论；
+- R23-0 块1 实锤后，蓝区决定是否给工具加 `--no-offload` 透传参数（代码线）；
+- R23-0 块2/3 + 本仓 dsa_offload remote_shared 源码 → 蓝区出停摆根修方案（R24 代码线）。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

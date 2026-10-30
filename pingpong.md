@@ -25,6 +25,8 @@
 - "零 miss 第二轮全 hit 卡住"是作者未关闭问题；若复现，保留 generation/status/Pool 三方日志原样回传。
 - 新旧 Pool/OPP/extension 不可混装；本轮全部用同一套源码新鲜编译。
 - backing 文件不会自动删除；每次起 Pool 用全新路径。
+- **用户经验入库（2026-10-30）：开 vLLM profile 采数据时 decode 阶段会挂**——与 R17-2/R18 的 `patch_shm_broadcast` 写侧块耗尽挂起同根嫌疑（profile 增大每步广播流量 → 加速块耗尽）。纪律：**bench/验收轮 ENABLE_PROFILE=0；采 profile 须先修 shm 块泄漏或压到极小并发**。R17-2 曾因 unset 落作者脚本默认 enable_profile=True 而实采 profile 后挂起，同型旁证。
+- **EI0006 已知边界（R17 坐实）**：bench/验收配方必须 `MAX_NUM_BATCHED_TOKENS=2048` + `ENABLE_CHUNKED_PREFILL=1` 成对出现；大 batched（≥25600）会在 determine_available_memory 的 dummy 前向首个 EP8 all-gather 建连超时。
 
 ---
 

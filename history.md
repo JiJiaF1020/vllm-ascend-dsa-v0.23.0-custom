@@ -188,3 +188,7 @@
 
 **R19-1（BS4×1024，R18 逐字仅 BS16→BS4）**：EI0006=0/1004=0，DRAIN 仅 2/8（DP2），patch_shm_broadcast 挂起复现（DP0/1/3，首挂 17:47:28），泄漏∝decode 步数（1024）而非请求数（16）坐实。
 **R19-2（BS4×256）**：EI0006=0/1004=0，**8/8 worker 全 DRAIN_OK + STORE_CLOSED（requests=4 put_pages=97344 remote_get=1）+ patch_shm 挂起 0 次**——短 decode 彻底消除收尾挂起，坐实泄漏∝步数；overlap CSV 8 端口 7239-7581 行（classify_union_mean≈38-39µs）。**但收尾撞框架仓统计 bug**：simple_test.py:451 `first_token_time` AttributeError（vLLM 0.23.0 已改名 `first_token_ts`，stats.py:208），4 DP 全崩 → metrics 未产出、基线未落袋。该函数是框架仓 R10 bench 口径新提交 717c396/e6fd53b 引入（作者 va 仓无），改字段名即可收 baseline。R19-3（BS1×64）不执行（挂起已消除，非挂起问题）。
+## §用户经验入库：profile×decode 挂起与 EI0006 配方边界（2026-10-30）
+
+用户反馈：开 vLLM profile 采数据时 decode 阶段会挂。蓝区核实：bench 配方 ENABLE_PROFILE=0 + --no-perf，未采 vLLM 侧 profile（pool 侧 overlap CSV 为固有遥测，R9 干净 run 同开）；该经验与 R17-2/R18 patch_shm 写侧块耗尽同根嫌疑（profile 增大每步广播流量→加速块耗尽），R17-2 曾因 unset 落作者默认 enable_profile=True 实采 profile 后挂起，同型旁证。纪律：bench/验收轮 profile 关；采 profile 先修块泄漏。同日入库 EI0006 配方边界：batched2048+chunked1 成对必需。
+

@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R23 已交付（2026-10-31）——R23-0 工具吞 env 源码实锤（profile_pool_inference.py:414 无条件覆盖 ENABLE_OFFLOAD）+ draft replay/DP2 崩溃源码；R23-1 真 baseline 落袋（绕工具直跑容器内，ENABLE_OFFLOAD=0 硬证据三选全中）：**baseline 不降反升**（tps +7.7%/wall −7.2%/tpot −9.4% vs R21 offload-on），+20% 分子分母全错，offload 收益预期在 decode 稳态/容量维度。
+- Current owner: **绿区**。Status: §R24 已派单（2026-10-31）——R23 判读：①真 baseline 反超 offload-on +7.7%（tps）坐实 offload 在 40K×256 prefill 主导配方为纯开销，+20% 口径需 100K×1K；②工具吞 env 实锤（profile_pool_inference.py:414）；③**R19-1 挂起/崩溃统一理论：max_model_len=40960 clamp → decode 尾部非 uniform 步 → eager 仍进 remote select → Q=4 断言**（同步区内炸=静默挂、区外炸=DP2 报错，shm 告警=下游症状；256 步不 clamp 全干净 vs 1024 步必 clamp 全崩，数字自洽）。蓝区已推 select 断言全上下文增强。R24 = 理论实证轮：R19-1 逐字唯一改 MAX_MODEL_LEN=43008，BS4×1024 首次冲无挂起。
 
 ## 0. 目标与口径
 
@@ -2493,6 +2493,46 @@ echo "RC=$?"
 - R23-1（真 baseline）vs R21（offload-on）同口径对比 → 「+20% 自提升」分子分母落袋；若差距仍 <5%，判读时按 40K prefill 主导期解释（offload 收益预期在 decode 稳态/容量维度，不在此配方），并明确写进给用户的结论；
 - R23-0 块1 实锤后，蓝区决定是否给工具加 `--no-offload` 透传参数（代码线）；
 - R23-0 块2/3 + 本仓 dsa_offload remote_shared 源码 → 蓝区出停摆根修方案（R24 代码线）。
+
+## §R23 判读（蓝区，2026-10-31）
+
+### 裁决
+
+1. **真 baseline 落袋，offload 在本配方是纯开销（验收口径级结论）**：R23-1（baseline，无 remote 链路）vs R21（offload-on）同口径：wall 75.65s vs 81.48s（**baseline 快 7.2%**）、output_tps 54.15 vs 50.27（**+7.7%**）、tpot avg 122.6 vs 135.2ms（−9.4%）；干净 decode 步 tpot min 29.8 vs 28.7ms 基本持平。**「+20% 自提升」在 BS4×256×40K-prefill 主导配方下不成立且反号**——offload 的收益维度是 KV 容量/decode 稳态（HBM 放不下时的续跑能力），不是此配方的速度。给用户结论：验收要证 +20% 必须换 100K×1K 长 decode 口径，而那条路被 shm 挂起堵着——见下条，已破。
+2. **工具吞 env 实锤**：`profile_pool_inference.py:414` 无条件 `env["VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD"] = "0" if mode=="baseline" else "1"`，外部 export 被覆盖。R22-1 的 ±1.4% = 同构噪声坐实。后续 offload-on 轮继续用工具（默认 mode=remote 正确），offload-off 轮必须绕过工具直跑（R23-1 模式）。
+3. **R19-1 挂起/崩溃双故障面统一（蓝区代码分析，待 R24-1 实证）**：根因 = **max_model_len=40960 clamp**——chinese_40k prompt（≈40K）+ MAX_TOKENS=1024 > 40960，decode 尾部 scheduler 把逼近上限的请求 clamp 成 1~3 token → **非 uniform 步**（如 [4,4,4,2]）；图门正确判 `non_uniform_decode` 回退 eager，但 eager 入口（sfa_v1.py:1709-1716）只看 attn_state 不看 uniform 性，照样进 `remote_shared.select` → Q=4 断言炸。**在同步区（acl graph pre_sync/EP 集合通信）内炸 = 进程静默挂死（DP0/1/3），区外炸 = 干净 ValueError（DP2）**；worker 停消费 → EngineCore shm 写侧 60s 告警 = 下游症状。数字自洽：256 步配方 prompt+256 ≤ 40960 不 clamp → R19-2/R20/R21/R23 全干净；1024 步必 clamp → R18/R19-1 崩/挂。「泄漏∝步数」重新表述为「非 uniform 事件只出现在长跑尾部」。
+4. **蓝区已推送 instrumentation commit**：`remote_shared.select` 的 ValueError 携带全上下文（identity/epoch/b/query_shape/active_num_reqs/graph_enabled/prepared_epoch/actual_q/row_modes）——下次复现直接显示非 uniform 步第一现场，不用猜。
+5. TTFT 修复第二轮验证通过（baseline 轮 41.6s avg 全正）。
+
+## §R24 派单：clamp 理论实证轮（BS4×1024 + max_model_len=43008）（蓝区，2026-10-31）
+
+### 执行
+
+```bash
+cd /home/fjj/vllm-ascend-remote-offload && git -c http.proxy=http://90.255.129.35:3128 pull --ff-only && git log --oneline -2
+# 顶部应含 select 报错增强 commit；grep 核验：
+grep -n "requires fixed MTP3 Q=4 capacity" vllm_ascend/dsa_offload/remote_shared.py
+```
+
+R19-1 配方逐字（经工具 profile_pool_inference.py + 作者数据面 + BENCH=1 + batched2048/chunked1 + BS4 + MAX_TOKENS=1024），**唯一变量**：
+
+```bash
+export VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=43008   # 原 40960；+2048 余量覆盖 prompt(≤~40.7K)+1024 的 clamp 区
+```
+
+输出目录 `tmp/r24-bench-bs4-mt1024-ml43008`，日志 `/home/fjj/pp_r24.log`。前置门禁/白名单（1004 ≤2 次、≥5min 静置 + 清场）不变。
+
+### 通过标准
+
+1. 8/8 DRAIN_OK + 8×STORE_CLOSED + patch_shm 挂起 = 0 次（**核心：1024 步首次无挂起**）；
+2. 4 rank metrics + metrics.json + `[dsa-smoke][metrics][global]` 原文回传（这是 1024 步口径的第一个 bench 点）；
+3. TTFT 全正（0 < ttft < wall×1000）。
+
+### 失败处置（三分支，全部回传原文）
+
+- **过** ⇒ clamp 理论坐实：1024 步 decode 解锁，R25 进 BS16×1024 + 100K×1K 验收配方；非 uniform 路由根治（eager 分支正确处理 Q≠4）转代码线挂账（生产健壮性，不阻塞验收）。
+- **崩（新 ValueError 带上下文）** ⇒ actual_q/row_modes 原文即非 uniform 步类型证据，蓝区直接出根治 commit；
+- **挂（无崩溃、60s 告警复现）** ⇒ clamp 理论证伪，回传挂起 worker 最后 30 行 + 各 EngineCore 告警计数，蓝区转 Pool native 闸口方向。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

@@ -461,7 +461,13 @@ class RemoteShared:
     def select(self, context, query, weights, scale, actual_q, rows, candidates, visible, row_modes, table, budgets):
         b = rows.numel()
         if not 0 < b <= 32 or query.shape != (4*b, 32, 128):
-            raise ValueError("remote shared decode requires fixed MTP3 Q=4 capacity B=1..32")
+            raise ValueError(
+                "remote shared decode requires fixed MTP3 Q=4 capacity B=1..32: "
+                f"{self.identity} epoch={self.runtime._forward_epoch} b={b} "
+                f"query_shape={tuple(query.shape)} active_num_reqs={self.runtime.active_num_reqs} "
+                f"graph_enabled={self.graph_enabled} prepared_epoch={self.prepared_epoch} "
+                f"actual_q={actual_q.cpu().tolist()} row_modes={row_modes.cpu().tolist()}"
+            )
         pool = self.runtime.resident_token_pool
         if self.graph_enabled:
             if self.prepared_epoch != self.runtime._forward_epoch:

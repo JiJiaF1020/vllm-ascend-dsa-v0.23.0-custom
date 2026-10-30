@@ -171,3 +171,8 @@
 **R16 交付**（commit 12866a46b）：R16-0 va.env 全文——13 smoke env；关键值 MAX_NUM_BATCHED_TOKENS=$((2048))、MAX_TOKENS=256、RUN_MODE=graph、MTP×3、TP2/DP4、chinese_40k、MODEL_PATH=/data/...0731/；非 smoke 独有 VLLM_ASCEND_DSA_HOST_MSTX=0；无 HCCL 变量。R16-1 融合配方（va.env 全量+我们 10 值覆盖，scp-va+作者数据面）EI0006×20 → D 非保护因子、MSTX=0 排除（非充分）。
 **R16 判读**（蓝区）：D 集合审计——MTP/TP/DP/RUN_MODE 与脚本默认值同值天然 inert；真不同值仅 batched_tokens/MAX_TOKENS/MSTX。**batched_tokens 相关性闭环：profile 过的 run（R9 RUN_OK/R15-1/作者现场）全=2048；崩的 10+ run 全≥25600（含 unset 默认 25600）→ 唯一完美相关变量**。机制：determine_available_memory dummy 前向 batch=batched_tokens，大 batch 首个 EP8 all-gather 首连超时。bench 口径预告：2048 下 prefill 分块、TPOT 不受影响。
 **R17 派单**：R15-2 基线（仅 MODEL_PATH）逐个加回：①batched=2048 ②+chunked1 ③+MSTX=0 ④+MAX_TOKENS=256，命中即停（过 profile=EI0006=0）；每步 env 原文核验+默认值回显；R18 预案=命中组合+fjj 仓+BENCH=1 落 bench 基线。
+
+## §R17 保护因子直测命中 + §R18 fjj bench 整网数据面跑通（2026-10-30）
+
+**R17 阶梯**：R17-1（batched2048 单设）撞配置校验 `chunked prefill is off: max_num_batched_tokens must be >= max_model_len`（simple_test.py:231，batched<model_len 非法）未到 profile；R17-2（+chunked1）**EI0006=0 命中**，1004=76（DP3_TP1_EP7 KV-cache 绑定）、DRAIN_OK×1（DP3_TP0_EP6）、EngineCore DP0/1/2 patch_shm_broadcast 挂起 → 保护因子=batched2048+chunked1，阶梯即停，R16 判读（profile 过=2048）坐实。
+**R18 bench**（fjj 仓+命中组合+BENCH=1，tmp/r18-fjj-bench）：首跑 `worker.py:475 Free memory 2.48/91.75 GiB`（R17-2 残留 worker 占 HBM 环境时序）→ 清场重跑。重跑 **EI0006=0/1004=0**、64 请求 decode 完成、`DSA_STORE_CLOSED requests=16 put_pages=389376 remote_get=1`、DRAIN_OK×2（DP0）、overlap CSV 14992 行（classify_union_mean≈75µs）——**整网数据面首次真跑通**。但 **3/4 EngineCore patch_shm_broadcast 挂起**（21 条，R17-2 同签名）→ `[dsa-smoke][metrics]`/metrics.json 未产出 → §R10 通过标准第 3/4 条不满足，bench 基线未落袋。新阻塞点=推理完成后收尾广播挂起，交蓝区判读。

@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R16 已判读（**真凶定位：MAX_NUM_BATCHED_TOKENS——profile 过的 run 全=2048（va.env），崩的 run 全≥25600**；MSTX=0 被 R16-1 排除；MTP/TP/DP 等 D 变量与默认值同值天然 inert）+ **§R17 派单已发**（R15-2 基线逐个加回保护因子：batched2048→+chunked1→+MSTX→+MAX_TOKENS256，命中即停；R18 bench 配方预案已写死）。bench 0/10。
+- Current owner: **蓝区**。Status: §R17 交付已回传（R17-1 batched2048 单设撞配置校验 `chunked prefill is off: max_num_batched_tokens must be >= max_model_len`；R17-2 +chunked1 **EI0006=0 命中** → 保护因子=batched2048+chunked1 组合，R16 判读坐实）；§R18 bench（fjj 仓+命中组合+BENCH=1）已跑：**EI0006=0/1004=0 + 整网数据面真跑通**（64 请求 decode、put_pages=389376、remote_get=1、DRAIN_OK×2、overlap CSV 14992 行 classify_union_mean≈75µs），但 **3/4 EngineCore patch_shm_broadcast 挂起**（R17-2 同签名）→ `[dsa-smoke][metrics]`/metrics.json 未产出 → §R10 通过标准第 3/4 条不满足；新阻塞点=推理完成后收尾挂起。bench 0/10。
 
 ## 0. 目标与口径
 
@@ -1752,6 +1752,64 @@ echo "RC=$?"
 ### 回传格式
 
 同 §R16（每步 env 核验原文、EI0006 计数/相位、默认基线值回显、日志路径、起止时间）。
+
+## §R17+R18 交付：保护因子直测命中 + fjj bench 整网数据面跑通（绿区，2026-10-30 14:28~15:24）
+
+### §R17 阶梯结果
+
+**R17-1（batched2048 单设，scp-va + 作者数据面，tmp/r17-b2048）**：**未到 profile 相位——撞配置校验**。模型日志：
+```
+ValueError: chunked prefill is off: max_num_batched_tokens must be >= max_model_len
+```
+simple_test.py:231 跨字段校验：chunked off 时 batched(2048) < model_len(默认 25600) 组合非法。summary.txt=RUN_FAILED（`RuntimeError: model exited 1`）。EI0006=0（未到建链）。按阶梯直接进 R17-2。
+
+**R17-2（+chunked1，tmp/r17-b2048-c1）**：**EI0006=0 命中**（profile 相位通过，决定性）。1004=76（14:34:28 `Worker_DP3_TP1_EP7 RaGetDevEidInfoList failed code=1004`，ub_v2_resource.cpp:554 rc=328103 phyId=7，KV-cache 绑定阶段）；DRAIN_OK×1（14:34:40 `Worker_DP3_TP0_EP6 DSA_SHARED_DRAIN_OK`）；EngineCore DP0/1/2 挂起 `patch_shm_broadcast.py:74 No available shared memory broadcast block found in 60 seconds`。**命中派单判据「过 profile = EI0006=0，后续 1004/hang 也算过相位」⇒ 保护因子=batched2048+chunked1 组合，阶梯即停**，R17-3/R17-4 不需执行。与蓝区「profile 过的 run 全=2048」判读吻合。
+
+### §R18 bench（fjj 仓 + 命中组合 + BENCH=1 完整配方）
+
+执行：`--framework-repo /home/fjj/vllm-ascend-remote-offload` + PYTHONPATH 前置 fjj + 命中组合（batched2048/chunked1）+ bench 值（BS16/MAX_MODEL_LEN=40960/CHUNKED=1/GPU_MEM=0.97/PROFILE=0/CPU_BINDING=0/BENCH=1/DATASET=chinese_40k/MAX_TOKENS=1024）+ 作者数据面（dp4tp2.json）。输出 tmp/r18-fjj-bench，日志 /home/fjj/pp_r18.log。启动 15:08:51；首跑失败（14:46 `worker.py:475 Free memory on device (2.48/91.75 GiB) ... less than 0.97(89.0 GiB)`，R17-2 残留 worker 占 HBM 环境时序）→ 清场重跑。
+
+**env 核验原文**（`env | grep SMOKE | sort`）：
+```
+VLLM_ASCEND_SMOKE_BENCH=1
+VLLM_ASCEND_SMOKE_DATASET=chinese_40k
+VLLM_ASCEND_SMOKE_ENABLE_CHUNKED_PREFILL=1
+VLLM_ASCEND_SMOKE_ENABLE_CPU_BINDING=0
+VLLM_ASCEND_SMOKE_ENABLE_PROFILE=0
+VLLM_ASCEND_SMOKE_GPU_MEMORY_UTILIZATION=0.97
+VLLM_ASCEND_SMOKE_MAX_MODEL_LEN=40960
+VLLM_ASCEND_SMOKE_MAX_NUM_BATCHED_TOKENS=2048
+VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=16
+VLLM_ASCEND_SMOKE_MAX_TOKENS=1024
+VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731
+```
+import 核验：`vllm_ascend=/home/fjj/vllm-ascend-remote-offload/vllm_ascend/__init__.py`（fjj 前置生效）、`vllm=/vllm-workspace/vllm/vllm/__init__.py`。non-default args 原文：`max_model_len=40960, tensor_parallel_size=2, enable_expert_parallel=True, block_size=128, gpu_memory_utilization=0.97, max_num_batched_tokens=2048, max_num_seqs=16, quantization=ascend, enable_chunked_prefill=True`（含 MTP spec 3/1/1）。
+
+**通过标准逐条**：
+1. 工具 RC：**未返回 0**——模型收尾阶段 3/4 EngineCore 挂起，主进程停在 POOL_ROI_RUNNING 未收尾，人工清理；summary.txt 未生成（无 RUN_OK）。
+2. `DSA_SHARED_DRAIN_OK`：**2/8 worker**（DP0_TP0_EP0 + DP0_TP1_EP1，15:16:54，select=4997 scatter_sfa=14991 real_store=1）；DP1/2/3 六 worker 未 DRAIN（挂起）。
+3. bench 证据（`[dsa-smoke][metrics]` 行 / bench 报告块 / results metrics.json）：**未产出**（3/4 EngineCore 挂起导致收尾未完成）。
+4. metrics global 行 / bench 报告块原文：**无**（同 3）。
+
+**但整网数据面首次真跑通（重大进展）**：
+- **EI0006=0、code=1004=0**（命中组合确认，profile 相位通过）
+- 64 请求（BS16×4DP）全部 decode 至 ~957 tokens（num_output_tokens=[794..959]），scheduler 16 请求并行，target_resident_budget=12288/sparse_budget=12288/resident_valid≈12380
+- `DSA_STORE_PUT_DONE rows=[15] pages=[312] versions=[20]` 持续至 15:16:32
+- `DSA_STORE_CLOSED requests=16 put_pages=389376 inference=hbm_full_remote_shared remote_get=1`（DP0 两 worker，remote_get=1 数据面真实读取）
+- overlap-19090.csv **14992 行**真实 classify 数据（session=732921069170540，classify_union_mean≈74.987µs，io_count=41424，payload_bytes=27174144）
+
+**新阻塞点定位**：推理完成后 **EngineCore DP1/2/3 挂起 `patch_shm_broadcast.py:74`**（60s 循环 ×21 条，最后 15:23:56）——与 R17-2 命中后完全同签名。EI0006 已解决，但 **3/4 EngineCore 在 bench 收尾广播处挂起**，阻止 8 worker 全 DRAIN 与 `[dsa-smoke][metrics]` 产出 → **§R10 通过标准第 3/4 条不满足，bench 基线未落袋**。交蓝区判读 patch_shm_broadcast 挂起（DP0 正常 DP1/2/3 挂的进程间不对称；推测与 bench 多 session 或 4 DP EngineCore 收尾广播握手相关）。
+
+**日志资产**：`/home/fjj/pp_r18.log`（launch env 原文）、`/home/w00919836/scp-opt/tmp/r18-fjj-bench/raw/model.log`（860KB 全链）、`raw/overlap-19090/91.csv`（满数据）、`raw/pool-a/b.log`。R17：`/home/fjj/pp_r17.log`、`/home/w00919836/scp-opt/tmp/r17-b2048/`（R17-1 校验失败留档）；r17-b2048-c1 输出目录命中后已清理（判定证据见上）。
+
+**框架仓 git log**：
+```
+1ed5def docs(pingpong): R16 判读（真凶=MAX_NUM_BATCHED_TOKENS 相关性闭环）+ R17 保护因子阶梯派单
+5d3e4a1 docs(history): backfill R16 delivery commit hash
+12866a4 docs(pingpong): R16 交付（va.env 原文 + 融合配方验证 EI0006，D 非保护因子）
+```
+
+**起止时间**：R17-1 14:28 / R17-2 14:33~14:41 / R18 首跑 14:45~14:47 / R18 重跑 15:08~15:24（人工清理收尾）。机器已清场（进程 0、NPU 8 卡空闲、shm 373G）。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

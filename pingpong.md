@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **蓝区**。Status: §R19 交付已回传（R19-0 挂起取证；R19-1 BS4×1024 **patch_shm 挂起复现** DRAIN=2/8、泄漏∝decode 步数坐实；R19-2 BS4×256 **8/8 DRAIN_OK + 挂起 0 次**——短 decode 彻底消除收尾挂起，但撞框架仓收尾统计 bug `simple_test.py:451 first_token_time AttributeError`(vLLM 已改名 first_token_ts, 717c396 新代码) → metrics 未产出、基线仍未落袋；修复该属性名即可收 baseline）。bench 0/11。
+- Current owner: **绿区**。Status: §R19 已判读 + **统计 bug 已本地修复**（first_token_time→first_token_ts ×3，mock 全过，随本 commit 推送）+ **§R20 派单已发**（pull 修复后逐字重跑 R19-2 = BS4×256 BENCH=1，过标准=§R10 第 3/4 条 metrics 原文）。挂起包线结论：decode ≤256 步可用，1024 步待 shm 块泄漏根修。bench 0/11。
 
 ## 0. 目标与口径
 
@@ -1899,6 +1899,38 @@ R18 逐字仅 BS16→BS4（MAX_NUM_SEQS=4）。**patch_shm 挂起复现**（命�
 **日志资产**：`/home/fjj/pp_r19.log`（R19-2 主日志，含 POOL_ROI/REPORT 原文）、`/home/w00919836/scp-opt/tmp/r19-bench-bs4/raw/model.log`（R19-1）、`/home/w00919836/scp-opt/tmp/r19-bench-bs4-mt256/raw/model.log`（R19-2 860KB 全链）、`summary.txt`/`run-status.json`（RUN_FAILED + graceful:true）、`raw/overlap-19*.csv`（8 端口满数据）。R19-1 残留 backing 已清（urma_mock DU 持 deleted FD 致 shm 269G→清后 373G）。
 
 **起止时间**：R19-1 17:41~17:53（人工清理收尾）、R19-2 17:57~18:02（自然结束）。机器已清场（进程 0、NPU 8 卡空闲、shm 373G）。
+
+## §R19 判读（蓝区，2026-10-30）+ 统计 bug 已修
+
+### 裁决
+
+1. **泄漏∝decode 步数坐实**：R19-1（BS4×1024）挂起复现（请求数已从 64→16 仍挂）⇒ 与请求数无关、与步数强相关；R19-2（BS4×256）8/8 DRAIN + 挂起 0 次 ⇒ 短 decode 彻底绕开。**当前可用包线：单条 decode ≤256 步**；1024 步需修 shm 块泄漏（代码线挂账，见 §R18 判读）。
+2. **新阻塞 = 蓝区 bench 代码自身 bug**（绿区定位精准，致谢）：`simple_test.py:451/454/455` 用 `metrics.first_token_time/last_token_time`，vLLM 0.23.0 `RequestStateStats` 已改名 `first_token_ts/last_token_ts`（vllm/v1/metrics/stats.py:208-209）。**蓝区已修复**（3 处改名，本 commit），mock 全过（/tmp/test_smoke_metrics.py 同步改）。
+3. 附带资产：R19-2 overlap CSV 8 端口 7239-7581 行，classify_union_mean≈38-39µs（短 decode 口径，与 R18 长 decode 75µs 同量级）。
+
+## §R20 派单：BS4×256 bench 基线落袋轮（蓝区，2026-10-30）
+
+### 执行
+
+```bash
+cd /home/fjj/vllm-ascend-remote-offload && git -c http.proxy=http://90.255.129.35:3128 pull --ff-only && git log --oneline -2
+# 顶部应含本修复提交（simple_test.py first_token_ts 改名）
+```
+
+然后 **R19-2 命令逐字重跑**（fjj 仓 + BENCH=1 + batched2048/chunked1 + BS4 + MAX_TOKENS=256 + 作者数据面全不变），输出目录 `tmp/r20-bench-bs4-mt256`，日志 `/home/fjj/pp_r20.log`。
+
+### 通过标准（§R10 第 3/4 条，本轮核心）
+
+1. 8/8 DRAIN_OK + STORE_CLOSED（R19-2 已证可达，防回归）；
+2. 4 rank 各打出 `[dsa-smoke][metrics][dp=N]` 行 + bench 报告块；
+3. `results/1p/<run_name>.metrics.json` 存在且 global 含 requests/分位数/吞吐/tpot_under_50ms；
+4. **原文回传** `[dsa-smoke][metrics][global]` 行与全局报告块全文。
+
+### 失败处置
+
+- AttributeError 复现 ⇒ pull 未生效，回传 `git log --oneline -2`；
+- patch_shm 挂起复现 ⇒ 泄漏非确定性，回传挂起计数/上下文，蓝区重估包线；
+- 1004 ⇒ 白名单重跑；EI0006 ⇒ 配方回归检查（不应发生）；其它新报错停。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

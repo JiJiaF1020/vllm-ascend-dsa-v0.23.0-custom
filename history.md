@@ -192,3 +192,9 @@
 
 用户反馈：开 vLLM profile 采数据时 decode 阶段会挂。蓝区核实：bench 配方 ENABLE_PROFILE=0 + --no-perf，未采 vLLM 侧 profile（pool 侧 overlap CSV 为固有遥测，R9 干净 run 同开）；该经验与 R17-2/R18 patch_shm 写侧块耗尽同根嫌疑（profile 增大每步广播流量→加速块耗尽），R17-2 曾因 unset 落作者默认 enable_profile=True 实采 profile 后挂起，同型旁证。纪律：bench/验收轮 profile 关；采 profile 先修块泄漏。同日入库 EI0006 配方边界：batched2048+chunked1 成对必需。
 
+
+## §R19 判读 + 统计 bug 修复 + §R20 基线落袋派单（2026-10-30）
+
+**R19 判读**（蓝区）：R19-1（BS4×1024）挂起复现、R19-2（BS4×256）8/8 DRAIN + 挂起 0 次 ⇒ **shm 块泄漏∝decode 步数坐实**（与请求数无关），当前可用包线 decode ≤256 步。新阻塞 = 蓝区 bench 代码 bug：`simple_test.py:451/454/455` 引用 vLLM 旧字段 `first_token_time/last_token_time`，0.23.0 已改名 `first_token_ts/last_token_ts`（绿区 model.log 定位）。
+**蓝区修复**（本 commit）：3 处字段改名；mock（/tmp/test_smoke_metrics.py）同步改并全过。
+**R20 派单**：绿区 pull 修复后逐字重跑 R19-2（BS4×256+BENCH=1），过 = §R10 第 3/4 条 metrics 基线落袋。

@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R14 已判读（代码轴排除；非单一配置值；剩余 4 env 中 3 个本地判 inert，**唯一活嫌疑 = MODEL_PATH 两 ckpt 可能不同**）+ **§R15 派单已发**（R15-0 ckpt config diff 只读锁定；R15-1 今日重放 R11-D 机器对照；R15-2 只留 MODEL_PATH 对照 + R16 分支预案）。R9 阳性落袋不变；bench 基线 0/8。
+- Current owner: **蓝区**。Status: **§R15 已交付**（R15-0：/home/models/..._99 不存在，两 ckpt 前提失效，实际全走 /data/model 同路径；R15-1：今日重放 R11-D 复现同签名=机器未劣化；R15-2：只留 MODEL_PATH 仍 EI0006×13 ⇒ MODEL_PATH 值排除，只剩 env 机制轴，等 R16）。R9 阳性落袋不变；bench 基线 0/8。
 
 ## 0. 目标与口径
 
@@ -1486,6 +1486,59 @@ export VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731
 ### 通过标准与回传格式
 
 同 §R14（R15-0 三块原文必回；R15-1/R15-2 附 import 路径、日志路径、起止时间、EI0006 计数/相位）。
+
+## §R15 交付：MODEL_PATH 轴排除 + 双对照完成（绿区，2026-10-30）
+
+### 结论（判读速览）
+
+- **R15-0**：`/home/models/GLM-5.2-w4a4c8-mxfp4_99` 在本机/容器**均不存在**（CONFIG_MISSING，ls 报 No such file）⇒ 蓝区「两 ckpt 可能不同」的前提在本机不成立。所有实际运行（R11-D/R14-1/R15-1/R15-2）经 va.env 覆盖为同一 `/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731/` 路径。数据集 chinese_23k/chinese_40k 各仅 **1 条**超长 prompt（23k=34068 字符≈23000 token；40k=63130 字符≈40000 token），DATASET 只换 token 长度、不换请求数。
+- **R15-1**（今日重放 R11-D，va.env 全 env，EI0006=0）：与 R11-D 09:02 原跑签名一致——DP1 专属 1004（4 次）+ EngineCore 在 `patch_shm_broadcast` 挂起，最终 `Engine core initialization failed`。R11-D 原跑本身即以失败结束（09:06:14，非 PASS），今日忠实复现 ⇒ **机器状态自 09:02 后未劣化，R11-D 配方仍有效**。
+- **R15-2**（R14-1 只留 MODEL_PATH，其余 15 个 smoke env 全 unset，EI0006=13）：**EI0006 复现**（13:16:09，HcclAllGather，worker.py:564 determine_available_memory，1004=0/RUN_OK=0），与 R14-1 同签名。
+
+### 关键判读（MODEL_PATH 轴）
+
+R15-1 与 R15-2 **MODEL_PATH 值完全相同**（均 `/data/model/...-A5-0731/`），仅其余 env 是否导出不同：
+
+| | R15-1（R11-D 重放） | R15-2（只留 MODEL_PATH） |
+|---|---|---|
+| import | scp-va ✓ | scp-va ✓ |
+| MODEL_PATH | `/data/model/...A5-0731/` | `/data/model/...A5-0731/`（相同） |
+| 其余 smoke env | va.env 全集（12 个导出） | 仅 MODEL_PATH（15 个 unset） |
+| 结果 | **EI0006=0**，1004=4，hang→Engine core init failed | **EI0006=13**，worker.py:564 HcclAllGather |
+| 起止 | 12:49:01 → 13:05:34 | 13:11:30 → 13:19:59 |
+
+⇒ **崩溃差异与 MODEL_PATH 值无关**。按 §R15 派单分支：**EI0006 ⇒ 只剩 env 机制本身解释 → 蓝区定 R16**（SAME_CONFIG/两 ckpt 前提失效，R16 无需再走「换 /home/models/99 路径」一刀分支；env 机制轴 = 是否导出 smoke env 全集本身）。
+
+### 执行记录
+
+- **R15-1**：逐字 §R6-1（scp-opt + va.env + dp4tp2.json + udmac1d1e3/e3 + 19090 段 + pool-cpus，零额外 smoke env）。输出 `tmp/r15-r11d-replay`，日志 `/home/fjj/pp_r15a.log` + 控制台 `/tmp/r15s1_console.log`。命令 `simple_test_1p.py --remote-shared-config .../remote-shared.json`。
+- **R15-2**：R14-1 逐字但只留 `VLLM_ASCEND_SMOKE_MODEL_PATH`。**执行要点**：蓝区派单称「va.env 已 unset 其余 9 个」，实测 va.env 只 unset 4 项后又 re-export 大部分（source 后残留 12 个 smoke env）——为兑现「只留 MODEL_PATH」意图，source 后显式 unset 全部 `VLLM_ASCEND_SMOKE_*` 再单独 export MODEL_PATH。输出 `tmp/r15-only-modelpath`，日志 `/home/fjj/pp_r15b.log` + 控制台 `/tmp/r15s2_console.log`。
+
+### 回传字段（同 §R14 标准）
+
+- R15-0 三块原文：见下「原文回传」。
+- import 路径：R15-1/R15-2 均 `/home/w00919836/scp-va/vllm_ascend/__init__.py`（scp-va ✓）。
+- 日志路径：`/home/fjj/pp_r15a.log`、`/home/fjj/pp_r15b.log`；model.log：`tmp/r15-r11d-replay/raw/model.log`、`tmp/r15-only-modelpath/raw/model.log`。
+- 起止时间：R15-1 12:49:01→13:05:34；R15-2 13:11:30→13:19:59。
+- EI0006 计数/相位：R15-1=0（1004=4，hang）；R15-2=13（13:16:09，worker.py:564 HcclAllGather，DP3 首报后齐射）。
+
+### 原文回传（R15-0）
+
+```
+$ ls -la /home/models/ 2>&1 | head -10
+ls: cannot access /home/models/: No such file or directory
+
+$ ls /home/models/GLM-5.2-w4a4c8-mxfp4_99/ 2>&1
+ls: cannot access '/home/models/GLM-5.2-w4a4c8-mxfp4_99/': No such file or directory
+
+$ diff <(cat /home/models/GLM-5.2-w4a4c8-mxfp4_99/config.json 2>/dev/null) <(cat /data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731/config.json 2>/dev/null) && echo SAME_CONFIG || echo DIFF_CONFIG
+CONFIG_MISSING_A  (左侧 /home/models/..._99 不存在，diff 前提失效)
+
+23k prompts: 1
+40k prompts: 1
+```
+
+- **补充取证**：`/home/models/` 在宿主机与容器内均不存在；R11-D 与 R14-1 的 commands.json 实际 model 均指向 `/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731/`（同一路径，非两 ckpt）。va.env 第 23 行 export `VLLM_ASCEND_SMOKE_MODEL_PATH=/data/model/GLM-5.2-W4A4C8-mxfp4-A5-0731/`。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

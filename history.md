@@ -145,3 +145,9 @@
 **R14 交付**（commit c526a3860）：R14-0——作者 /root/.bash_history 无 smoke env 导出，scp-va diff 仍仅 2 文件 15 行（无大配置字段）⇒ 作者成功跑程=入口默认小配置。R14-1——scp-va 代码+我们 env 值全集+作者数据面 EI0006 复现（11:34:45）⇒ 配置值轴坐实、代码轴排除。R14-2——五步逐项 unset（batched_tokens/model_len/chunked/BS/gpu_mem）全复现 EI0006，无单一元凶；step1 profile 形状与 R11-D 相同仍崩。
 **R14 判读**（蓝区）：剩余 4 个从未 unset 的 env 中，DATASET/MAX_TOKENS/ENABLE_PROFILE 本地判 inert（DSA budget 全来自默认值，profile 不用真实 prompts）→ 唯一活嫌疑 = MODEL_PATH（/data/model/...-A5-0731 vs R11-D 作者默认 /home/models/GLM-5.2-w4a4c8-mxfp4_99，可能不同 ckpt）；时间线旁证排除纯机器时段假说（R11-D 被崩溃轮夹在中间）。bench 0/8 到 generate。
 **R15 派单**：R15-0 只读（两 ckpt config.json diff + 数据集 prompt 数——免费决定性）；R15-1 今日重放 R11-D（机器状态对照，EI0006=机器劣化转取证路线）；R15-2 R14-1 只留 MODEL_PATH（过=三 add-back 梯子；崩=依 R15-0 换 ckpt 路径一刀分 MODEL_PATH vs env 机制）。
+
+## §R15 MODEL_PATH 轴排除 + 双对照（2026-10-30）
+
+**派单**（commit a2f2353）：R15-0 只读取证（两 ckpt config.json diff + 数据集 prompt 数）；R15-1 今日重放 R11-D（机器状态对照，EI0006=机器劣化转取证）；R15-2 R14-1 只留 MODEL_PATH（过=三 add-back 梯子；崩=依 R15-0 换 ckpt 路径一刀分）。白名单=1004（≤2 次重跑）。
+
+**交付**（commit a2f235346114c9a3b7ae59b7f1c5cc606fac1c4c）：R15-0：`/home/models/GLM-5.2-w4a4c8-mxfp4_99` 在本机/容器均不存在（CONFIG_MISSING_A），「两 ckpt 可能不同」前提失效；所有实际运行（R11-D/R14-1/R15-1/R15-2）经 va.env 覆盖为同一 `/data/model/...A5-0731/`；数据集 chinese_23k/40k 各仅 1 条超长 prompt。R15-1（va.env 全 env，EI0006=0）：DP1 专属 1004×4 + EngineCore patch_shm_broadcast 挂起，最终 Engine core initialization failed，与 R11-D 09:02 原跑（09:06:14 失败）签名一致 ⇒ 机器未劣化，R11-D 配方仍有效。R15-2（只留 MODEL_PATH，其余 15 个 smoke env 全 unset）：EI0006×13（13:16:09，HcclAllGather，worker.py:564，1004=0/RUN_OK=0）⇒ **MODEL_PATH 值排除（两轮同值仅 env 集不同）**，只剩 env 机制轴 → 蓝区定 R16。**执行要点**：蓝区称「va.env 已 unset 其余 9 个」不实，va.env 只 unset 4 项后 re-export 大部分（source 后残留 12 个 smoke env）；已显式 unset 全部 VLLM_ASCEND_SMOKE_* 兑现「只留 MODEL_PATH」。数据出处：/home/fjj/pp_r15a.log + pp_r15b.log + tmp/r15-r11d-replay/ + tmp/r15-only-modelpath/。

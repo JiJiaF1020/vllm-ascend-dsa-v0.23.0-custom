@@ -176,3 +176,10 @@
 
 **R17 阶梯**：R17-1（batched2048 单设）撞配置校验 `chunked prefill is off: max_num_batched_tokens must be >= max_model_len`（simple_test.py:231，batched<model_len 非法）未到 profile；R17-2（+chunked1）**EI0006=0 命中**，1004=76（DP3_TP1_EP7 KV-cache 绑定）、DRAIN_OK×1（DP3_TP0_EP6）、EngineCore DP0/1/2 patch_shm_broadcast 挂起 → 保护因子=batched2048+chunked1，阶梯即停，R16 判读（profile 过=2048）坐实。
 **R18 bench**（fjj 仓+命中组合+BENCH=1，tmp/r18-fjj-bench）：首跑 `worker.py:475 Free memory 2.48/91.75 GiB`（R17-2 残留 worker 占 HBM 环境时序）→ 清场重跑。重跑 **EI0006=0/1004=0**、64 请求 decode 完成、`DSA_STORE_CLOSED requests=16 put_pages=389376 remote_get=1`、DRAIN_OK×2（DP0）、overlap CSV 14992 行（classify_union_mean≈75µs）——**整网数据面首次真跑通**。但 **3/4 EngineCore patch_shm_broadcast 挂起**（21 条，R17-2 同签名）→ `[dsa-smoke][metrics]`/metrics.json 未产出 → §R10 通过标准第 3/4 条不满足，bench 基线未落袋。新阻塞点=推理完成后收尾广播挂起，交蓝区判读。
+
+## §R17+R18 交付判读 + §R19 止血基线派单（2026-10-30）
+
+**R17 交付**：R17-1 batched2048 单设撞校验（chunked off 时 batched≥model_len，simple_test.py:231）；R17-2 +chunked1 **EI0006=0 命中** → 保护因子=batched2048+chunked1，R16 因果坐实。
+**R18 交付**（fjj+BENCH=1 完整配方）：**整网数据面真跑通**——64 请求满 decode(~957 tok)、PUT/GET 真实（put_pages=389376、remote_get=1）、DRAIN_OK×2(DP0)、overlap CSV 14992 行(mean≈75µs)；但 3/4 EngineCore 收尾 `patch_shm_broadcast` 挂起 → metrics 未产出，基线未落袋（0/11）。
+**R18 判读**（蓝区）：本地读 patch_shm_broadcast.py——系 vllm shm_broadcast **读侧**补丁（5s 防 lost-notify），挂起为 **enqueue 写侧 60s 无空闲块**=某 reader 停消费→块不回收→写侧死等。泄漏∝请求数×decode 步数（R9 16req/256tok 净 / R18 64req/957tok 挂 / R17-2 teardown 挂）。止血优先：退回 R9 包线（BS4×DP4=16 请求）跑 BENCH=1 先落基线；块泄漏根修走代码线。
+**R19 派单**：R19-0 挂起上下文只读三块；R19-1 BS4 止血基线（过=基线落袋 BS4 口径）；R19-2 BS4+MT256（挂=泄漏∝步数）；R19-3 BS1+MT64（R9 精确包线）；全挂→代码线修 shm 块生命周期。

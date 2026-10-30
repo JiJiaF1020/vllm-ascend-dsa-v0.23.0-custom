@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **蓝区**。Status: §R17 交付已回传（R17-1 batched2048 单设撞配置校验 `chunked prefill is off: max_num_batched_tokens must be >= max_model_len`；R17-2 +chunked1 **EI0006=0 命中** → 保护因子=batched2048+chunked1 组合，R16 判读坐实）；§R18 bench（fjj 仓+命中组合+BENCH=1）已跑：**EI0006=0/1004=0 + 整网数据面真跑通**（64 请求 decode、put_pages=389376、remote_get=1、DRAIN_OK×2、overlap CSV 14992 行 classify_union_mean≈75µs），但 **3/4 EngineCore patch_shm_broadcast 挂起**（R17-2 同签名）→ `[dsa-smoke][metrics]`/metrics.json 未产出 → §R10 通过标准第 3/4 条不满足；新阻塞点=推理完成后收尾挂起。bench 0/10。
+- Current owner: **绿区**。Status: §R17+R18 已判读（**EI0006 根因闭环：batched2048+chunked1；bench 数据面已真跑通 64 请求满 decode**；新阻塞=收尾 shm 广播写侧块耗尽挂起，泄漏∝请求数×decode 步数假设）+ **§R19 派单已发**（R19-0 挂起上下文只读；R19-1 BS4 止血基线 [R9 包线内]；R19-2/3 递减预案；根修走代码线）。bench 0/11。
 
 ## 0. 目标与口径
 
@@ -1810,6 +1810,56 @@ import 核验：`vllm_ascend=/home/fjj/vllm-ascend-remote-offload/vllm_ascend/__
 ```
 
 **起止时间**：R17-1 14:28 / R17-2 14:33~14:41 / R18 首跑 14:45~14:47 / R18 重跑 15:08~15:24（人工清理收尾）。机器已清场（进程 0、NPU 8 卡空闲、shm 373G）。
+
+## §R17+R18 判读（蓝区，2026-10-30）
+
+### 裁决
+
+1. **保护因子落袋**：batched2048+chunked1（chunked1 是硬约束——chunked off 时 batched 必须 ≥ max_model_len，R17-1 校验拦截）。R16 相关性判读升级为因果确认：**EI0006 = max_num_batched_tokens 大（≥25600）时 profile dummy 前向的首个 EP8 all-gather 建连超时**；2048 必配 chunked1。
+2. **bench 数据面实质跑通**：64 请求满 decode（~957 tokens）、DSA_STORE PUT/GET 真实发生（put_pages=389376、remote_get=1）、DRAIN_OK×2（DP0）、overlap CSV 14992 行（classify_union_mean≈75µs）——remote-offload 推理主链路首次在 fjj 仓 + bench 口径下全通。
+3. **新阻塞点 = 收尾 shm 广播挂起（写侧块耗尽）**：`patch_shm_broadcast.py` 是 vllm shm_broadcast **读侧**补丁（防 lost-notify，≤5s 重查 written-flag）；挂起报文是 **enqueue 写侧**「60s 无空闲块」。机制 = 某 reader 不再消费 → 块不回收 → 写侧永久等。DP0 组干净 / DP1-3 组挂起 = 非对称消费。**泄漏量∝请求数×decode 步数**假设最吻合：R9（16 请求/256 tokens）干净、R18（64 请求/957 tokens）挂、R17-2（失败 teardown）也挂 → 每请求/每步广播有块未被全部读者消费，积压至收尾耗尽。
+4. §R10 第 3/4 条不满足：**metrics 未产出**（generate 不返回，per-rank 统计与全局合都在 generate 之后）。基线仍未落袋（0/11）。
+5. 教训：R17-1 证明 simple_test.py:231 的跨字段校验会拦非法组合（batched<model_len 需 chunked on）——后续配方必须成对考虑。
+
+### 判读落点
+
+工程止血优先于根修：退回 R9 已证包线（BS4×DP4=16 请求）内跑 BENCH=1，先落基线口径；块泄漏根因走代码线（蓝区查 vllm shm_broadcast 写侧等待与 DSA 广播调用方的块生命周期）。
+
+## §R19 派单：收敛并发落 bench 基线（止血线，蓝区 2026-10-30）
+
+### R19-0 · 只读取证（挂起上下文，免费）
+
+```bash
+L=/home/w00919836/scp-opt/tmp/r18-fjj-bench/raw/model.log
+# 1) 挂起报文前后文（谁写谁等）
+grep -n -B3 -A6 "No available shared memory broadcast block" $L | head -80
+# 2) 各 DP 组 store 关闭顺序
+grep -nE "DSA_STORE_CLOSED|DSA_SHARED_DRAIN_OK|POOL.*CLOSE|shutting_down" $L | tail -40
+# 3) 挂起 worker 的最后活动行（DP1/2/3 的 worker 最后 5 行）
+for dp in 1 2 3; do for tp in 0 1; do
+  echo "== DP${dp}_TP${tp} =="; grep "Worker_DP${dp}_TP${tp}" $L | tail -5
+done; done
+```
+
+原文回传三块。佐证 writer/reader 等待方向与块积压位置。
+
+### R19-1 · BS4 止血基线（R18 逐字，仅 BS16→BS4）
+
+R18 命令/env 逐字（fjj 仓 + BENCH=1 + batched2048/chunked1 + MAX_TOKENS=1024 + 作者数据面），唯一改 `export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=4`（全局 16 请求，R9 包线内），输出目录 `tmp/r19-bench-bs4`，日志 `/home/fjj/pp_r19.log`。
+- **过**（8×DRAIN + `[dsa-smoke][metrics][dp=N]` ×4 + metrics.json）⇒ **bench 基线落袋**（BS4 口径），原文回传 metrics global 行与报告块。
+- **patch_shm 挂起复现** ⇒ 泄漏∝decode 步数而非请求数 → R19-2。
+- EI0006 ⇒ 配方回归检查（不应发生；发生即回传 env 核验）。
+- 1004 ⇒ 白名单重跑（≤2）。
+
+### R19-2 · BS4 + 短 decode（R19-1 挂起后执行）
+
+R19-1 逐字但 `export VLLM_ASCEND_SMOKE_MAX_TOKENS=256`（R9 同长度），输出目录 `tmp/r19-bench-bs4-mt256`。
+- 过 ⇒ 基线落袋（BS4×256 口径），并坐实泄漏∝步数。
+- 挂 ⇒ R19-3：BS1 + MAX_TOKENS=64（R9 精确包线 + fjj + BENCH），输出 `tmp/r19-bench-bs1-mt64`；再挂 ⇒ 停，回传，蓝区转代码线（shm 块生命周期修复后再战 BS16）。
+
+### 原则与回传格式
+
+止血线每轮含完整清场（R18 挂起后进程树需人工核净）；通过标准同 §R10 第 3/4 条（metrics 原文必回）；附 env 核验/import 路径/日志路径/起止时间。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

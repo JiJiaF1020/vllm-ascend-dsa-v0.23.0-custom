@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R20 已判读（**bench 基线 1/11 落袋**：RUN_OK、8/8 DRAIN、metrics 全产出；TPOT avg=136/p50=136/min=29.9ms 属 chunked-prefill 混合相位口径，非稳态 decode）+ **TTFT 单位 bug 已修复**（arrival_time=epoch µs vs first_token_ts=epoch s，>1e12 归一；mock 真实单位用例过）+ **§R21 派单已发**（R21-0 stats 源码+R19-1 挂起上下文只读；R21-1 TTFT 复跑）。R22 预案：offload-off 对照 + shm 泄漏代码线。
+- Current owner: **蓝区**。Status: §R21 已交付（2026-10-30 23:42~23:53）——R21-1 TTFT 复跑 RUN_OK/8/8 DRAIN/metrics 全产出，但 **TTFT 仍负（-1.79e12）**，失败处置命中：stats 源码原文回传。**根因=时钟域错配坐实**：`first_token_ts`=engine-core `time.monotonic()`（engine/__init__.py:231），`arrival_time`=wall-clock `time.time()`（async_llm.py:742），跨时钟域相减必然无意义；15d4610 的 arrival_s 归一只修了量级未修时钟域。**建议修复=改用 `metrics.first_token_latency`**（stats.py:369-371 官方同域 wall-clock TTFT，随 RequestOutput 透出）×1000 即 ms。R21-0 三块取证原文已回传（stats.py 时钟域注释 + arrival_time 全链 grep + R19-1 挂起上下文）。R22 预案：offload-off 对照 + shm 泄漏代码线。
 
 ## 0. 目标与口径
 
@@ -2014,6 +2014,99 @@ R20 命令逐字重跑（BS4×256 全配方不变），输出目录 `tmp/r21-ben
 
 1. **offload-off 对照轮**（同 BS4×256 口径，`VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=0`，其余不变）→ 计算吞吐/TPOT 相对提升，对齐「+20% 自提升」验收口径；
 2. **shm 泄漏代码线**：按 R21-0 挂起上下文定位块泄漏点（reader 停消费的 DP 组 + 最后活动），蓝区出修复 commit 后再战 BS16×1024 / 100K×1K。
+
+
+## §R21 交付：TTFT 复跑仍负（时钟域根因坐实），stats 源码原文回传（绿区，2026-10-30 23:42~23:53）
+
+### 执行核验
+
+- pull 到 15d4610（`git log --oneline -2` 顶部=TTFT 单位归一提交），simple_test.py:454-457 已改 `arrival_s` 归一 + mock 用例（grep 核验落地）。
+- R20 命令逐字重跑（fjj 仓 + BENCH=1 + batched2048/chunked1 + BS4 + MAX_TOKENS=256 + 作者数据面全不变），输出 `tmp/r21-bench-bs4-mt256`，日志 `/home/fjj/pp_r21.log`。
+- 首跑 23:42:27 崩：DP3_TP1_EP7 `_bind_dsa_split_kv_caches`→`aiv_urma_query_eids` RaGetDevEidInfoNum **code=1004**（与 R9/R11-D/R15-1 同签名瞬时竞争，本次落 DP3；E4=4/DRAIN=1/STCL=1/HANG=1）。按白名单清场重跑：精确 PID 杀残留 + rm 8×32G backing（shm 372G 恢复）→ 23:53:18 复跑成功。
+- 复跑启动前置门禁：进程 0 / NPU 8 卡全空闲 / shm 372G。双 Pool READY（groups=['a','b']）→ 自然收尾。
+
+### 结果（通过标准逐条）
+
+1. **8/8 DRAIN_OK + 8×STORE_CLOSED**（23:53:18，8 worker 全 `requests=4 put_pages=97344 inference=hbm_full_remote_shared remote_get=1`）——EI=0/E4=0/DRAIN=8/STCL=8/MET=6/HANG=0。
+2. **4 rank 各打出 `[dsa-smoke][metrics][dp=N]` 行**（dp=0/1/2/3，各 requests=4 output_tokens=1024）。
+3. **`results/1p/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared.metrics.json` 存在**（框架仓 results/ 下，model.log:2781 有写入确认），global 含 requests/分位数/吞吐/tpot_under_50ms 全字段。
+4. **`[dsa-smoke][metrics][global]` 原文回传**（见下）。
+
+**summary.txt = RUN_OK model_exit=0**；run-status.json graceful=true errors=[]；patch_shm_broadcast 挂起 = 0 次；EI0006=0 / code=1004=0（复跑）。
+
+### `[dsa-smoke][metrics][global]` 原文
+
+```
+{"dp_size": 4, "requests": 16, "output_tokens": 4096, "global_wall_s": 81.481, "request_throughput_rps": 0.196, "global_output_tps": 50.27, "ttft_ms": {"avg": -1792611306857.886, "min": -1792611333864.11, "p50": -1792611306720.925, "p90": -1792611280138.26, "p99": -1792611280046.97, "max": -1792611280046.97}, "tpot_ms": {"avg": 135.234, "min": 28.725, "p50": 134.919, "p90": 241.744, "p99": 241.98, "max": 241.98}, "tpot_under_50ms": false}
+```
+
+### ❌ 失败处置命中：TTFT 仍负（-1.79e12），根因=时钟域错配（修复前提错误）
+
+**15d4610 的修复已生效执行，但前提错误**：`arrival_s = arrival_time/1e6 if >1e12 else arrival_time` 只归一了 arrival_time 的量级，而 `first_token_ts` 是**另一时钟域（engine-core monotonic）**，与 arrival_time（wall-clock epoch）直接相减必然无意义。
+
+**决定性证据链**（容器内 `/vllm-workspace/vllm/` 源码）：
+
+1. `vllm/v1/engine/__init__.py:230-231`：`EngineCoreOutputs.__post_init__: if self.timestamp == 0.0: self.timestamp = time.monotonic()`——**`first_token_ts`/`last_token_ts` = `outputs.timestamp` = `time.monotonic()`**（engine-core 单调时钟）。
+2. `vllm/v1/engine/async_llm.py:742` + `input_processor.py:278,289`：**`arrival_time = time.time()`**（wall-clock epoch 秒）。
+3. **数学闭合**：实测 `gen_start_epoch=1793375411`（epoch 秒）；`first_token_ts ≈ 764077`（monotonic，≈8.8 天 uptime）。`first_token_ts - arrival_s = 764077 - 1793375411 = -1792611334`，×1000 = `-1.7926e12`，与实测 ttft_ms 逐位吻合。
+
+**vLLM 官方同域 TTFT 现成字段**：`stats.py:369-371` `first_token_latency = iteration_timestamp - arrival_time`（两者都是 `time.time()` wall-clock），已写入 `RequestStateStats.first_token_latency`（stats.py:217），并经 `output_processor.py:373 metrics=self.stats` 随 RequestOutput 透出。**建议蓝区改用 `metrics.first_token_latency`（秒）×1000 即 TTFT(ms)**，或自行用同域 wall-clock，勿跨时钟域相减。
+
+### R21-0 三块取证原文回传
+
+**块1 · stats.py:195-240（RequestStateStats 定义，含时钟域注释）**：
+
+```
+# This is an engine frontend timestamp (wall-clock)
+arrival_time: float = 0.0
+
+# These are engine core timestamps (monotonic)
+queued_ts: float = 0.0
+scheduled_ts: float = 0.0
+first_token_ts: float = 0.0
+last_token_ts: float = 0.0
+
+# first token latency
+first_token_latency: float = 0.0
+```
+
+**块2 · arrival_time 全链 grep**（engine/*.py）：
+
+```
+/vllm-workspace/vllm/vllm/v1/engine/async_llm.py:742:            arrival_time=time.time(),
+/vllm-workspace/vllm/vllm/v1/engine/input_processor.py:278:                arrival_time = prompt.get("arrival_time", time.time())
+/vllm-workspace/vllm/vllm/v1/engine/input_processor.py:289:                arrival_time = time.time()
+/vllm-workspace/vllm/vllm/v1/engine/output_processor.py:207:            self.stats.arrival_time = update.arrival_time
+/vllm-workspace/vllm/vllm/v1/metrics/stats.py:208:    arrival_time: float = 0.0
+/vllm-workspace/vllm/vllm/v1/metrics/stats.py:369:            first_token_latency = self._time_since(req_stats.arrival_time)
+/vllm-workspace/vllm/vllm/v1/metrics/stats.py:437:        e2e_latency = self._time_since(req_stats.arrival_time)
+```
+
+**块3 · R19-1 挂起上下文**（/home/w00919836/scp-opt/tmp/r19-bench-bs4/raw/model.log，18 条报文）：
+
+```
+17:47:28 首现：EngineCore_DP0/DP1/DP3 三 EngineCore 60s 循环
+  (EngineCore_DP0 pid=1998570) 17:47:28 [patch_shm_broadcast.py:74] No available shared memory broadcast block found in 60 seconds.
+  (EngineCore_DP3 pid=1998582) 17:47:28 [patch_shm_broadcast.py:74] No available shared memory broadcast block found in 60 seconds.
+  (EngineCore_DP1 pid=1998588) 17:47:28 [patch_shm_broadcast.py:74] No available shared memory broadcast block found in 60 seconds.
+  ... 每 60s 重复至 17:52:29（共 18 条）
+DP2 组已 DRAIN+STORE_CLOSED（requests=4 put_pages=97344 remote_get=1）
+挂起 worker 最后活动（17:46:09）：
+  DP0_TP0/DP1_TP0/DP3_TP0 → [acl_graph.py:284] Replaying aclgraph + [llm_base_proposer.py:651] Replaying MTP draft
+  DP0_TP1/DP1_TP1/DP3_TP1 → [remote_store.py:230] DSA_STORE_PUT_DONE rows=[3] pages=[312] versions=[21] bound=0
+                          → [remote_shared.py:180] DSA_SHARED_CONNECT_BEGIN endpoint=127.0.0.1:1909x
+                          → [remote_shared.py:207] DSA_SHARED_CONNECT_OK wire=6 backend=real_store group_gather=full groups=21
+  DP2_TP0/TP1（已收尾）→ [remote_store.py:252] DSA_STORE_CLOSED requests=4 put_pages=97344
+```
+
+### 附带资产
+
+- overlap CSV 8 端口各 7239-7581 行（总计 59394 行），classify_union_mean_us ≈ 12.7-13.0µs（同 R20）。
+- non-default args 原文：`max_model_len=40960, tensor_parallel_size=2, enable_expert_parallel=True, block_size=128, gpu_memory_utilization=0.97, max_num_batched_tokens=2048, max_num_seqs=4, quantization=ascend, enable_chunked_prefill=True, speculative_config=mtp(3)`, compilation FULL_DECODE_ONLY capture_sizes=[4,8,16]。
+
+**日志资产**：`/home/fjj/pp_r21.log`、`/home/w00919836/scp-opt/tmp/r21-bench-bs4-mt256/raw/model.log`、`summary.txt`（RUN_OK）、`run-status.json`（graceful:true）、`results/1p/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared.metrics.json`（23:51 复跑版本）。机器已清场（进程 0、NPU 8 卡空闲、shm 372G）。
+
+**起止时间**：23:42~23:53（含 1004 重跑）。**bench 基线保持 R20 值（TTFT 待蓝区按真实时钟域修后复取）**。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

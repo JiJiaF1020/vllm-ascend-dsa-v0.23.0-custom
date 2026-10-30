@@ -451,7 +451,10 @@ def summarize_request_metrics(
         if metrics is None or metrics.first_token_ts is None or metrics.last_token_ts is None:
             per_request.append({"request_id": output.request_id, "output_tokens": n, "metrics": "unavailable"})
             continue
-        ttft_ms = (metrics.first_token_ts - metrics.arrival_time) * 1000
+        # vLLM 0.23: first/last_token_ts 为 epoch 秒；arrival_time 为 epoch 微秒。
+        # 单位鲁棒归一：>1e12 视为微秒（epoch 秒约 1.7e9，epoch 微秒约 1.7e15）。
+        arrival_s = metrics.arrival_time / 1e6 if metrics.arrival_time > 1e12 else metrics.arrival_time
+        ttft_ms = (metrics.first_token_ts - arrival_s) * 1000
         tpot_ms = (metrics.last_token_ts - metrics.first_token_ts) / (n - 1) * 1000 if n > 1 else None
         ttfts.append(ttft_ms)
         if tpot_ms is not None:

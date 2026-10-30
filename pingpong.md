@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **蓝区**。Status: §R20 交付已回传（BS4×256 BENCH=1 逐字重跑，**statistics bug 修复生效，bench 基线首次落袋**：summary RUN_OK model_exit=0、8/8 DRAIN_OK+STORE_CLOSED(requests=4 put_pages=97344 remote_get=1)、patch_shm 挂起 0 次、4×[dsa-smoke][metrics][dp=N]+[global] 行、results/1p/<run>.metrics.json global 全字段；tpot_ms avg=136.055/request_throughput=0.196rps/global_output_tps=50.23/tpot_under_50ms=false）。⚠️ 数据质量待蓝区修：ttft_ms 为巨大负值(first_token_ts 与 arrival_time 时钟基准不一致，tpot 正常)。bench 1/11。
+- Current owner: **绿区**。Status: §R20 已判读（**bench 基线 1/11 落袋**：RUN_OK、8/8 DRAIN、metrics 全产出；TPOT avg=136/p50=136/min=29.9ms 属 chunked-prefill 混合相位口径，非稳态 decode）+ **TTFT 单位 bug 已修复**（arrival_time=epoch µs vs first_token_ts=epoch s，>1e12 归一；mock 真实单位用例过）+ **§R21 派单已发**（R21-0 stats 源码+R19-1 挂起上下文只读；R21-1 TTFT 复跑）。R22 预案：offload-off 对照 + shm 泄漏代码线。
 
 ## 0. 目标与口径
 
@@ -1967,6 +1967,53 @@ cd /home/fjj/vllm-ascend-remote-offload && git -c http.proxy=http://90.255.129.3
 **日志资产**：`/home/fjj/pp_r20.log`、`/home/w00919836/scp-opt/tmp/r20-bench-bs4-mt256/raw/model.log`（514KB 全链）、`summary.txt`（RUN_OK）、`run-status.json`（graceful:true）、`raw/overlap-*.csv`（8 端口满数据）、`results/1p/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared.metrics.json`。机器已清场（进程 0、NPU 8 卡空闲、shm 373G）。
 
 **起止时间**：23:10~23:16（自然结束）。**bench 基线 1/11 落袋**。
+
+## §R20 判读（蓝区，2026-10-30）
+
+### 裁决
+
+1. **阳性落袋**：首次 bench 全链闭环——RUN_OK model_exit=0、8/8 DRAIN_OK+STORE_CLOSED（put_pages=97344 remote_get=1）、patch_shm 挂起 0 次、4×`[dsa-smoke][metrics][dp=N]`+`[global]`、metrics.json 全字段。基线（BS4×DP4=16 请求 × 256 token 定长，batched2048/chunked1，作者数据面）：`requests=16 output_tokens=4096 wall=81.54s rps=0.196 output_tps=50.23 tpot_ms avg=136.055 p50=135.997 p90=241.908 p99=242.134 min=29.899`。
+2. **TPOT 口径解读（重要，判读防误读）**：avg/p50 被 **chunked-prefill 交错污染**——16 请求 × 40K prefill ÷ 2048 chunk 的 prefill 肩完全覆盖 decode 期，decode 步与 prefill 共享 batched 预算；**min=29.899ms 代表无 prefill 竞争时的干净 decode 步**，p90/p99≈242ms 属 prefill 期尾段。即：本口径的 TPOT 是「单次离线 cohort 混合相位」，**不是稳态 decode 性能**，不可直接用于 TPOT<50ms 判定；稳态口径需（a）prefill 完成后分段统计，或（b）100K×1K 长 decode 场景尾段（待 shm 泄漏根修后可达 1024 步）。用户预期 decode 2000+ tok/s 与本口径 50 tok/s 的差距主因 = prefill 主导 + BS4 低并发 + batched2048 限制，需同口径对比。
+3. **TTFT bug 定性闭环**：`arrival_time` 为 epoch **微秒**、`first/last_token_ts` 为 epoch **秒**（-1.79e12 ms 量级与 1e6 倍率严格吻合）。**已本地修复**：>1e12 视为微秒归一（注释说明），mock 增加真实单位用例（ttft=1800ms/tpot=100ms）全过。
+4. 数据面开销旁证：8 端口 overlap CSV 各 7239-7581 行，classify_union_mean≈12.7-13.0µs（低开销，非瓶颈）。
+5. 待办：TTFT 复跑取数；shm 泄漏根修（1024 步/BS16 前提）；offload-off 对照（+20% 口径）。
+
+## §R21 派单：TTFT 修复复跑 + 挂起取证（蓝区，2026-10-30）
+
+### R21-0 · 只读取证（stats 单位权威确认 + R19-1 挂起上下文）
+
+```bash
+sed -n '195,240p' /vllm-workspace/vllm/vllm/v1/metrics/stats.py
+grep -n "arrival_time" /vllm-workspace/vllm/vllm/v1/metrics/stats.py /vllm-workspace/vllm/vllm/v1/engine/*.py 2>/dev/null | head -20
+# R19-1 挂起上下文（养代码线修块泄漏用）：
+L=/home/w00919836/scp-opt/tmp/r19-bench-bs4/raw/model.log
+grep -c "No available shared memory broadcast block" $L
+grep -n "No available shared memory broadcast block" $L | head -5
+for dp in 0 1 2 3; do for tp in 0 1; do echo "== DP${dp}_TP${tp} =="; grep "Worker_DP${dp}_TP${tp}" $L | tail -3; done; done
+```
+
+三块原文回传。
+
+### R21-1 · TTFT 修复复跑（R20 逐字）
+
+```bash
+cd /home/fjj/vllm-ascend-remote-offload && git -c http.proxy=http://90.255.129.35:3128 pull --ff-only && git log --oneline -2
+# 顶部应含 TTFT 单位归一提交
+```
+
+R20 命令逐字重跑（BS4×256 全配方不变），输出目录 `tmp/r21-bench-bs4-mt256`，日志 `/home/fjj/pp_r21.log`。
+
+**通过标准**：同 §R20 第 1/3/4 条 + **ttft_ms 量级合理**（0 < ttft_ms < global_wall_s×1000，预期数秒~数十秒，40K chunked prefill 本就大）；原文回传 `[global]` 行与报告块。
+
+### 失败处置
+
+- TTFT 仍负/超界 ⇒ 回传 R21-0 的 stats 源码原文，蓝区按真实单位再修；
+- 其它同 §R20（挂起/1004/EI0006 白名单逻辑不变）。
+
+### R22 预案（R21 过后）
+
+1. **offload-off 对照轮**（同 BS4×256 口径，`VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=0`，其余不变）→ 计算吞吐/TPOT 相对提升，对齐「+20% 自提升」验收口径；
+2. **shm 泄漏代码线**：按 R21-0 挂起上下文定位块泄漏点（reader 停消费的 DP 组 + 最后活动），蓝区出修复 commit 后再战 BS16×1024 / 100K×1K。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

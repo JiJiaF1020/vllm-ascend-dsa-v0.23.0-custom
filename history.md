@@ -202,3 +202,9 @@
 ## §R20 统计 bug 修复生效，bench 基线首次落袋（2026-10-30）
 
 pull c461a78（first_token_time→first_token_ts ×3，simple_test.py:451/454/455）后逐字重跑 R19-2（BS4×256 BENCH=1，tmp/r20-bench-bs4-mt256）。**summary RUN_OK model_exit=0（首次整网干净收尾）**、8/8 DRAIN_OK+STORE_CLOSED（requests=4 put_pages=97344 remote_get=1）、patch_shm 挂起 0 次、EI0006=0/1004=0；4×[dsa-smoke][metrics][dp=N]+[global] 行全产出，results/1p/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared.metrics.json 存在（global 含 requests/分位数/吞吐/tpot_under_50ms 全字段）。global 原文：requests=16/output_tokens=4096/global_wall_s=81.54/request_throughput_rps=0.196/global_output_tps=50.23/tpot_ms avg=136.055/tpot_under_50ms=false。overlap CSV 8 端口 59394 行 classify_union_mean_us≈12.7-13.0µs。**通过标准 4 条全满足 → bench 基线 1/11 落袋**。⚠️ 数据质量告警：ttft_ms 巨大负值（first_token_ts 与 arrival_time 时钟基准不一致，tpot 正常）交蓝区修口径。bench 1/11。
+
+## §R20 判读 + TTFT 单位修复 + §R21 派单（2026-10-30）
+
+**R20 交付**（commit a4f2b6429）：BS4×256 BENCH=1 逐字重跑，统计 bug 修复生效——**bench 基线首次落袋**：RUN_OK、8/8 DRAIN+STORE_CLOSED、挂起 0 次、4×metrics 行+global+metrics.json。数值：requests=16/output_tokens=4096/wall=81.54s/rps=0.196/output_tps=50.23/tpot avg=136.055 p50=135.997 p90=241.9 p99=242.1 min=29.899/tpot_under_50ms=false；ttft 巨负（待修）。overlap classify_union_mean≈12.7-13.0µs。
+**R20 判读**（蓝区）：基线口径 = chunked-prefill 混合相位（prefill 肩覆盖 decode 期），TPOT avg/p50 不可用于 TPOT<50ms 判定，min=29.9ms 代表干净 decode 步；稳态口径需 prefill 分段或 100K×1K 长 decode 尾段（待 shm 泄漏根修）。TTFT bug 定性：arrival_time=epoch µs、first/last_token_ts=epoch s → **已修**（>1e12 归一为 µs，mock 真实单位用例过）。
+**R21 派单**：R21-0 只读（stats.py 源码权威确认单位 + R19-1 挂起上下文=代码线输入）；R21-1 TTFT 修复逐字复跑 R20（ttft 量级合理为过标准）。R22 预案：offload-off 对照（+20% 口径）+ shm 块泄漏根修。

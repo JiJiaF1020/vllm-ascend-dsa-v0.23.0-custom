@@ -103,3 +103,11 @@
 **R11 交付**（commit 923d852ee）：梯子全执行——R11-A EI0006 稳定复现（非瞬时）；R11-B eager 同签名复现（acl_graph 计数=0）→ graph 面排除；R11-C 跳过；R11-D 作者配置 2 跑 EI0006=0 但前移 DP1 专属 1004（aiv_urma_query_eids，physical 2/3，两跑复现非瞬时），0 DRAIN。
 **R11 判读**（蓝区）：① R10 主嫌疑 graph 证伪，自我修正；② EI0006 归因 fjj 数据面配置（e2/20000 段/eid-probe-r1 json，三选一未拆），fjj 配置 3/3 崩、作者配置 0 崩；③ 1004 与 R9 首跑交集 physical 2 + R7/R8 节点重建证据 → NPU 2/3 UB/EID 状态面嫌疑上升；④ 1004「重跑即过」修正为「取决于机器 UB 面状态，上限 2 次」。
 **R12 派单**：R12-0 只读取证（EID 探测×3 轮重点 2/3 + uburma 节点 + dmesg + npu-smi + 端口快照）；R12-1 主实验 = fjj 框架仓 + BENCH=1 + 作者数据面配置逐字（scp-opt + dp4tp2.json + udmac1d1e3/e3 + 19090 段 + --framework-repo 混用），过则 EI0006 归因数据面且 bench 基线同轮落袋，复现则转 fjj 代码 diff。须先核验 vllm_ascend import 指向 fjj 仓。
+
+## §R12 EI0006 归因拆解（fjj 框架+BENCH=1+作者数据面）（2026-10-30）
+
+**派单**（commit 982340a）：R12-0 只读取证（NPU 2/3 UB/EID 状态面）→ R12-1 主实验 = fjj 框架仓 + BENCH=1 + 作者数据面配置逐字，过则 数据面归因且 bench 基线同轮落袋，复现则转 fjj 代码 diff。白名单=1004（≤2 次）；EI0006 复现即停回传。
+
+**交付**（commit 待回填）：R12-0 五块全过（EID 两轮探测干净无 1004、UB 节点 09:42 批量重建与 R8 同型、端口全空闲）；R12-1 EI0006 复现（10:02:15 齐射，EI0006×20，0×1004，崩溃在 _initialize_kv_caches → determine_available_memory 内 MoE 前向 HcclAllGather，与 R10/R11 同签名同相位）→ 数据面配置排除，指向 fjj 框架/scp-va 之外代码或 smoke env 差异。数据出处：/home/fjj/pp_r12.log + tmp/r12-fjj-bench-authorplane/raw/model.log。
+
+**判读**（蓝区）：待定（蓝区做 fjj vs scp-va 代码 diff）。

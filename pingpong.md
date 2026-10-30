@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R11 已判读（graph 面排除；EI0006 归因 fjj 数据面配置；作者配置下前移 DP1 专属 1004，NPU 2/3 UB 面嫌疑）+ **§R12 派单已发**（R12-0 取证 + R12-1 主实验：fjj 框架+BENCH=1+作者数据面配置，过则 bench 基线同轮落袋）。R9 阳性落袋不变。
+- Current owner: **绿区**。Status: §R12 已交付（fjj 框架+BENCH=1+作者数据面配置下 EI0006 仍复现，数据面配置排除，指向 fjj 框架/env）。R9 阳性落袋不变；bench 基线仍未落袋。
 
 ## 0. 目标与口径
 
@@ -1035,6 +1035,77 @@ echo "RC=$?"
 ### 回传格式
 
 追加「§R12 交付」节：R12-0 五块原文 + import 路径核验输出 + RC + 通过标准逐条 + metrics 原文（若过）+ 日志路径 + 执行起止时间。
+
+## §R12 交付：EI0006 复现（作者数据面配置下仍崩）→ 数据面配置排除，指向 fjj 框架/env（绿区，2026-10-30 09:42~10:10）
+
+### 结论(先行)
+
+- **R12-0 只读取证**:NPU 2/3 的 EID/UB 状态面**无异常**——EID 单卡探测(pool 未起+pool 运行中两轮)physical 2/3 各返回完整 19 EID,无 1004 无错误;npu-smi 2/3 Health=OK/Error=NA;UB 设备节点 udmac{0,1}d1e2-d1e5 **09:42:45-46 批量重建**(R8 的 01:48 重建同型);端口 19090-19097/20000-20007 全空闲。
+- **R12-1 主实验(fjj 框架 + BENCH=1 + 作者数据面配置)**:**EI0006 复现**(10:02:15,8 worker + 4 EngineCore 齐射,EI0006×20,**0×1004**,0 DRAIN),崩溃点 = `_initialize_kv_caches → determine_available_memory` 内 MoE 前向 `HcclAllGather`(与 R10/R11-A/B 完全同签名同相位)。
+- **关键差分结论**:作者数据面配置(19090 段/udmac1d1e3/dp4tp2.json)下 EI0006 **仍复现** → **EI0006 与数据面配置无关**(R12 判读预案命中「若 EI0006 复现 ⇒ fjj 代码/env 引入」)。结合 R11-B(fjj+eager 复现)与 R11-D(scp-va+eager 作者数据面=0),**EI0006 决定性差分为 fjj 框架(scp-va 之外)+ smoke env**,与 graph/eager 无关、与数据面配置无关。
+- bench 基线仍未落袋(0/5 轮跑到 generate);无 metrics 可回传(§R12 通过标准第 3/4 条不适用)。
+
+### R12-0 · 只读取证五块原文
+
+**块1 EID 单卡探测 ×2 轮(physical 2/3)**:
+- **pool 未起轮**(09:44):npu:2 返回 19 EID(eid_index 0-8 的 03xx/02xx 组 + 02xx 设备 EID `...0051f8` + 05xx 组 `...0052fa` 起),npu:3 返回 19 EID(02xx 设备 EID `...0061f8` + 05xx 组 `...0072fb` 起 + 03xx 组)。两卡均**无错误无 1004**。
+- **pool 运行轮**(09:46,udmac1d1e3 mock pool,local_eid_hex=`...0a0bf8`,reconnect enabled):npu:2/npu:3 各返回同样 19 EID,**无 1004 无错误**。pool 起的 EID 查询正常。
+- 判定:physical 2/3 的 EID 枚举面**健康**,R11-D 的 1004 非 EID 枚举缺失。
+
+**块2 UB 设备节点 mtime**(09:42):
+```
+crw-rw-rw-. 1 root root 509, 0 2026-10-30 09:42:46.276365130 +0800 udmac0d1e2
+crw-rw-rw-. 1 root root 509, 4 2026-10-30 09:42:46.400365130 +0800 udmac0d1e3
+crw-rw-rw-. 1 root root 509, 3 2026-10-30 09:42:46.516365130 +0800 udmac0d1e4
+crw-rw-rw-. 1 root root 509, 2 2026-10-30 09:42:46.648365130 +0800 udmac0d1e5
+crw-rw-rw-. 1 root root 509, 1 2026-10-29 19:48:48.544365130 +0800 udmac0d1e6
+crw-rw-rw-. 1 root root 509, 5 2026-10-30 09:42:45.800365130 +0800 udmac1d1e2
+crw-rw-rw-. 1 root root 509, 9 2026-10-30 09:42:45.916365130 +0800 udmac1d1e3
+crw-rw-rw-. 1 root root 509, 8 2026-10-30 09:42:46.032365130 +0800 udmac1d1e4
+crw-rw-rw-. 1 root root 509, 7 2026-10-30 09:42:46.156365130 +0800 udmac1d1e5
+crw-rw-rw-. 1 root root 509, 6 2026-10-29 19:48:48.544365130 +0800 udmac1d1e6
+```
+→ d1e2-d1e5 八个节点 09:42:45-46 批量重建(d1e6 为 10-29 旧节点),与 R8 的 01:48 重建同型;R12-1 主实验(09:57 起)在这些**新节点**上跑仍 EI0006。
+
+**块3 dmesg 近 2 小时 NPU/UB/URMA/UDMA**(09:02-09:06 窗口):`ubase 0000X: UDMA: opt 14/15 no need to process`(09:02:09)+ `udma_free_u_hugepage: 464 callbacks suppressed` + `UDMA: current mm released.`×N + `udma_destroy_jfr_batch: 8 callbacks suppressed` + `UDMA: JFR sleep time = 1000 us.`×N(09:06:33-35)→ R11-D 重跑(09:02)结束后的 UDMA 面收尾活动,无错误码。
+
+**块4 npu-smi 2/3 健康与错误码**:两者均 `Health Status: OK`、`Error Code: NA`、`Error Information: NA`。`npu-smi info -t error-code` 本机不支持(25.6.rc2 无此项,报 Usage)。
+
+**块5 端口占用快照**:宿主 `ss` + 容器 `netstat` 均 **19090-19097/20000-20007 全空闲**(R12-0 时点与 R12-1 结束后复测均空)。
+
+### R12-1 · 主实验(fjj 框架 + BENCH=1 + 作者数据面配置)——EI0006 复现
+
+- **import 路径核验**:va.env 后 `vllm_ascend.__file__` = `/home/w00919836/scp-va/vllm_ascend/__init__.py`(scp-va)→ 按派单 `export PYTHONPATH=/home/fjj/vllm-ascend-remote-offload:$PYTHONPATH` 后再验 = `/home/fjj/vllm-ascend-remote-offload/vllm_ascend/__init__.py`(fjj,**生效**)。fjj 含 bench 代码(717c396:simple_test.py `SMOKE_BENCH`/`min_tokens=max_tokens`/`ignore_eos`/`_bench_report`)。
+- 命令:派单逐字 + PYTHONPATH 前置(fjj),`--framework-repo /home/fjj/vllm-ascend-remote-offload` + `--remote-config ../dp4tp2.json`(作者数据面)+ udmac1d1e3/19090 段 + 双 pool。remote-shared.json 生效确认:du 19090-19097、device EID=`...0001f8/0031f8/0051f8/0061f8/0091f8/00a1f8/00c1f8/00f1f8`(作者 dp4tp2.json 值)、pool_eid=`...0a0bf8/...080bf8`。
+- **执行起止**:09:57:24(engine init)→ 09:58:26 **DSA_EXECUTION_PLAN×8**(权重装载成功)→ **10:02:15-16 EI0006 齐射**。summary 未生成、无 metrics、无 DRAIN。
+- **EI0006 证据**:EI0006×20(8 worker×2 + 4 EngineCore×1),首个=DP3_TP0_EP6(pid 1462699)10:02:15.847,全部 10:02:15-16。**acl_graph 计数=16**(graph 模式,va.env RUN_MODE=graph);**0×1004**(本轮 DP1 1004 未出现)。
+- **崩溃栈**(model.log:1634-1684,首个 EI0006 前 50 行,DP3_TP0_EP6):`core.py:1195 _initialize_kv_caches → core.py:257 _initialize_kv_caches → abstract.py:147 determine_available_memory → multiproc_executor.py collective_rpc →` Worker `moe_runner.py:637 forward → _moe_forward_shared(134) → fused_moe_0_23_0.py:134/122/693/497 → method_adapters.py:274 → w4a4_mxfp4.py:225 → moe_comm_method.py:156/175 → moe_mlp.py:527/133 quant_apply_mlp → device_op.py:1318 npu_dynamic_quant → torch_npu.npu_dynamic_mx_quant → **HcclAllGather → EI0006**`。
+- **与 R10/R11 同签名确认**:崩溃在 KV-cache 内存测定 dummy run 的 MoE 前向 EP8 all-gather,与 R10(07:29:18)/R11-A(08:26:50)/R11-B(08:44:26)完全同相位同栈。
+- 崩溃后模型父进程挂死(worker 已崩,parent Ss 态),按 R10 经验精确 kill 进程树 + 双 pool + shm backing,清场完成。
+
+### 各步 RC / summary
+
+| 步 | 结果 | EI0006 | 1004 | DRAIN_OK | summary/metrics |
+|----|------|--------|------|----------|-----------------|
+| R12-0 | 只读全过 | - | 0 | - | - |
+| R12-1 | EI0006 复现 | 20 | 0 | 0 | 未生成/无 |
+
+### 通过标准逐条
+
+- 第 1 条(工具 RC=0、summary RUN_OK、model.log 生成文本):**不满足**——RC 未出(profile_pool_inference 挂死轮询,清场 kill),summary 未生成。
+- 第 2 条(DSA_SHARED_DRAIN_OK ×8):**不满足**——0 DRAIN。
+- 第 3/4 条(metrics 与报告块):**不适用**——未到 generate,无 metrics。
+
+### 失败处置
+
+- EI0006 复现:按派单「停,回传首个报错点前后 50 行(蓝区转代码 diff 排查)」。EI0006 **不在 R12 白名单**(仅 1004 可重跑),不重试,停。
+- 1004:本轮 0 次,R11-D 的 DP1 专属 1004 未在作者数据面+fjj 框架组合下出现。
+
+### 环境状态(交付时)
+
+- 清场完成:无残留 urma/VLLM/python 进程(PCP pmda 2 个系统守护除外);端口 19090-19097/20000-20007 空闲;/dev/shm 373G 可用。
+- 日志资产:`/home/fjj/pp_r12.log`(tee 输出)+ `pp_r12_console.log`;`/home/w00919836/scp-opt/tmp/r12-fjj-bench-authorplane/raw/model.log`(571KB)+ pool 日志;R12-0 证据见上文原文。
+- 待蓝区判读:R12-1 证明 EI0006 与作者数据面配置无关(fjj 框架+作者数据面仍崩),指向 **fjj 框架/scp-va 之外代码或 smoke env 差异**;蓝区做 fjj vs scp-va 代码 diff 定位。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

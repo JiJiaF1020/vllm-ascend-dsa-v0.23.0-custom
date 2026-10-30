@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R24 已派单（2026-10-31）——R23 判读：①真 baseline 反超 offload-on +7.7%（tps）坐实 offload 在 40K×256 prefill 主导配方为纯开销，+20% 口径需 100K×1K；②工具吞 env 实锤（profile_pool_inference.py:414）；③**R19-1 挂起/崩溃统一理论：max_model_len=40960 clamp → decode 尾部非 uniform 步 → eager 仍进 remote select → Q=4 断言**（同步区内炸=静默挂、区外炸=DP2 报错，shm 告警=下游症状；256 步不 clamp 全干净 vs 1024 步必 clamp 全崩，数字自洽）。蓝区已推 select 断言全上下文增强。R24 = 理论实证轮：R19-1 逐字唯一改 MAX_MODEL_LEN=43008，BS4×1024 首次冲无挂起。
+- Current owner: **绿区**。Status: §R24 已交付（2026-10-31）——clamp 理论实证坐实：R19-1 逐字唯一改 MAX_MODEL_LEN=43008（BS4×1024），R24_RC=0 干净收尾，8/8 DRAIN_OK + 8×STORE_CLOSED + patch_shm 挂起=0（**1024 步 decode 首次无挂起**），output_tps=164.26 / tpot avg=48.32ms / TTFT avg=45382ms 全正；1024 步解锁，R25 进 BS16×1024 + 100K×1K 验收配方，非 uniform 路由根治转代码线挂账。
 
 ## 0. 目标与口径
 
@@ -3753,3 +3753,54 @@ TPOT (ms, excl. 1st token): avg=122.569ms p50=121.828 p90=215.03 p99=215.038 max
 **R23-0 后续**：块1 实锤 → 蓝区可决定是否给工具加 `--no-offload` 透传参数（代码线）；块2/3 → 停摆根修方案（R24 代码线）输入已齐。
 
 **日志/产物路径**：容器内 `/home/fjj/pp_r23a.log`（tee 全量）、`/home/fjj/r23a_wrapper.log`（env+import+RC 标记）、`/home/fjj/vllm-ascend-remote-offload/results/1p/dp4_tp2_baseline_graph_mtp_eager.metrics.json`。运行后机器已自然收尾（EngineCore 全 SIGTERM 退出、worker 队列终止）。
+
+## §R24 交付：clamp 理论坐实——1024 步 decode 首次无挂起（BS4×1024 + ML43008）（绿区，2026-10-31 04:02~04:08）
+
+### 执行核验
+
+- pull 到 7e8e3b5（select 断言增强 commit，`git log --oneline -2` 顶部=fix(dsa_offload): select 容量断言携带步上下文）；grep 核验 `requires fixed MTP3 Q=4 capacity` 在 remote_shared.py:465（增强后带全上下文）。
+- R19-1 配方逐字（经工具 profile_pool_inference.py + 作者数据面 dp4tp2.json + BENCH=1 + batched2048/chunked1 + BS4 + MAX_TOKENS=1024），**唯一变量 `MAX_MODEL_LEN=40960→43008`**。
+- 前置门禁：进程 0 / NPU 8 卡全空闲 / shm 384G（清场残留后）。04:02 启动，双 Pool READY（groups=['a','b']，store 19080-19087/du 19090-19097 路由正确）→ **04:07:28 自然收尾（无人工清理）**。
+- env 核验原文（`env | grep SMOKE | sort`）：`MAX_MODEL_LEN=43008`（唯一改）+ BENCH=1/DATASET=chinese_40k/MAX_NUM_SEQS=4/MAX_NUM_BATCHED_TOKENS=2048/MAX_TOKENS=1024/CHUNKED=1/GPU_MEM=0.97/PROFILE=0/CPU_BINDING=0 全就位。import 核验：`vllm_ascend=/home/fjj/vllm-ascend-remote-offload/vllm_ascend/__init__.py`（fjj 仓 ✓）。
+- 工具 RC=0（R24_RC=0），summary=RUN_OK model_exit=0，run-status graceful=true errors=[]。
+
+### 结果（通过标准逐条，核心=1024 步首次无挂起）
+
+1. **8/8 DRAIN_OK + 8×STORE_CLOSED**（04:07:28，8 worker 全 `requests=4 put_pages=97344 inference=hbm_full_remote_shared remote_get=1`，select=7505-8626 scatter_sfa=22515-25878）；**patch_shm 挂起 = 0 次**（1024 步首次无挂起）。
+2. **4 rank 各打出 `[dsa-smoke][metrics][dp=N]` 行**（dp=0/1/2/3，各 requests=4 output_tokens=4096）。
+3. **`results/1p/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared.metrics.json` 存在**（model.log:2811 写入确认），global 含 requests=16/分位数/吞吐/tpot_under_50ms 全字段。
+4. **`[dsa-smoke][metrics][global]` 原文回传**（见下）+ 全局报告块全文。
+
+### `[dsa-smoke][metrics][global]` 原文
+
+```
+{"dp_size": 4, "requests": 16, "output_tokens": 16384, "global_wall_s": 99.743, "request_throughput_rps": 0.16, "global_output_tps": 164.26, "ttft_ms": {"avg": 45382.123, "min": 18577.744, "p50": 45536.521, "p90": 71874.828, "p99": 71950.002, "max": 71950.002}, "tpot_ms": {"avg": 48.32, "min": 21.551, "p50": 48.263, "p90": 77.477, "p99": 77.583, "max": 77.583}, "tpot_under_50ms": false}
+```
+
+### 全局报告块原文
+
+```
+============ DSA Smoke Benchmark Result (global, offline) ============
+Successful requests: 16
+Benchmark duration (s): 99.74
+Total generated tokens: 16384
+Request throughput (req/s): 0.16
+Output token throughput (tok/s): 164.26
+TTFT (ms): avg=45382.123ms p50=45536.521 p90=71874.828 p99=71950.002 max=71950.002
+TPOT (ms, excl. 1st token): avg=48.32ms p50=48.263 p90=77.477 p99=77.583 max=77.583
+========================================================================
+```
+
+### 健康计数
+
+- **patch_shm_broadcast 挂起 = 0 次**；ValueError/RuntimeError = 0；EI0006 = 0；code=1004 = 0。
+- TTFT 全正且 `0 < ttft(avg 45382ms) < global_wall_s×1000(99743ms)` ✓。
+- 1024 步 decode 全 16 请求跑满（output_tokens=16384 = 16×1024），remote 数据面真实发生（put_pages=97344×8、real_store=1）。
+
+### 判读预案命中：过 ⇒ clamp 理论坐实
+
+R24（ML43008）vs R19-1（ML40960，同 BS4×1024 其余全同）：**ML43008 干净跑完 1024 步 decode 无挂起无崩溃**（R19-1 崩+挂全中）。唯一变量=MAX_MODEL_LEN 从 40960→43008（+2048 余量覆盖 prompt≤~40.7K+1024 的 clamp 区）。**clamp 统一理论实证坐实**：max_model_len 不足 → decode 尾部非 uniform 步 → eager 仍进 remote select → Q=4 断言；+2048 余量后不触发 clamp → 1024 步全净。**1024 步 decode 解锁**，按预案 R25 进 BS16×1024 + 100K×1K 验收配方；非 uniform 路由根治（eager 分支正确处理 Q≠4）转代码线挂账（生产健壮性，不阻塞验收）。
+
+**数据点**（1024 步口径首个 bench 点）：global_wall_s=99.743、output_tps=164.26、tpot avg=48.32ms（min 21.55/p50 48.26）、TTFT avg=45382ms（40K chunked-prefill 主导，与 R23-1 同量级）。
+
+**日志/产物路径**：容器内 `/home/fjj/pp_r24.log`（tee 全量，含 POOL_ROI_REPORT + R24_RC=0）、`/home/w00919836/scp-opt/tmp/r24-bench-bs4-mt1024-ml43008/raw/model.log`（860KB 全链）、`summary.txt`（RUN_OK）、`run-status.json`（graceful:true）、`raw/overlap-*.csv`（8 端口满数据）、`results/1p/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared.metrics.json`。运行后机器自然收尾（EngineCore 全 SIGTERM 退出、worker 队列终止），进程 0 / NPU 8 卡空闲 / shm 384G 已清场。

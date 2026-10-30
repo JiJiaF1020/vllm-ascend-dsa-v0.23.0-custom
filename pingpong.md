@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R25 已派单（2026-10-31）——R24 判读：clamp 统一理论实证坐实（唯一变量 ML43008 从崩+挂→全净），纪律入库「max_model_len > max(prompt)+max_tokens+MTP 余量」；1024 步首个 decode 主导 bench 点：tps=164.26、tpot avg=48.32/min=21.55ms。R25 = R25-1 BS16×1024 offload-on（R18 原始失败点复测）+ R25-2 同配方 baseline（绕工具直跑）对照，给 +20% 口径 decode 主导数据点；R25-2 若 OOM 即 offload 容量价值直接证据。R26 预案 = 100K×1K 验收配方。
+- Current owner: **绿区**。Status: §R25 已交付（2026-10-31）——R25-1 BS16×1024 offload-on 解锁 R18 失败点（R25A_RC=0，8/8 DRAIN+挂起0，tps=126.81），R25-2 baseline 反超 +24.3%（tps 157.6 vs 126.81，tpot avg 184.6 vs 347.5ms）——offload-on 此配方=纯开销第二数据点，OOM 未触发，容量价值待 R26 100K×1K 验收配方验证。
 
 ## 0. 目标与口径
 
@@ -2590,6 +2590,23 @@ export VLLM_ASCEND_SMOKE_ENABLE_OFFLOAD=0
 - 若 R25-2 OOM 而 R25-1 过 ⇒ offload 容量价值直接成立，验收叙事改为「offload 解锁 baseline 跑不了的规格」；
 - 之后 R26 = 100K×1K 验收配方（chinese_104k + MAX_MODEL_LEN≥105K + MAX_TOKENS=1024，offload-on vs baseline 同口径）。
 
+## §R25 交付：BS16×1024 双轮对照——offload-on 解锁 R18 失败点，baseline 反超坐实 decode 主导口径（2026-10-31）
+
+**R25-1 offload-on（经工具，R24 逐字唯一改 MAX_NUM_SEQS=4→16）**：R25A_RC=0 干净收尾，8/8 DRAIN_OK + 8×STORE_CLOSED（put_pages=97344×8 real_store=1）+ patch_shm 挂起=0 + ValueError/EI0006/1004 全 0 + 4 rank metrics + metrics.json + `[global]` 原文：requests=64/output_tokens=65536/global_wall_s=516.789/rps=0.124/output_tps=126.81/ttft avg=152579ms（全正0<ttft<wall×1000）/tpot avg=347.501 p50=349.5 p90=462 p99=476/tpot_under_50ms=false。**R18 原始失败点（BS16×ML40960 崩+挂）在 ML43008 下解锁坐实**——8/8 DRAIN+挂起0 自然收尾。
+
+**R25-2 baseline 对照（绕工具直跑，R23-1 模式，ENABLE_OFFLOAD=0）**：R25B_RC=0 干净收尾，offload=False 硬证据三选全中（run 名=`dp4_tp2_baseline_graph_mtp_eager` 不含 offload / STORE_CLOSED=0+SHARED_CONNECT=0+POOL_STORE_ROUTE=0 无 STORE 行 / 启动行 4 rank `offload=False`+`mtp_graph_enabled=False`）；4×[metrics][dp]+metrics.json baseline 路径全字段；ERROR_SCAN=0 无 OOM。`[global]` 原文：requests=64/output_tokens=65536/global_wall_s=415.833/rps=0.154/output_tps=157.6/ttft avg=163220ms（全正0<ttft<wall×1000）/tpot avg=184.616 p50=182.695 p90=284.797 p99=297.672/tpot_under_50ms=false。
+
+**对照结论（同配方 BS16×1024 ML43008 decode 主导口径，R25 第二数据点）**：
+
+| 指标 | R25-1 offload-on | R25-2 baseline | 差(baseline−offload) |
+|---|---|---|---|
+| global_wall_s | 516.789 | 415.833 | −100.96s（−19.5%） |
+| output_tps | 126.81 | 157.6 | +30.8（+24.3%） |
+| tpot avg ms | 347.501 | 184.616 | −162.9ms（−46.9%） |
+| tpot p50 ms | 349.5 | 182.695 | −166.8ms（−47.7%） |
+| TTFT avg ms | 152579 | 163220 | +10641（+7.0%） |
+
+**判读（绿区按数据陈述，裁决交蓝区）**：BS16×1024 decode 主导口径下 **baseline 反超 offload-on +24.3%**（tps），tpot avg −46.9%——与 R23（BS4×256 prefill 主导）baseline 反超 +7.7% 同号且幅度更大，**offload-on 在此配方=纯开销坐实第二数据点**；「+20% 自提升」预期在 decode 主导口径下不成立且差距反号更大。offload 容量价值（R25 派单预案：R25-2 OOM 即直接证据）**未触发**——baseline 无 OOM 正常跑完（BS16×1024 ML43008 每卡可装下，8 worker 各 60.96GB），容量维度未到 HBM 上限，offload 容量收益待 100K×1K 或更大 BS 配方验证。TTFT baseline 略高（+7.0%）因 baseline 无 remote 预取/调度差异，属 prefill 肩相位噪声。R26 预案（100K×1K 验收配方：chinese_104k + ML≥105K + MT1024）方向不变，offload 收益预期收敛于容量维度（100K 长上下文 KV 超 HBM 时 offload 不可替代）。机器已清场。
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 
 ### 目标

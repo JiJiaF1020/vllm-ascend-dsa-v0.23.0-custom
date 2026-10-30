@@ -122,6 +122,6 @@
 
 **派单**（commit b34e7a3）：R13-1 = R12-1 逐字 + 唯一变量 ENABLE_CPU_BINDING=0（头号嫌疑直测），过则 绑核根因坐实 + bench 基线落袋；EI0006 复现 则 R13-2 env 二分（BENCH=0）。白名单=1004。
 
-**交付**（commit 待回填）：R13-1 关绑核 EI0006 复现（10:54:05 齐射×20），绑核关闭核验通过（enable_cpu_binding=False 生效，无绑核执行痕迹）→ 绑核排除；R13-2 BENCH=0 仍 复现（11:03:16 ×20）→ bench env/代码路径排除，触发面在基础 env 集合或更底层。两轮均 0×1004，0 DRAIN，崩溃相位同签名（KV-cache init MoE 前向 HcclAllGather）。数据出处：/home/fjj/pp_r13.log + pp_r13b.log + tmp/r13-nobind-bench/ + tmp/r13-envbis-nobench/。
+**交付**（commit 34a2b10）：R13-1 关绑核 EI0006 复现（10:54:05 齐射×20），绑核关闭核验通过（enable_cpu_binding=False 生效，无绑核执行痕迹）→ 绑核排除；R13-2 BENCH=0 仍 复现（11:03:16 ×20）→ bench env/代码路径排除，触发面在基础 env 集合或更底层。两轮均 0×1004，0 DRAIN，崩溃相位同签名（KV-cache init MoE 前向 HcclAllGather）。数据出处：/home/fjj/pp_r13.log + pp_r13b.log + tmp/r13-nobind-bench/ + tmp/r13-envbis-nobench/。
 
 **判读**（蓝区）：待定（给定下一轮 逐项 unset 二分表）。

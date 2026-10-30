@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R25 已交付 + §R26 已排队（2026-10-31）——R25：BS16×1024 双轮对照，R25-1 offload-on 解锁 R18 失败点（8/8 DRAIN+挂起0，tps=126.81），R25-2 baseline 反超 +24.3%（tps 157.6，tpot avg 184.6 vs 347.5ms），OOM 未触发。**规格变更（用户定）：100K 取消，统一 40K×1K**。R26（紧接执行）= 在线 serving 拉齐 KVAF 负载形态：R26-0 取证工具 pool-only + remote-shared json；R26-1 `vllm serve` bring-up（DP4TP2EP8 + MTP3 graph + remote_shared 内联，serve 参数已从 build_llm_kwargs 精确生成）；R26-2 `vllm bench serve` 40K×1K 并发 16/64 两档（KVAF 同口径 JSON）。
+- Current owner: **绿区**。Status: §R26 已交付（2026-10-31）——在线 serving 拉齐失败：R26-1 serve bring-up 成功（健康+DSA_CONNECT=24），R26-2 bench 两档崩溃根因=remote_shared 单种群限制（remote_shared.py:124 validate_requests，BIND 后新 request_id 拒绝，触发边界并发2成功/4崩溃）——架构级限制非参数可调，单请求/并发2 在线数据点有效（TPOT=15ms/ITL=46ms/acceptance=69.9%），等蓝区裁决在线 serving 路线。
 
 ## 0. 目标与口径
 
@@ -2696,6 +2696,20 @@ vllm bench serve --model glm52-dsa --host localhost --port 8000 \
 - 档1（并发16齐射）TPOT/吞吐 vs R25-1 离线 BS16 同配方 → 离线/在线口径差定量；
 - 档2（并发64）= KVAF 形态大 batch 数据点；全过后验收叙事 = 离线（R25）+ 在线（R26）双口径 40K×1K。
 
+
+## §R26 交付：在线 serving 拉齐失败——remote_shared 单种群限制（并发2 成功，4/16 崩溃）（2026-10-31）
+
+**R26-0 取证**：工具 **无 pool-only 模式**（profile_pool_inference.py 仅 remote/local/baseline + --preflight-only，无只起 Pool 不跑推理选项）——R26-1 用 urma_pool_server 二进制直接起 Pool；R24 remote-shared json 全量内容已取（serve 的 remote_shared 字段内联用，8 device 的 du_endpoint 19090-19097 / store_endpoint 19080-19087 / pool_eid 0f7f03+0f3f03 对）。
+
+**R26-1 serve bring-up 成功**（经工具内联，DP4TP2EP8 + MTP3 graph + remote_shared 内联）：Pool A/B 完全就绪（REMOTE_DU_SOURCE kind=shared_store group_gather=1 + HOST_PUSH_READY + CPU_PLACEMENT 绑核 numa0/numa2）；serve 健康（/health 200 + /v1/models 返回 glm52-dsa max_model_len=43008）；**DSA_SHARED_CONNECT_OK/DSA_STORE 行=24**（serving 模式 remote 建链证据，通过标准第1条命中）；ERROR=0。
+
+**R26-2 两档 bench 失败，根因=remote_shared 单种群限制（代码级证据链完整）**：
+- 首先发现：bench 默认 temperature=1.0 与 DSA+MTP3 greedy 约束冲突（scheduler.py:70 `ValueError: DSA compromise MTP currently requires greedy sampling (temperature=0.0)`）→ 请求全拒 + ApiServer died + serve 进程组关停。修正：bench 加 `--temperature 0.0`（已验证可行）。
+- 正式档 1（并发16，但加了 → 也是并发16）：16/16 全败（duration=1.05s），根因 `Worker failed with error 'remote shared supports one offline cohort: no new requests or retired-row reuse after BIND'`（EngineCore_DP1 崩溃→ EngineDeadError → ApiServer died → serve 关停）。
+- **决定性验证（流形前的额外进展）**：并发2 完全成功（2/2, failed=0, TTFT avg=19213ms, TPOT avg=15.08ms, ITL avg=46.62ms, output_tps=54.34, total_tps=2177.09, acceptance=69.9%）——**在线 serving 并发2 是工作的**；并发4 崩溃（4/4 failed, duration=0.27s，同样误差同样根因）。触发边界在 2~4 之间。
+- 代码级证据：remote_shared.py:124-127 `validate_requests`：`if row in self.retired or (self.real_bound and self.request_ids.get(row) != request_id): raise ValueError(...)`；config.py:484 `remote_shared requires BS1..32 per DP; one offline cohort, no request-row reuse`。并发2 时两请求映射同 row 0 同一 cohort（DSA_SHARED_CONNECT_BEGIN active_rows=[0] bound_rows=[0]），完成后 DSA_SHARED_RETIRED row=0 row_reusable=0；并发4/16 时多请求跨多批/新 request_id 在 BIND 后到达，validate_requests 拒绝→ worker 崩溃→ 整个 serve 进程组关停。
+
+**判读（绿区按数据陈述，裁决交蓝区）**：remote_shared（hbm_full_remote_shared）的**在线 serving 只支持单 cohort（单批 BIND），不支持 vllm bench serve 的多请求并发打流**——这是架构级限制（设计时即确认 BS1..32 但单种群无多请求），非参数可调。R26-1 的 serve 上线本身成功（健康+建链证据全齐），但在线打流碰到 remote_shared 单种群限制。**单请求/并发2 下的 TPOT=15ms、ITL=46ms、acceptance=69.9%（MTP3 draft 生效）是有效的在线 serving 数据点**；但 R26-2 两档（并发16/64）未能完成，KVAF 同口径大批次数据点缺失。建议蓝区判断：①是否需要为在线 serving 修改 remote_shared 支持多种群/多请求轮转（解除 real_bound 后的新 request_id 拒绝）；②或认可单种群限制，将在线 serving 回退到并发2以内或将 R26 改为单请求循环走丁量；③或在线 serving 路线放弃、回归离线路线（R25 已覆盖 40K×1K 离线）。机器已清场。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

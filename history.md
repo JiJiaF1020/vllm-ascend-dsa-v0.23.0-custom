@@ -257,3 +257,7 @@ pull 15db763（TTFT 改 first_token_latency 优先 + R22 派单）后执行：R2
 ## §R25 判读：offload 纯开销第二数据点（+24.3%），容量价值在八卡 40K 规格内不成立（2026-10-31）
 
 R18 失败点解锁坐实（BS16×1024+ML43008 全净，clamp 理论二次实证）。对照：BS4×256 baseline 反超 7.7% → BS16×1024 反超 24.3%（tps 157.6 vs 126.81）、tpot avg −46.9%（184.6 vs 347.5ms）——offload 开销∝decode 步数，decode 主导口径放大，同号两连可下结论「40K 规格 HBM 装得下时 offload-on 恒为净开销」。R25-2 baseline 无 OOM（8×60.96GB）+ 100K 规格已取消 ⇒ 当前可测规格内无 offload 容量场景，「+20% 自提升」在八卡 40K 口径无成立路径，验收收口方式待用户裁决。R26（在线 serving 拉齐）不变。
+
+## §R26 交付：在线 serving 失败——remote_shared 单种群限制（并发2 成功，4/16 崩溃）（2026-10-31）
+
+**R26-0**：工具无 pool-only（仅 remote/local/baseline + preflight-only），Pool 用 urma_pool_server 直接起；R24 remote-shared json 已取。**R26-1**：serve bring-up 成功（健康 + /v1/models glm52-dsa ML43008 + DSA_SHARED_CONNECT_OK/DSA_STORE=24 + ERROR=0）。**R26-2**：bench 默认 temperature=1.0 与 DSA+MTP3 greedy 约束冲突（scheduler.py:70 ValueError）→ 加 --temperature 0.0 后：并发2 成功（2/2, TTFT=19213ms/TPOT=15.08ms/ITL=46.62ms/output_tps=54.34/acceptance=69.9%），并发4 崩溃（4/4），并发16 崩溃（16/16）——根因 remote_shared.py:124-127 validate_requests 单种群限制：BIND 后新 request_id 拒绝（config.py:484 BS1..32 one offline cohort），触发边界 2~4。架构级限制，非参数可调；在线打流失败但单请求/并发2 数据点有效。机器已清场。

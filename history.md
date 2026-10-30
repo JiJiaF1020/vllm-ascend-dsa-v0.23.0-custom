@@ -266,3 +266,7 @@ R18 失败点解锁坐实（BS16×1024+ML43008 全净，clamp 理论二次实证
 
 **判读**：①serving 模式 remote 建链首次跑通（健康+CONNECT/STORE 24 行，graph 档一把过，serve_dsa.sh 的 DP+MTP3 eager 限制对本配置不适用）；②**架构级发现：remote_shared=单离线 cohort 设计**（remote_shared.py:124-127 validate_requests + config.py:484：BIND 后拒新 request_id、retired row 不复用）——40K prefill 分批完成，先 decode 者触发 BIND 后其余成「BIND 后新请求」被拒，并发 2 同窗口存活/并发 4+ 必崩；现阶段 remote 方案不能上生产 serving，验收只能走离线口径或 ≤2 并发在线口径；多种群/row 轮转=需求级改动挂作者线。③并发 2 在线数据点有效：TPOT 15.08ms（低于用户经验 26.7ms）、ITL 46.62ms、acceptance 69.9%（MTP3 生效）、output_tps 54.34、total_tps 2177。④纪律入库：bench serve 打 DSA 必须 --temperature 0.0（scheduler.py:70 greedy 约束）。
 **派单**：R27-1 并发 1（8 条）/并发 2（16 条滚动，预期崩则改单 cohort 2 条重打）正式档；R27-2 并发 3 边界探测（256 输出只判存活）——定 cohort 边界是固定 2 还是「同 prefill 窗口」。
+
+## §R28 派单：吞吐主线定调——BS 阶梯加压找 baseline 容量边界（2026-10-31）
+
+用户定调：并发 2 在线 TPOT 对提吞吐无意义（仅口径存档），提吞吐走并发扩展。依据：R25-2 baseline BS16 每卡仅用 60.96GB（总 91.75GB），余量 ~30GB；offload 价值 = 把 batch 拉到 baseline 撞 HBM 天花板后继续上行。R28（排 R27 后）= R28-1 baseline BS32（绕工具，OOM 即边界证据）+ R28-2 offload-on BS32（经工具）。预案：baseline OOM + offload 过 ⇒ R29 offload BS48/64 冲总吞吐，超过 baseline 最大可达 157.6 tps 即「提吞吐」兑现；都过 ⇒ 继续加压；offload 挂 ⇒ 重估。

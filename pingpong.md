@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R27 已派单（2026-10-31）——R26 判读：①serving 模式 remote 建链首次跑通（健康+CONNECT/STORE 24 行，graph 档一把过）；②**架构级发现：remote_shared 单离线 cohort 设计**（BIND 后拒新 request_id、retired row 不复用），在线滚动打流必崩，边界并发2成/4崩——现阶段 remote 方案不能上生产 serving，多种群支持=需求级改动挂作者线；③并发2 在线数据点有效：TPOT 15.08ms/ITL 46.62ms/acceptance 69.9%。R27 = 并发1/2 正式档（--temperature 0.0 纪律入库）+ 档B 滚动16条验证「同窗口 cohort」假设 + 并发3 边界探测。
+- Current owner: **绿区**。Status: §R27 执行中 + §R28 已排队（2026-10-31）——**吞吐主线定调（用户）：并发2 在线 TPOT 仅口径存档，提吞吐走并发扩展**。R28（R27 交付后执行）= BS 阶梯加压找 baseline 容量边界：R28-1 baseline BS32（绕工具直跑，OOM 即边界证据）、R28-2 offload-on BS32（经工具）。判读预案：baseline OOM + offload 过 ⇒ R29 offload BS48/64 冲总吞吐对比 baseline 最大可达 157.6 tps。R27 在线小并发档继续（结果只作口径存档）。
 
 ## 0. 目标与口径
 
@@ -2764,6 +2764,42 @@ vllm bench serve --model glm52-dsa --host localhost --port 8000 \
 - 档A/B 成 → 在线口径数据包 = 并发 1/2 两档，验收材料可用；
 - 档3 成 ⇒ cohort 边界不是固定 2 而是「同 prefill 窗口可同行」，蓝区重新建模 BIND 时机；崩 ⇒ 边界=2 坐实；
 - 大并发在线（并发≥4）= 多种群需求，挂作者线，不在绿区排期。
+
+## §R28 派单：吞吐线——BS 阶梯加压找 baseline 容量边界（蓝区，2026-10-31）——**§R27 交付完成后执行**
+
+**背景（用户定调）**：并发 2 在线 TPOT 对提吞吐无意义（仅口径存档）。吞吐主线 = **并发扩展**：R25-2 baseline BS16 每卡仅用 60.96GB（总 91.75GB），余量 ~30GB；offload 的价值是把 batch 拉到 baseline 撞 HBM 天花板之后继续上行。本轮找边界。
+
+### R28-1 · baseline BS32（绕工具直跑，R23-1/R25-2 模式）
+
+R25-2 逐字（容器内 + va.env + PYTHONPATH 前置 fjj + 不起 Pool + ENABLE_OFFLOAD=0 + BENCH=1 + batched2048/chunked1 + ML43008 + MT1024），唯一变量：
+
+```bash
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=32   # BS16→BS32，全局 128 请求
+```
+
+日志 `/home/fjj/pp_r28a.log`。**两种结局都有用**：OOM ⇒ baseline 容量边界 ∈(16,32]，offload 并发扩展叙事的前提成立；跑过 ⇒ 记录数据，边界更高。
+
+### R28-2 · offload-on BS32（经工具，R25-1 模式）
+
+R25-1 逐字，唯一变量 `MAX_NUM_SEQS=32`，输出 `tmp/r28-bench-bs32-mt1024-ml43008`，日志 `/home/fjj/pp_r28b.log`。
+
+### 通过标准
+
+1. R28-1：RUN_OK + metrics（或 OOM 原文末 30 行——OOM 不是失败，是边界证据）；
+2. R28-2：8/8 DRAIN + STORE_CLOSED + 挂起 0 + metrics 全产出；
+3. 两轮 `[global]` 原文回传。
+
+### 失败处置
+
+- R28-1 OOM ⇒ 原文回传，转 R28-3 预案（见下，蓝区下轮派）；
+- R28-2 OOM/挂起/崩溃 ⇒ 原文回传（offload 侧 BS32 也有上限的话，叙事需重新评估）；
+- 1004 ⇒ 白名单；其余同前。
+
+### 判读预案（派单时写死）
+
+- **R28-1 OOM + R28-2 过** ⇒ offload 并发扩展叙事前提成立：R29 = offload BS48/64 冲总吞吐，对比「baseline 最大可达总吞吐（BS16 的 157.6）」——offload 总吞吐超过它即「提吞吐」兑现；
+- **两轮都过** ⇒ 边界更高，R29 继续加压（BS48）；
+- **R28-2 挂/OOM** ⇒ offload 侧 BS32 也有瓶颈，回报具体失败面再定。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

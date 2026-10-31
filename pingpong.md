@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R27 执行中 + §R28 已排队（2026-10-31）——**吞吐主线定调（用户）：并发2 在线 TPOT 仅口径存档，提吞吐走并发扩展**。R28（R27 交付后执行）= BS 阶梯加压找 baseline 容量边界：R28-1 baseline BS32（绕工具直跑，OOM 即边界证据）、R28-2 offload-on BS32（经工具）。判读预案：baseline OOM + offload 过 ⇒ R29 offload BS48/64 冲总吞吐对比 baseline 最大可达 157.6 tps。R27 在线小并发档继续（结果只作口径存档）。
+- Current owner: **绿区**。Status: §R27 已交付 + §R28 执行中（2026-10-31）——R27 在线小并发全部完成（并发1 串行滚动 1/8 崩 / 并发2 单 cohort 2/2 成 / 并发3 3/3 崩，cohort 边界=2 座实，在线打流路线关闭）；**R28 吞吐线=并发扩展：R28-1 baseline BS32 （绕工具直跑）+ R28-2 offload-on BS32 （经工具），找 baseline 容量边界。
 
 ## 0. 目标与口径
 
@@ -2765,6 +2765,18 @@ vllm bench serve --model glm52-dsa --host localhost --port 8000 \
 - 档3 成 ⇒ cohort 边界不是固定 2 而是「同 prefill 窗口可同行」，蓝区重新建模 BIND 时机；崩 ⇒ 边界=2 坐实；
 - 大并发在线（并发≥4）= 多种群需求，挂作者线，不在绿区排期。
 
+## §R27 交付：并发1 串行滚动也崩——单 cohort 每次 serve 只能处理 1 个请求群（并发2 单 cohort 2 条成功，并发3 确认崩溃）（2026-10-31）
+
+**R27-1 服务起法逐字复用 R26-1**：Pool A/B 就绪 + serve 健康（HEALTH=200）+ DSA_CONNECT/STORE 24 行。
+
+**R27-2 三个结果（bench 全带 --temperature 0.0）**：
+- **档A · 并发1 × 8 条稳态：1/8 成功，7 失败，serve 崩**（r27_c1.json: completed=1 failed=7 duration=30.22s）。成功条 TTFT=18262.35ms/TPOT=11.48ms/ITL=43.34ms/acceptance=92.62%；失败原因=Never received a valid chunk to calculate TTFT + Internal Server Error（同 R26 single cohort 签名）。→ **并发1 串行滚动也不支持：每次 serve 启动后只能处理 1 个 cohort（第 2 条触发 BIND 后新请求拒绝），之后必须重启 serve 才能继续后续档。**
+- **档B · 并发2 × 16 条滚动：2/16 成功，14 失败，serve 崩**（r27_c2_16.json: completed=2 failed=14 duration=32.24s）。成功 2 条 TTFT=19414.90ms/TPOT=17.54ms/ITL=47.23ms/acceptance=65.67%（这 2 条是同一 cohort 内的 2 个请求）。预案命中：滚动后续请求=“BIND 后新请求”崩溃。
+- **档B 兜底 · 并发2 × 2 条单 cohort：2/2 成功，failed=0，serve 保持健康**（r27_c2.json: completed=2 failed=0 duration=42.67s，TTFT=19098.02ms/TPOT=17.64ms/ITL=47.00ms/acceptance=55.51%，serve HEALTH=200 未崩）。→ **并发2 单 cohort 2 条确认可行，与 R26 并发2 成功一致。**
+
+**R27-3 边界探测并发3 × 3 条（output256）：3/3 失败，serve 崩**（r27_c3.json: completed=0 failed=3 duration=0.25s）。爆崩根因=同一签名 `remote shared supports one offline cohort: no new requests or retired-row reuse after BIND`（EngineCore_DP3 worker 抛错→ ApiServer died。对应规则原文迷码日志 2462 行）。→ **cohort 边界=2 座实：并发3 就崩，不是“同 prefill 窗口可同行”。**
+
+**判读（绿区按数据陈述，裁决交蓝区）**：remote_shared（hbm_full_remote_shared）的在线 serving **不仅大并发不行，连并发1 串行滚动、并发3 都崩**：每次 serve 启动只能处理且仅处理 1 个单 cohort（单 cohort 内最多 2 个请求，并发3 就超出而崩）。这彻底关闭了“在线打流”路线：即使并发1，多请求串行也不可能——与 R26 的“并发2 可行”组合得出：可用范围仅为“单 cohort 内 1~2 个请求”，超过即需重启 serve。**单请求/并发2 在线数据点有效（档A 单条 TTFT=18262ms/TPOT=11.48ms/ITL=43.34ms/acceptance=92.62%；档B 兜底 TTFT=19098ms/TPOT=17.64ms/ITL=47.00ms/acceptance=55.51%），但只能作为单发/微并发数据点，无法组成可用的在线打流能力。**建议蓝区裁决：①在线 serving 路线放弃，回归离线路线（R25 已覆盖 40K×1K 离线）；②或多种群支持（解除 real_bound 后新 request_id 拒绝）=需求级改动，挂作者线；③或将在线路线回退为“单 cohort 单次 BIND + 重启 serve 循环”的可行性研究。机器已清场。
 ## §R28 派单：吞吐线——BS 阶梯加压找 baseline 容量边界（蓝区，2026-10-31）——**§R27 交付完成后执行**
 
 **背景（用户定调）**：并发 2 在线 TPOT 对提吞吐无意义（仅口径存档）。吞吐主线 = **并发扩展**：R25-2 baseline BS16 每卡仅用 60.96GB（总 91.75GB），余量 ~30GB；offload 的价值是把 batch 拉到 baseline 撞 HBM 天花板之后继续上行。本轮找边界。

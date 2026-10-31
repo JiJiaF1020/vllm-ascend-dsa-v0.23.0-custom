@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **蓝区**。Status: §R30 已交付（2026-10-31）——offload-on BS4×1024 profile 采集完成：8/8 DRAIN+STORE_CLOSED 无挂起，profile 11G 落盘 /home/fjj/profiles/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared/（4 rank×2 worker ascend_pt trace），[global] output_tps=158.23（profile 开销 -3.7%）。remote-offload 线收官结论已定（R29 判读：HBM 边界>48、吞吐甜点 BS16）。等 §R30 判读/下一手派单。——offload-on BS4×1024 profile 采集轮（R25-1 模式三变量：BS4 / ENABLE_PROFILE=1 / PROFILE_DIR=/home/fjj/profiles；profile 纪律=极小并发，全局 16 请求）。§R29 已判读：baseline BS48 无 OOM 131.35 tps（BS16 起单调降 157.6→153.83→131.35），HBM 边界>48、吞吐甜点=BS16 坐实，remote-offload 线收官。等 §R30 交付，profile 数据路径回传用户。
+- Current owner: **蓝区**。Status: §R30 已判读收官（2026-10-31）——BS4×1024 offload-on profile 采集成功无挂起，11G trace 落盘 `/home/fjj/profiles/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared/`（已回传用户）；output_tps=158.23（profile 开销 -3.7%）。remote-offload 线全部议程关闭（R27 在线线关闭 / R28 store 页容量根因 / R29 HBM 边界>48+甜点 BS16 / R30 profile 采集），无在途派单。
 
 ## 0. 目标与口径
 
@@ -2920,6 +2920,10 @@ export VLLM_ASCEND_SMOKE_PROFILE_DIR=/home/fjj/profiles   # 绝对路径，勿�
 **profile 数据完整绝对路径（用户直接取用）**：`/home/fjj/profiles/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared/`（11G，dp_rank_0..3 四 rank 各含 2 worker 的 ascend_pt trace）
 
 **机器已清场**：进程 0、NPU 8 卡全空闲、shm 384G 干净（Pool backing 已清）、profile 目录 11G 保留勿删。日志：`/home/fjj/pp_r30.log` + `tmp/r30-bench-bs4-mt1024-profile/raw/`（model.log + overlap-19090..97.csv 8 端口）。
+
+## §R30 判读（蓝区，2026-10-31）
+
+**实测**：BS4×1024 offload-on + profile 全程无挂起（BS4 并发下 shm 广播压力低于耗尽阈值，profile 纪律验证有效），8/8 DRAIN+STORE_CLOSED，torch profiler 轨迹 11G 落盘四 rank。**profile 数据路径（用户取用）**：`/home/fjj/profiles/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared/`。性能参考：output_tps=158.23 vs R24 同配方无 profile 164.26（profile 开销 -3.7%，符合预期、量级健康）。本轮为一次性数据需求，交付后盯梢收官。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R27 已交付 + §R28 执行中（2026-10-31）——R27 在线小并发全部完成（并发1 串行滚动 1/8 崩 / 并发2 单 cohort 2/2 成 / 并发3 3/3 崩，cohort 边界=2 座实，在线打流路线关闭）；**R28 吞吐线=并发扩展：R28-1 baseline BS32 （绕工具直跑）+ R28-2 offload-on BS32 （经工具），找 baseline 容量边界。
+- Current owner: **绿区**。Status: §R28 已交付（2026-10-31）——R28-1 baseline BS32 RUN_OK 无 OOM（global_output_tps=153.83，对照 BS16 157.6 持平-2.4%），**baseline 边界>32 未碰 HBM 天花板**；R28-2 offload-on BS32 崩于 **Pool store 容量边界**（每 DU `--embedded-store-requests 32`，BS32×128 请求恰打满 4DU×32 槽，`Store backing exhausted`→`Pool [a] exited`），非 OOM。“把 batch 拉到 baseline 碰天花板后继续上行”的 offload 价值故事未验证；baseline 先找真边界（R29 BS48/64）或 offload 升 store 槽位约束后再试。等蓝区裁决。机器已清场。
 
 ## 0. 目标与口径
 
@@ -2813,6 +2813,13 @@ R25-1 逐字，唯一变量 `MAX_NUM_SEQS=32`，输出 `tmp/r28-bench-bs32-mt102
 - **两轮都过** ⇒ 边界更高，R29 继续加压（BS48）；
 - **R28-2 挂/OOM** ⇒ offload 侧 BS32 也有瓶颈，回报具体失败面再定。
 
+## §R28 交付：BS32 梯梯压加——baseline 无 OOM 跑过（153.83 tps），offload-on 崩于 Pool store 容量边界（每 DU 32 槽）（2026-10-31）
+
+**R28-1 · baseline BS32（绕工具直跑，R25-2 模式唯一变量 MAX_NUM_SEQS=16→32）：RUN_OK 无 OOM，RC=0 干净收尾。归属硬证推：启动行 4 rank 均 `offload=False ... bs=32`；STORE 行=0；run 名=`dp4_tp2_baseline_graph_mtp_eager`。`[global]`原文：**requests=128 / output_tokens=131072 / global_wall_s=852.076 / request_throughput_rps=0.15 / global_output_tps=153.83 / ttft_ms avg=369049.806(min=16826.084 全正) / tpot_ms avg=226.541 p50=236.83 p90=322.518 p99=345.036 / tpot_under_50ms=false**。对照 R25-2 baseline BS16：157.6 tps→BS32 153.83（-2.4%，基本持平）→ **baseline 容量边界 >32**，命中“跑过⇒辰界更高”分支（未碰到 HBM 天花板）。
+
+**R28-2 · offload-on BS32（经工具，R25-1 模式唯一变量 MAX_NUM_SEQS=16→32）：崩溃，RC=1，DRAIN_OK=0、STORE_CLOSED=0、metrics 未产出。归属硬证：启动行 4 rank 均 `offload=True ... bs=32 mtp_graph_enabled=True`。根因链（raw/pool-a.log:306-313）：**`REMOTE_DU stopped: Store backing exhausted` + `REMOTE_DU fatal: direct PUT/GET error; exiting without retry`×4→ model.log 全部 Worker `prefill direct PUT failed: [25585, 13570, 16, 0]`（DP0-3/EP0-7 全覆盖）+ `AIV TopK control exchange send failed: Broken pipe`→ EngineCore 4 全崩→ `RuntimeError: Pool ['a'] exited while inference active`。配置实锤（pool-a.log REPRODUCE_COMMAND）：每 DU `--embedded-store-requests 32 --embedded-store-bytes 34358697984`（32GB），BS32×128 请求分布 4 DU = 每 DU 恰 32 槽，全量 PUT 打满即崩。**
+
+**判读（绿区按数据陈述，裁决交蓝区）**：混合结局命中两个预案分支的各一半：①这回不是“R28-1 OOM＋baseline 边界 ∈(16,32]”，而是 **baseline 边界 >32（未碰 HBM 天花板），BS32 与 BS16 吞吐持平（-2.4%）**；②③④**offload 侧的上限不是 HBM，而是 **Pool store 容量（每 DU 固定 32 请求槽 / 32GB backing）——BS32×128 请求就打满，崩在 store 边界而非模型容量边界。**“把 batch 拉到 baseline 碰 HBM 天花板后继续上行”的 offload 价值故事这一步未能验证：因为 baseline 还没碰天花板，而 offload-on 已先碰了 store 上限。**建议蓝区裁决：①继续压 baseline（R29 BS48/64）找它的真边界；②或解除 offload-on 的 store 槽位约束（--embedded-store-requests 升高／--embedded-store-bytes 扩容）后再试 BS32，看 offload-on 能否超 baseline BS16 吞吐；③或两路并行（baseline 快速找边界 + offload 开 store 槽变量探索）。机器已清场（进程 0、NPU 8 卡全空闲、shm 残留已清）。
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 
 ### 目标

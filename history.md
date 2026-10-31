@@ -283,4 +283,8 @@ R18 失败点解锁坐实（BS16×1024+ML43008 全净，clamp 理论二次实证
 
 **派单**（commit 0ea6dee）：R28-1 逐字唯一变量 MAX_NUM_SEQS=32→48，单轮单跑 baseline BS48，定 HBM 边界（OOM⇒边界∈(32,48] 或跑过⇒平台延伸坐实算力顶）。通过标准=RUN_OK+[global] 原文+启动行归属硬证。
 **交付**（commit 见本节首次提交）：RUN_OK RC=0——global_output_tps=131.35（BS32 153.83 -14.6% / BS16 157.6 -16.7%），BS48 无 OOM，HBM 边界 >48 平台延伸。数据出处：/home/fjj/pp_r29a.log + results/1p/dp4_tp2_baseline_graph_mtp_eager.metrics.json。
-**判读**（蓝区）：待定。绿区按数据陈述：算力顶先到、HBM 顶未到（BS48 仍未碰天花板），BS48 越过吞吐甜点进排队区反降。
+**判读**（蓝区）：HBM 边界>48（容量故事前提不成立）；吞吐甜点=BS16，BS48 反降 16.7% 坐实算力顶。remote-offload 线收官：40K×1024 口径 offload 吞吐/容量叙事均无成立路径，价值面=容量维度，待 KVAF 主线合并。
+
+## §R30 派单：offload-on BS4×1024 profile 采集轮（蓝区，2026-10-31）
+
+用户需求：采 offload-on 真实推理 torch profiler 数据供 decode 拆解，数据路径直接给用户。遵守 profile 纪律（BS16 实采 decode 挂起→压极小并发）：R25-1 模式三变量 BS4（全局16请求）+ ENABLE_PROFILE=1 + PROFILE_DIR=/home/fjj/profiles，输出 tmp/r30-bench-bs4-mt1024-profile，日志 pp_r30.log；交付须写明 profile 数据完整绝对路径；decode 挂起不自行重试（下轮 BS1/MT256 预案）。注：蓝绿协同此前已宣布收官，本轮为用户单独追加。

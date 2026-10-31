@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **蓝区**。Status: §R29 已交付（2026-10-31）——baseline BS48 无 OOM 跑过（131.35 tps，较 BS32 -14.6%），**HBM 边界 >48，平台延伸坐实算力顶**（BS16~BS32 ~155 tps 平台，BS48 进排队/争用区反降）；R28 判读「拉并发无空间」坐实。offload 容量故事最后实证未出现，等 §R29 判读/下一手派单。——R27 判读：在线路线关闭（单 cohort≤2 请求，滚动打流不再派轮）。R28 判读：baseline 吞吐 BS16 已饱和（BS32=153.83 tps≈BS16 157.6，算力顶先到）；R28-2 根因蓝区修正=**Pool store 页容量耗尽**（remote_kv_store.cpp:267，Close 不回收页→消耗∝全局请求数累积，非槽位），offload BS32 需 512GB shm 不可行、不派 offload 轮。R29=baseline BS48 定 HBM 边界（OOM 即边界证据）。等 §R29 交付。
+- Current owner: **绿区**。Status: §R30 已派单（2026-10-31）——offload-on BS4×1024 profile 采集轮（R25-1 模式三变量：BS4 / ENABLE_PROFILE=1 / PROFILE_DIR=/home/fjj/profiles；profile 纪律=极小并发，全局 16 请求）。§R29 已判读：baseline BS48 无 OOM 131.35 tps（BS16 起单调降 157.6→153.83→131.35），HBM 边界>48、吞吐甜点=BS16 坐实，remote-offload 线收官。等 §R30 交付，profile 数据路径回传用户。
 
 ## 0. 目标与口径
 
@@ -2866,6 +2866,44 @@ OOM ⇒ 原文回传；1004 ⇒ 白名单 ≤2 次重跑；其余同前。跑完
 **对照（baseline 阶梯）**：BS16=157.6 tps（R25-2）→ BS32=153.83（R28-1，-2.4%）→ **BS48=131.35（R29-1，较 BS32 -14.6%，较 BS16 -16.7%）**。BS48 未 OOM（8 worker 权重装载后各卡 VLLMWorker ~59.2GB，EP8 分片正确，generate 全程 GPU KV cache 峰值 92.7% 未爆）。
 
 **判读（绿区按数据陈述，裁决交蓝区）**：命中「跑过⇒平台延伸」分支——**BS48 无 OOM 跑过，baseline HBM 边界 >48，容量故事最后实证未出现**；但吞吐较 BS32 显著下滑（-14.6%）且每请求 decode 同比变慢（tpot avg 226.5→284.0ms，-25.4%）、TTFT 暴涨（avg 369→630s，批内排队效应），**BS48 已越过吞吐甜点、进入排队/资源争用区**。综合 R28+R29：baseline 在 40K×1024 口径的吞吐平台=BS16~BS32（~155 tps），**算力顶先到、HBM 顶未到（BS48 仍未碰 HBM 天花板）**，R28 判读的「拉并发提吞吐对 baseline 无空间」进一步坐实（BS48 反降）。机器已清场（进程 0、NPU 8 卡全空闲、shm 干净）。
+
+## §R29 判读（蓝区，2026-10-31）
+
+**实测**：baseline BS48 RUN_OK 无 OOM，global_output_tps=131.35（BS16=157.6 → BS32=153.83 → BS48=131.35，单调降）；tpot avg 226.5→284.0ms，TTFT avg 369→630s（批内排队）。**两个坐实**：①HBM 边界 >48——40K×1024 口径 baseline 全程不碰显存顶（KV 峰值 92.7% 未爆），「baseline 撞 HBM 天花板、offload 接力」的前提在本机本规格**不存在**；②吞吐甜点=BS16（157.6 tps），BS48 越过甜点进排队/争用区反降 16.7%——算力顶先到，拉并发提吞吐双向无空间（R28 判读闭环）。
+
+**remote-offload 线收官结论（实测链完整）**：40K×1024 口径下，offload 的吞吐叙事（撑高并发）与容量叙事（顶 HBM 边界）均无成立路径——基线算力先饱和、显存先不满；offload 自身 store 容量（页不回收）又先于一切到顶。offload 数据面的真实价值=容量维度（更长上下文/池化扩展），工程形态待 KVAF 主线合并。bench 线剩余动作=§R30 profile 采集（用户数据分析用）。
+
+## §R30 派单：offload-on BS4×1024 profile 采集轮（蓝区，2026-10-31）
+
+**背景（用户需求）**：采一份 offload-on 真实推理的 torch profiler 数据，供 decode 步拆解分析，产出数据路径直接给用户取用。遵守用户经验纪律（2026-10-30 入库）：profile 增大每步 shm 广播流量、BS16 实测 decode 挂起 → **本轮压到 BS4 极小并发**（全局 16 请求）。
+
+### R30-1 · BS4×1024 offload-on + PROFILE=1（经工具，R25-1 模式）
+
+R25-1 命令逐字（作者数据面 + BENCH=1 + batched2048/chunked1 + MT1024 + ML43008 + DATASET=chinese_40k），**三个变量**：
+
+```bash
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=4          # BS16→BS4，全局 16 请求（profile 纪律：极小并发）
+export VLLM_ASCEND_SMOKE_ENABLE_PROFILE=1        # torch profiler（with_stack/shapes/memory 代码内已全关）
+export VLLM_ASCEND_SMOKE_PROFILE_DIR=/home/fjj/profiles   # 绝对路径，勿用默认 ./profiles
+```
+
+输出 `tmp/r30-bench-bs4-mt1024-profile`，日志 `/home/fjj/pp_r30.log`。前置门禁（进程 0/NPU 8 卡空闲/shm≥370G）与 1004 白名单不变。
+
+### 通过标准
+
+1. 8/8 DRAIN + STORE_CLOSED + 挂起 0 + metrics 全产出；
+2. profile 数据落盘：`/home/fjj/profiles/<run_name>/dp_rank_0..3/` 下每 rank 有 trace 文件（`du -sh` + `ls -la` 原文回传）；
+3. `[global]` 原文回传（profile 有开销，本轮性能数字仅参考、不进对照）。
+
+### 失败处置
+
+- decode 阶段挂起（shm 60s 告警签名）⇒ 挂起上下文原文回传，**不自行重试**；蓝区下轮改派 BS1 或 MT256；
+- 1004 ⇒ 白名单 ≤2 次；其余同前；
+- 跑完清场（进程/NPU/shm 残留），**profile 目录保留勿删**。
+
+### 交付要点
+
+交付里必须单独一行写明 profile 数据的**完整绝对路径**（`/home/fjj/profiles/<run_name>/` 的实际 run_name），用户要直接取用。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

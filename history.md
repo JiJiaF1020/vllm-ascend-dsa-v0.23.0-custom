@@ -278,3 +278,9 @@ R18 失败点解锁坐实（BS16×1024+ML43008 全净，clamp 理论二次实证
 ## §R27+R28 判读 + §R29 派单（蓝区，2026-10-31）
 
 **R27 判读**：在线路线关闭（实测 c1 串行 1/8 崩、c3 3/3 崩）——remote_shared 在线可用域=单 cohort 内 1~2 请求；两数据点（c1 TPOT=11.48ms/acc=92.62%；c2 TPOT=17.64ms/acc=55.51%）口径存档，滚动打流不再派轮，多种群=作者线。**R28 判读**：①baseline BS16→BS32 吞吐平台化（157.6→153.83 tps，-2.4%），算力顶先到、HBM 顶未到，「拉并发提吞吐」对 baseline 无空间；②R28-2 根因修正（代码实锤）：`Store backing exhausted`=remote_kv_store.cpp:267 页容量耗尽（非绿区所述槽位；Close 不回收页 :388→消耗∝全局请求数累积），offload BS32 需 2×256GB>384G shm 不可行，单 pool 变体污染对比不派——offload 升并发前提=Pool 容量规划/页回收（作者线）。战略：40K×1024 口径 offload 并发扩展叙事双侧关闭，价值面回到容量维度，支撑 KVAF 主线合并。**R29 派单**：baseline BS48 单轮（MAX_NUM_SEQS=48，全局 192 请求，log pp_r29a.log），OOM 即边界证据，不派 offload 轮。
+
+## §R29 baseline BS48 定 HBM 边界（2026-10-31）
+
+**派单**（commit 0ea6dee）：R28-1 逐字唯一变量 MAX_NUM_SEQS=32→48，单轮单跑 baseline BS48，定 HBM 边界（OOM⇒边界∈(32,48] 或跑过⇒平台延伸坐实算力顶）。通过标准=RUN_OK+[global] 原文+启动行归属硬证。
+**交付**（commit 见本节首次提交）：RUN_OK RC=0——global_output_tps=131.35（BS32 153.83 -14.6% / BS16 157.6 -16.7%），BS48 无 OOM，HBM 边界 >48 平台延伸。数据出处：/home/fjj/pp_r29a.log + results/1p/dp4_tp2_baseline_graph_mtp_eager.metrics.json。
+**判读**（蓝区）：待定。绿区按数据陈述：算力顶先到、HBM 顶未到（BS48 仍未碰天花板），BS48 越过吞吐甜点进排队区反降。

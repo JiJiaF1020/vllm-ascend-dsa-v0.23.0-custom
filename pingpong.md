@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R29 已派单（2026-10-31）——R27 判读：在线路线关闭（单 cohort≤2 请求，滚动打流不再派轮）。R28 判读：baseline 吞吐 BS16 已饱和（BS32=153.83 tps≈BS16 157.6，算力顶先到）；R28-2 根因蓝区修正=**Pool store 页容量耗尽**（remote_kv_store.cpp:267，Close 不回收页→消耗∝全局请求数累积，非槽位），offload BS32 需 512GB shm 不可行、不派 offload 轮。R29=baseline BS48 定 HBM 边界（OOM 即边界证据）。等 §R29 交付。
+- Current owner: **蓝区**。Status: §R29 已交付（2026-10-31）——baseline BS48 无 OOM 跑过（131.35 tps，较 BS32 -14.6%），**HBM 边界 >48，平台延伸坐实算力顶**（BS16~BS32 ~155 tps 平台，BS48 进排队/争用区反降）；R28 判读「拉并发无空间」坐实。offload 容量故事最后实证未出现，等 §R29 判读/下一手派单。——R27 判读：在线路线关闭（单 cohort≤2 请求，滚动打流不再派轮）。R28 判读：baseline 吞吐 BS16 已饱和（BS32=153.83 tps≈BS16 157.6，算力顶先到）；R28-2 根因蓝区修正=**Pool store 页容量耗尽**（remote_kv_store.cpp:267，Close 不回收页→消耗∝全局请求数累积，非槽位），offload BS32 需 512GB shm 不可行、不派 offload 轮。R29=baseline BS48 定 HBM 边界（OOM 即边界证据）。等 §R29 交付。
 
 ## 0. 目标与口径
 
@@ -2858,6 +2858,14 @@ export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=48   # BS32→BS48，全局 192 请求
 ### 失败处置
 
 OOM ⇒ 原文回传；1004 ⇒ 白名单 ≤2 次重跑；其余同前。跑完清场（进程/NPU/shm）。
+
+## §R29 交付：baseline BS48 无 OOM 跑过（131.35 tps）——平台延伸，坐实算力顶（2026-10-31）
+
+**R29-1 · baseline BS48（绕工具直跑，R28-1 逐字唯一变量 MAX_NUM_SEQS=32→48，全局 192 请求）：RUN_OK，RC=0 干净收尾。归属硬证：启动行 4 rank 均 offload=False ... tp=2 bs=48 max_model_len=43008（pp_r29a.log:27-36，offload=False×4 / bs=48×4）；api_utils 非默认参 max_num_seqs: 48；STORE 相关行=0（无 offload、无 Pool）；run 名=dp4_tp2_baseline_graph_mtp_eager。[global]原文：**requests=192 / output_tokens=196608 / global_wall_s=1496.872 / request_throughput_rps=0.128 / global_output_tps=131.35 / ttft_ms avg=630197.609(min=16755.528 全正) / tpot_ms avg=284.022 p50=291.309 p90=393.697 p99=416.087 / tpot_under_50ms=false**。每 dp 48 请求全成功（4×Successful requests: 48），metrics.json results/1p/dp4_tp2_baseline_graph_mtp_eager.metrics.json 已落盘。**
+
+**对照（baseline 阶梯）**：BS16=157.6 tps（R25-2）→ BS32=153.83（R28-1，-2.4%）→ **BS48=131.35（R29-1，较 BS32 -14.6%，较 BS16 -16.7%）**。BS48 未 OOM（8 worker 权重装载后各卡 VLLMWorker ~59.2GB，EP8 分片正确，generate 全程 GPU KV cache 峰值 92.7% 未爆）。
+
+**判读（绿区按数据陈述，裁决交蓝区）**：命中「跑过⇒平台延伸」分支——**BS48 无 OOM 跑过，baseline HBM 边界 >48，容量故事最后实证未出现**；但吞吐较 BS32 显著下滑（-14.6%）且每请求 decode 同比变慢（tpot avg 226.5→284.0ms，-25.4%）、TTFT 暴涨（avg 369→630s，批内排队效应），**BS48 已越过吞吐甜点、进入排队/资源争用区**。综合 R28+R29：baseline 在 40K×1024 口径的吞吐平台=BS16~BS32（~155 tps），**算力顶先到、HBM 顶未到（BS48 仍未碰 HBM 天花板）**，R28 判读的「拉并发提吞吐对 baseline 无空间」进一步坐实（BS48 反降）。机器已清场（进程 0、NPU 8 卡全空闲、shm 干净）。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 

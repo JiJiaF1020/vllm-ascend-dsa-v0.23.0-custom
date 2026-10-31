@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R28 已交付（2026-10-31）——R28-1 baseline BS32 RUN_OK 无 OOM（global_output_tps=153.83，对照 BS16 157.6 持平-2.4%），**baseline 边界>32 未碰 HBM 天花板**；R28-2 offload-on BS32 崩于 **Pool store 容量边界**（每 DU `--embedded-store-requests 32`，BS32×128 请求恰打满 4DU×32 槽，`Store backing exhausted`→`Pool [a] exited`），非 OOM。“把 batch 拉到 baseline 碰天花板后继续上行”的 offload 价值故事未验证；baseline 先找真边界（R29 BS48/64）或 offload 升 store 槽位约束后再试。等蓝区裁决。机器已清场。
+- Current owner: **绿区**。Status: §R29 已派单（2026-10-31）——R27 判读：在线路线关闭（单 cohort≤2 请求，滚动打流不再派轮）。R28 判读：baseline 吞吐 BS16 已饱和（BS32=153.83 tps≈BS16 157.6，算力顶先到）；R28-2 根因蓝区修正=**Pool store 页容量耗尽**（remote_kv_store.cpp:267，Close 不回收页→消耗∝全局请求数累积，非槽位），offload BS32 需 512GB shm 不可行、不派 offload 轮。R29=baseline BS48 定 HBM 边界（OOM 即边界证据）。等 §R29 交付。
 
 ## 0. 目标与口径
 
@@ -2820,6 +2820,45 @@ R25-1 逐字，唯一变量 `MAX_NUM_SEQS=32`，输出 `tmp/r28-bench-bs32-mt102
 **R28-2 · offload-on BS32（经工具，R25-1 模式唯一变量 MAX_NUM_SEQS=16→32）：崩溃，RC=1，DRAIN_OK=0、STORE_CLOSED=0、metrics 未产出。归属硬证：启动行 4 rank 均 `offload=True ... bs=32 mtp_graph_enabled=True`。根因链（raw/pool-a.log:306-313）：**`REMOTE_DU stopped: Store backing exhausted` + `REMOTE_DU fatal: direct PUT/GET error; exiting without retry`×4→ model.log 全部 Worker `prefill direct PUT failed: [25585, 13570, 16, 0]`（DP0-3/EP0-7 全覆盖）+ `AIV TopK control exchange send failed: Broken pipe`→ EngineCore 4 全崩→ `RuntimeError: Pool ['a'] exited while inference active`。配置实锤（pool-a.log REPRODUCE_COMMAND）：每 DU `--embedded-store-requests 32 --embedded-store-bytes 34358697984`（32GB），BS32×128 请求分布 4 DU = 每 DU 恰 32 槽，全量 PUT 打满即崩。**
 
 **判读（绿区按数据陈述，裁决交蓝区）**：混合结局命中两个预案分支的各一半：①这回不是“R28-1 OOM＋baseline 边界 ∈(16,32]”，而是 **baseline 边界 >32（未碰 HBM 天花板），BS32 与 BS16 吞吐持平（-2.4%）**；②③④**offload 侧的上限不是 HBM，而是 **Pool store 容量（每 DU 固定 32 请求槽 / 32GB backing）——BS32×128 请求就打满，崩在 store 边界而非模型容量边界。**“把 batch 拉到 baseline 碰 HBM 天花板后继续上行”的 offload 价值故事这一步未能验证：因为 baseline 还没碰天花板，而 offload-on 已先碰了 store 上限。**建议蓝区裁决：①继续压 baseline（R29 BS48/64）找它的真边界；②或解除 offload-on 的 store 槽位约束（--embedded-store-requests 升高／--embedded-store-bytes 扩容）后再试 BS32，看 offload-on 能否超 baseline BS16 吞吐；③或两路并行（baseline 快速找边界 + offload 开 store 槽变量探索）。机器已清场（进程 0、NPU 8 卡全空闲、shm 残留已清）。
+## §R27 判读（蓝区，2026-10-31）
+
+在线路线正式关闭（实测）：并发1 串行滚动 1/8 即崩、并发3 3/3 崩，与 R26 组合确认 **remote_shared 在线可用域 = 单 cohort 内 1~2 个请求**，根因=单 cohort 架构（BIND 后拒新 request_id、retired 行不复用）。档A/档B兜底两数据点口径存档（c1：TTFT=18262ms/TPOT=11.48ms/ITL=43.34ms/acc=92.62%；c2：TTFT=19098ms/TPOT=17.64ms/ITL=47.00ms/acc=55.51%），仅作单发/微并发参考，不进吞吐叙事。**在线滚动打流不再派轮**，等作者线多种群支持。
+
+## §R28 判读（蓝区，2026-10-31）
+
+**R28-1（实测）**：baseline BS32 RUN_OK，global_output_tps=153.83 ≈ BS16 的 157.6（-2.4%）。**关键结论：baseline 吞吐在 BS16 已饱和**——BS 翻倍总产出不涨、每请求 decode 同比变慢，本机 40K×1024 口径是**算力顶先到、HBM 顶未到**（R25-2 BS16 每卡 60.96GB/总 91.75GB，BS32 仍未 OOM）。「拉并发提吞吐」对 baseline 已无空间。
+
+**R28-2（根因修正，代码实锤）**：绿区归因为「每 DU 32 请求槽打满」，蓝区核源后修正——报错 `Store backing exhausted` 出自算子仓 `host_offload/remote_kv_store.cpp:267 ReservePut()`，是**页/字节容量**耗尽；槽位耗尽是另一条报错 `Store request capacity exhausted`（:228），本轮 32 槽/DU 恰好够用（第 33 个 CREATE 才触发）。且 `Store::Close()` 只逻辑关闭（:388 注释「首版只逻辑关闭，backing 到作业退出后由显式管理者回收」）→ **store 消耗随全局请求数单调累积，与并发度无关**：BS16×64 请求 fits（32GB/DU），BS32×128=2× 打穿。槽位杠杆=工具 `--requests`（默认 128→pool server 按 ceil(requests/DU数) 分槽，urma_pool_server.cpp:175）；字节杠杆=`--store-bytes`。**offload BS32 需 ~2× per-pool bytes（256GB×2 pool=512GB > 384G shm），本机双 pool 拓扑下不可行**；单 pool 变体会丢一半 URMA 设备带宽 + 跨 NUMA，污染对比，不派。**offload 升并发的前提=Pool 容量规划（更大 shm 或页回收机制），页回收=作者线需求级改动。**
+
+**战略判读**：40K×1024 口径下「offload 撑高并发→提总吞吐」叙事**双侧关闭**——baseline 侧算力饱和（BS16 起 ~155 tps 平台），offload 侧 store 容量先到顶。offload 的真实价值面回到**容量维度**（更长上下文/更多驻留请求），不是本规格的吞吐。此结论直接支撑 KVAF 主线合并讨论（remote 数据面并入 KVAF 生命周期）。
+
+## §R29 派单：baseline BS48 定 HBM 边界（蓝区，2026-10-31）
+
+**背景**：R28 实测 baseline BS16→BS32 吞吐平台化（157.6→153.83 tps）。剩余唯一实证缺口：baseline 的 HBM 边界——BS48 或 OOM（边界 ∈(32,48]，容量故事的最后实证）或跑过（平台延伸，坐实算力顶）。单轮单跑，**不派 offload 轮**（store 容量不可行，见 §R28 判读）。
+
+### R29-1 · baseline BS48（绕工具直跑，R25-2/R28-1 模式）
+
+R28-1 逐字（容器内 + `source /usr/local/Ascend/ascend-toolkit/set_env.sh` + va.env + PYTHONPATH 前置 fjj 仓 + 不起 Pool + ENABLE_OFFLOAD=0 + BENCH=1 + batched2048/chunked1 + ML43008 + MT1024），唯一变量：
+
+```bash
+export VLLM_ASCEND_SMOKE_MAX_NUM_SEQS=48   # BS32→BS48，全局 192 请求
+```
+
+日志 `/home/fjj/pp_r29a.log`。
+
+### 前置核验
+
+进程 0 / NPU 8 卡空闲 / shm≥370G；任一不满足先清场，清不了就停跑说明。
+
+### 通过标准
+
+1. RUN_OK + `[global]` 原文（或 OOM 报错原文末 30 行——OOM 不是失败，是边界证据）；
+2. 启动行归属硬证（offload=False + bs=48 + run 名）。
+
+### 失败处置
+
+OOM ⇒ 原文回传；1004 ⇒ 白名单 ≤2 次重跑；其余同前。跑完清场（进程/NPU/shm）。
+
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 
 ### 目标

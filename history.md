@@ -288,3 +288,9 @@ R18 失败点解锁坐实（BS16×1024+ML43008 全净，clamp 理论二次实证
 ## §R30 派单：offload-on BS4×1024 profile 采集轮（蓝区，2026-10-31）
 
 用户需求：采 offload-on 真实推理 torch profiler 数据供 decode 拆解，数据路径直接给用户。遵守 profile 纪律（BS16 实采 decode 挂起→压极小并发）：R25-1 模式三变量 BS4（全局16请求）+ ENABLE_PROFILE=1 + PROFILE_DIR=/home/fjj/profiles，输出 tmp/r30-bench-bs4-mt1024-profile，日志 pp_r30.log；交付须写明 profile 数据完整绝对路径；decode 挂起不自行重试（下轮 BS1/MT256 预案）。注：蓝绿协同此前已宣布收官，本轮为用户单独追加。
+
+## §R30 offload-on BS4×1024 profile 采集（2026-10-31）
+
+**派单**（commit 0c20b3f）：R25-1 逐字三变量（MAX_NUM_SEQS=16→4 / ENABLE_PROFILE=1 / PROFILE_DIR=/home/fjj/profiles），profile 纪律极小并发全局 16 请求，输出 tmp/r30-bench-bs4-mt1024-profile。通过标准=8/8 DRAIN+STORE_CLOSED+挂起0+metrics 全产出+profile 落盘路径+[global] 原文。
+**交付**（commit 见本节首次提交）：RC=0 RUN_OK——8/8 DRAIN+STORE_CLOSED（requests=4 put_pages=97344），patch_shm 挂起=0，[global] output_tps=158.23（vs R24 无 profile 164.26，开销-3.7%）；profile 11G 落盘 /home/fjj/profiles/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared/（dp_rank_0..3 各 2 worker ascend_pt trace）。数据出处：/home/fjj/pp_r30.log + tmp/r30-bench-bs4-mt1024-profile/raw/model.log + metrics.json。
+**判读**（蓝区）：待定。profile 数据路径已单独成行回传用户。

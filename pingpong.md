@@ -5,7 +5,7 @@
 - 本文件是蓝区 ↔ 绿区的唯一通信面；`history.md` 是只追加的轮次档案。
 - **蓝区**（可外部 AI 侧）写全部代码、做全部判读决策；**绿区**（隔离执行侧）按任务书执行并回写交付，不改代码。
 - 每次 commit 必须同时包含代码 + `pingpong.md` + `history.md`；pull 用 `--ff-only`；绝不 force-push。
-- Current owner: **绿区**。Status: §R30 已派单（2026-10-31）——offload-on BS4×1024 profile 采集轮（R25-1 模式三变量：BS4 / ENABLE_PROFILE=1 / PROFILE_DIR=/home/fjj/profiles；profile 纪律=极小并发，全局 16 请求）。§R29 已判读：baseline BS48 无 OOM 131.35 tps（BS16 起单调降 157.6→153.83→131.35），HBM 边界>48、吞吐甜点=BS16 坐实，remote-offload 线收官。等 §R30 交付，profile 数据路径回传用户。
+- Current owner: **蓝区**。Status: §R30 已交付（2026-10-31）——offload-on BS4×1024 profile 采集完成：8/8 DRAIN+STORE_CLOSED 无挂起，profile 11G 落盘 /home/fjj/profiles/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared/（4 rank×2 worker ascend_pt trace），[global] output_tps=158.23（profile 开销 -3.7%）。remote-offload 线收官结论已定（R29 判读：HBM 边界>48、吞吐甜点 BS16）。等 §R30 判读/下一手派单。——offload-on BS4×1024 profile 采集轮（R25-1 模式三变量：BS4 / ENABLE_PROFILE=1 / PROFILE_DIR=/home/fjj/profiles；profile 纪律=极小并发，全局 16 请求）。§R29 已判读：baseline BS48 无 OOM 131.35 tps（BS16 起单调降 157.6→153.83→131.35），HBM 边界>48、吞吐甜点=BS16 坐实，remote-offload 线收官。等 §R30 交付，profile 数据路径回传用户。
 
 ## 0. 目标与口径
 
@@ -2904,6 +2904,22 @@ export VLLM_ASCEND_SMOKE_PROFILE_DIR=/home/fjj/profiles   # 绝对路径，勿�
 ### 交付要点
 
 交付里必须单独一行写明 profile 数据的**完整绝对路径**（`/home/fjj/profiles/<run_name>/` 的实际 run_name），用户要直接取用。
+
+## §R30 交付：offload-on BS4×1024 profile 采集——8/8 DRAIN 无挂起，11G profiler trace 落盘（2026-10-31）
+
+**R30-1 · offload-on BS4×1024 + PROFILE=1（经工具，R25-1 逐字三变量 MAX_NUM_SEQS=16→4 / ENABLE_PROFILE=0→1 / PROFILE_DIR=/home/fjj/profiles）：RC=0 干净收尾，RUN_OK model_exit=0，run-status graceful=true errors=[]。**
+
+**通过标准逐条**：①**8/8 DRAIN_OK + 8×STORE_CLOSED**（21:53:33 各 worker `requests=4 put_pages=97344 inference=hbm_full_remote_shared remote_get=1`），**patch_shm 挂起 = 0**（grep patch_shm_broadcast=0；唯一 "60 seconds" 匹配=Loading weights took 70.60s 非挂起），EI0006/ValueError/RuntimeError/code=1004 全 0；②**profile 数据落盘**：`/home/fjj/profiles/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared/`（run 名=`dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared`）**du -sh=11G**，`dp_rank_0..3/` 4 rank 各 2 个 ascend_pt trace 目录（~1028 文件/rank，PROF_000001 含 device data/aicpu/ffts/stars 全量），`ls -la` 见下；③**`[dsa-smoke][metrics][global]` 原文**（model.log:2837）：`{"dp_size": 4, "requests": 16, "output_tokens": 16384, "global_wall_s": 103.544, "request_throughput_rps": 0.155, "global_output_tps": 158.23, "ttft_ms": {"avg": 46505.541, "min": 18792.952, "p50": 46504.865, "p90": 73800.015, "p99": 74037.49, "max": 74037.49}, "tpot_ms": {"avg": 50.162, "min": 22.8, "p50": 50.215, "p90": 79.849, "p99": 79.97, "max": 79.97}, "tpot_under_50ms": false}`；metrics.json 已写 `results/1p/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared.metrics.json`。
+
+**profile 配置实锤（model.log api_utils profiler_config）**：profiler=torch，torch_profiler_dir=`/home/fjj/profiles/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared/dp_rank_{0..3}`，with_stack/flops/record_shapes/memory 全 False，use_gzip=True，active_iterations=5；ENABLE_PROFILE=1/PROFILE_DIR 两 env 已在 smoke 读取（vLLM 侧 Unknown env 告警属预期）。
+
+**性能参考（profile 有开销，仅参考不进对照）**：global_output_tps=158.23 vs R24 同配方（BS4×1024 无 profile）164.26，profile 开销约 -3.7%；tpot avg 48.32→50.16ms。
+
+**归属硬证**：api_utils `max_num_seqs: 4 / max_model_len: 43008 / enable_chunked_prefill: True / gpu_memory_utilization: 0.97`；dsa_sparse_config `placement: hbm_full_remote_shared`，device 表 8 项 store 19080-19087/du 19090-19097 路由正确。
+
+**profile 数据完整绝对路径（用户直接取用）**：`/home/fjj/profiles/dp4_tp2_offload_graph_mtp_graph_hbm_full_remote_shared/`（11G，dp_rank_0..3 四 rank 各含 2 worker 的 ascend_pt trace）
+
+**机器已清场**：进程 0、NPU 8 卡全空闲、shm 384G 干净（Pool backing 已清）、profile 目录 11G 保留勿删。日志：`/home/fjj/pp_r30.log` + `tmp/r30-bench-bs4-mt1024-profile/raw/`（model.log + overlap-19090..97.csv 8 端口）。
 
 ## §R8 派单-旧：机器层证据采集（蓝区，2026-10-30）——已交付
 
